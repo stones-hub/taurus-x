@@ -1,0 +1,149 @@
+package middleware
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/stones-hub/taurus-pro-common/pkg/util/tnet"
+
+	"{{ .Module }}/app/helper"
+	"{{ .Module }}/app/model"
+	"{{ .Module }}/app/repo"
+)
+
+// operationLogRepoOnce 惰性初始化操作日志仓储（taurus.Container 装配后才可用）
+var (
+	operationLogRepoOnce sync.Once
+	operationLogRepo     *repo.OperationLogRepository
+)
+
+// getOperationLogRepo 惰性获取操作日志仓储
+func getOperationLogRepo() *repo.OperationLogRepository {
+	operationLogRepoOnce.Do(func() {
+		operationLogRepo = repo.NewStore().OperationLog()
+	})
+	return operationLogRepo
+}
+
+// operationLogFile 全局操作日志文件（按天分割，logs/operation-YYYY-MM-DD.log）
+var operationLogFile = helper.NewDailyLogFile("logs", "operation")
+
+// OperationLogMiddleware 操作日志中间件：记录写操作（POST/PUT/PATCH/DELETE）
+// 记录用户/方法/路径/动作/资源/IP/状态码/请求体/结果，异步写入。
+// 应在 JWT + Permission 之后（以便拿到用户 ID 与判定结果）。
+func OperationLogMiddleware() func(next http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			method := strings.ToUpper(r.Method)
+			if method != "POST" && method != "PUT" && method != "PATCH" && method != "DELETE" {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// 跳过下拉框选项查询（/admin/option/*），避免下拉框高频请求刷屏操作日志
+			if strings.HasPrefix(r.URL.Path, "/admin/option") {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// 跳过日志自身接口 + 前端错误上报，避免日志记录日志递归嵌套
+			if shouldSkipLogging(r.URL.Path) {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// 读取请求体（限制大小，避免大文件上传导致内存问题）
+			body := readBody(r)
+
+			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+			next.ServeHTTP(rec, r)
+
+			userID, _ := CurrentUserIDFromJWT(r)
+			result := "成功"
+			if rec.status >= 400 {
+				result = "失败"
+			}
+
+			go func() {
+				entry := &model.OperationLog{
+					UserID:       userID,
+					Method:       method,
+					Path:         r.URL.Path,
+					Action:       inferAction(method, r.URL.Path),
+					Resource:     inferResource(r.URL.Path),
+					IP:           tnet.GetRemoteIP(r),
+					StatusCode:   rec.status,
+					RequestBody:  truncate(string(body), 4096),
+					ResponseBody: truncate(rec.body(), maxBodyLogSize),
+					Result:       result,
+					ErrorMsg:     "",
+					CreatedAt:    time.Now(),
+				}
+				_ = getOperationLogRepo().Create(context.Background(), entry)
+				operationLogFile.Write(formatOperationLine(entry))
+			}()
+		})
+	}
+}
+
+// inferAction 根据请求路径末段推断动作类型（路径末段本身就是动作语义词，
+// 如 /admin/user/add → add、/admin/role/update-status → update）。
+// 对常见写动作做归一化：add/save/create → add；update-*/edit-* → update；delete/remove-* → delete；
+// 其余语义动词原样保留，业务侧新增动作不用改这里。
+//
+// 业务模块如果有自己的动作命名（比如 complete / approve），既可以直接依赖
+// default 分支原样落库，也可以在下面的 case 里补一条归一化规则。
+func inferAction(method, path string) string {
+	seg := lastPathSegment(path)
+
+	// 无明显动作语义时回退到 HTTP 方法
+	if seg == "" {
+		return strings.ToLower(method)
+	}
+
+	switch seg {
+	case "add", "save", "create", "add-user", "assign", "bind":
+		return "add"
+	case "update", "edit", "edit-info", "update-profile", "update-status", "update-is-system",
+		"batch-update-user", "update-user", "set-password", "change-password":
+		return "update"
+	case "delete", "remove-user":
+		return "delete"
+	default:
+		// 语义动作词原样返回
+		return seg
+	}
+}
+
+// lastPathSegment 取路径最后一段（/admin/user/add → add），空则返回 ""
+func lastPathSegment(path string) string {
+	p := strings.Trim(path, "/")
+	if p == "" {
+		return ""
+	}
+	parts := strings.Split(p, "/")
+	return parts[len(parts)-1]
+}
+
+// inferResource 根据路径推断资源模块（/admin/user/list → user）
+func inferResource(path string) string {
+	p := strings.Trim(path, "/")
+	if p == "" {
+		return ""
+	}
+	parts := strings.Split(p, "/")
+	if len(parts) >= 2 && parts[0] == "admin" {
+		return parts[1]
+	}
+	return parts[0]
+}
+
+// formatOperationLine 格式化操作日志一行（落文件用）
+func formatOperationLine(e *model.OperationLog) string {
+	return fmt.Sprintf("[operation] %s user=%d method=%s path=%s action=%s resource=%s status=%d result=%s",
+		e.CreatedAt.Format("2006-01-02 15:04:05"), e.UserID, e.Method, e.Path, e.Action, e.Resource, e.StatusCode, e.Result)
+}

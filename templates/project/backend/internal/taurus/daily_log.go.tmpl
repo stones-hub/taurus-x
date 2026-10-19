@@ -1,0 +1,136 @@
+package taurus
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"gorm.io/gorm/logger"
+)
+
+// dailyWriter 按天分割的文件写入器（惰性切换，并发安全）。
+// 文件名为 base-YYYY-MM-DD.log，跨天自动切换新文件。
+type dailyWriter struct {
+	mu      sync.Mutex
+	dir     string
+	base    string
+	curDate string
+	file    *os.File
+}
+
+func newDailyWriter(dir, base string) *dailyWriter {
+	return &dailyWriter{dir: dir, base: base}
+}
+
+func (d *dailyWriter) Write(p []byte) (int, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	today := time.Now().Format("2006-01-02")
+	if d.curDate != today {
+		d.switchFile(today)
+	}
+	if d.file == nil {
+		return len(p), nil // 打开失败时静默丢弃
+	}
+	return d.file.Write(p)
+}
+
+func (d *dailyWriter) switchFile(date string) {
+	if d.file != nil {
+		_ = d.file.Close()
+		d.file = nil
+	}
+	d.curDate = date
+	if err := os.MkdirAll(d.dir, 0755); err != nil {
+		return
+	}
+	path := filepath.Join(d.dir, fmt.Sprintf("%s-%s.log", d.base, date))
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return
+	}
+	d.file = f
+}
+
+// DailyGormLogger 按天分割的 GORM 日志记录器（实现 gorm.io/gorm/logger.Interface）。
+// 替代框架 db.NewDbLogger（后者用 lumberjack 按大小轮换），实现按天分割。
+type DailyGormLogger struct {
+	writer    *dailyWriter
+	level     logger.LogLevel
+	formatter func(logger.LogLevel, string) string
+}
+
+// NewDailyGormLogger 创建按天 GORM 日志记录器。
+// dir 目录（如 "logs"）、base 文件名前缀（如 "db_admin"），生成 logs/db_admin-YYYY-MM-DD.log。
+func NewDailyGormLogger(dir, base string, level logger.LogLevel) *DailyGormLogger {
+	return &DailyGormLogger{
+		writer:    newDailyWriter(dir, base),
+		level:     level,
+		formatter: defaultDBFormatter,
+	}
+}
+
+// defaultDBFormatter 默认格式化（对齐框架 default 格式：带时间戳 + 级别）
+func defaultDBFormatter(level logger.LogLevel, msg string) string {
+	ts := time.Now().Format("2006-01-02 15:04:05")
+	prefix := map[logger.LogLevel]string{
+		logger.Info:  "INFO",
+		logger.Warn:  "WARN",
+		logger.Error: "ERROR",
+	}[level]
+	if prefix == "" {
+		prefix = "INFO"
+	}
+	return fmt.Sprintf("[%s] [%s] %s", ts, prefix, msg)
+}
+
+// LogMode 实现 logger.Interface
+func (l *DailyGormLogger) LogMode(level logger.LogLevel) logger.Interface {
+	nl := *l
+	nl.level = level
+	return &nl
+}
+
+// Info 实现 logger.Interface
+func (l *DailyGormLogger) Info(ctx context.Context, msg string, data ...interface{}) {
+	if l.level >= logger.Info {
+		_, _ = l.writer.Write([]byte(l.formatter(logger.Info, fmt.Sprintf(msg, data...)) + "\n"))
+	}
+}
+
+// Warn 实现 logger.Interface
+func (l *DailyGormLogger) Warn(ctx context.Context, msg string, data ...interface{}) {
+	if l.level >= logger.Warn {
+		_, _ = l.writer.Write([]byte(l.formatter(logger.Warn, fmt.Sprintf(msg, data...)) + "\n"))
+	}
+}
+
+// Error 实现 logger.Interface
+func (l *DailyGormLogger) Error(ctx context.Context, msg string, data ...interface{}) {
+	if l.level >= logger.Error {
+		_, _ = l.writer.Write([]byte(l.formatter(logger.Error, fmt.Sprintf(msg, data...)) + "\n"))
+	}
+}
+
+// Trace 实现 logger.Interface（记录 SQL 执行）
+func (l *DailyGormLogger) Trace(ctx context.Context, begin time.Time, fc func() (sql string, rowsAffected int64), err error) {
+	if l.level <= logger.Silent {
+		return
+	}
+	elapsed := time.Since(begin)
+	sqlStr, rows := fc()
+	switch {
+	case err != nil && l.level >= logger.Error:
+		msg := fmt.Sprintf("[%.3fms] [rows:%v] %s; %v", float64(elapsed.Nanoseconds())/1e6, rows, sqlStr, err)
+		_, _ = l.writer.Write([]byte(l.formatter(logger.Error, msg) + "\n"))
+	case elapsed > 200*time.Millisecond && l.level >= logger.Warn:
+		msg := fmt.Sprintf("[%.3fms] [rows:%v] %s; slow sql", float64(elapsed.Nanoseconds())/1e6, rows, sqlStr)
+		_, _ = l.writer.Write([]byte(l.formatter(logger.Warn, msg) + "\n"))
+	case l.level >= logger.Info:
+		msg := fmt.Sprintf("[%.3fms] [rows:%v] %s", float64(elapsed.Nanoseconds())/1e6, rows, sqlStr)
+		_, _ = l.writer.Write([]byte(l.formatter(logger.Info, msg) + "\n"))
+	}
+}

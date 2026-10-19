@@ -1,0 +1,150 @@
+package dto
+
+import (
+	"{{ .Module }}/app/model"
+)
+
+// UserInfo 用户信息（完整字段，admin_users 表）
+type UserInfo struct {
+	UserID        uint64  `json:"user_id"`
+	Username      string  `json:"username"`
+	Realname      string  `json:"realname"`
+	Nickname      string  `json:"nickname"`
+	Avatar        string  `json:"avatar"`
+	Mobile        *string `json:"mobile"`
+	Email         *string `json:"email"`
+	Gender        int8    `json:"gender"`
+	Birthday      string  `json:"birthday"`
+	Position      string  `json:"position"`
+	Status        int8    `json:"status"`
+	UserSource    int8    `json:"user_source"`
+	LastLoginTime string  `json:"last_login_time"`
+	LastLoginIP   string  `json:"last_login_ip"`
+	CreatedAt     string  `json:"created_at"`
+	UpdatedAt     string  `json:"updated_at"`
+}
+
+// ToUserInfo 将 model.AdminUser 实体转换为 dto.UserInfo
+func ToUserInfo(u *model.AdminUser) *UserInfo {
+	if u == nil {
+		return nil
+	}
+	birthday := "1900-01-01"
+	if u.Birthday != nil {
+		birthday = u.Birthday.Format("2006-01-02")
+	}
+	lastLoginTime := "1900-01-01 00:00:00"
+	if u.LastLoginTime != nil {
+		lastLoginTime = u.LastLoginTime.Format("2006-01-02 15:04:05")
+	}
+	lastLoginIP := u.LastLoginIP
+	if lastLoginIP == "" {
+		lastLoginIP = "127.0.0.1"
+	}
+	return &UserInfo{
+		UserID:        u.UserID,
+		Username:      u.Username,
+		Realname:      u.Realname,
+		Nickname:      u.Nickname,
+		Avatar:        u.Avatar,
+		Mobile:        u.Mobile,
+		Email:         u.Email,
+		Gender:        u.Gender,
+		Birthday:      birthday,
+		Position:      u.Position,
+		Status:        u.Status,
+		UserSource:    u.UserSource,
+		LastLoginTime: lastLoginTime,
+		LastLoginIP:   lastLoginIP,
+		CreatedAt:     u.CreatedAt.Format("2006-01-02 15:04:05"),
+		UpdatedAt:     u.UpdatedAt.Format("2006-01-02 15:04:05"),
+	}
+}
+
+// UpdateProfileRequest 更新个人信息请求（/admin/user/update-profile）
+type UpdateProfileRequest struct {
+	Realname string `json:"realname"`
+	Nickname string `json:"nickname"`
+	Email    string `json:"email"`
+	Gender   int    `json:"gender"`
+	Birthday string `json:"birthday"`
+}
+
+// ChangePasswordRequest 修改密码请求（需校验旧密码）
+type ChangePasswordRequest struct {
+	OldPassword string `json:"old_password"`
+	NewPassword string `json:"new_password"`
+}
+
+// SetPasswordRequest 设置/重置密码请求（覆盖式，无需旧密码）
+type SetPasswordRequest struct {
+	NewPassword string `json:"new_password"`
+}
+
+// BindMobileRequest 绑定手机号请求
+type BindMobileRequest struct {
+	Mobile string `json:"mobile"`
+	Code   string `json:"code"`
+}
+
+// UnbindMobileRequest 解绑手机号请求
+type UnbindMobileRequest struct {
+	Mobile string `json:"mobile"`
+	Code   string `json:"code"`
+}
+
+// SendCodeRequest 发送验证码请求
+type SendCodeRequest struct {
+	LoginType  string `json:"login_type"`
+	LoginValue string `json:"login_value"`
+}
+
+// ==================== 用户管理（管理员视角） ====================
+
+// UserListResponse 用户列表响应
+type UserListResponse struct {
+	PageNo      int         `json:"page_no"`
+	PageSize    int         `json:"page_size"`
+	ResultTotal int64       `json:"result_total"`
+	List        []*UserInfo `json:"list"`
+}
+
+// UserListRequest 用户列表查询请求
+type UserListRequest struct {
+	PageQuery
+	UsernameMobileEmail string `json:"username_mobile_email"`
+	Status              int    `json:"status"`
+}
+
+// AddUserRequest 新增用户请求
+type AddUserRequest struct {
+	Username   string   `json:"username"`
+	Password   string   `json:"password"`
+	Mobile     string   `json:"mobile"`
+	Realname   string   `json:"realname"`
+	Nickname   string   `json:"nickname"`
+	Avatar     string   `json:"avatar"`
+	Email      string   `json:"email"`
+	Gender     int8     `json:"gender"`
+	Birthday   string   `json:"birthday"`
+	UserSource int8     `json:"user_source"`
+	RoleIDs    []uint64 `json:"role_ids"`
+}
+
+// UpdateUserRequest 更新用户请求（密码、角色可空，空则不更新）
+type UpdateUserRequest struct {
+	UserID   uint64   `json:"user_id"`
+	Realname string   `json:"realname"`
+	Nickname string   `json:"nickname"`
+	Password string   `json:"password"`
+	Gender   int8     `json:"gender"`
+	Birthday string   `json:"birthday"`
+	Email    string   `json:"email"`
+	RoleIDs  []uint64 `json:"role_ids"`
+}
+
+// UpdateUserStatusRequest 更新用户状态请求
+type UpdateUserStatusRequest struct {
+	UserID uint64 `json:"user_id"`
+	Status int    `json:"status"`
+}

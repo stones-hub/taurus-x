@@ -1,0 +1,70 @@
+package repo
+
+import (
+	"context"
+
+	"gorm.io/gorm"
+
+	"{{ .Module }}/app/model"
+)
+
+// AdminPermissionsRepository 权限数据访问层
+type AdminPermissionsRepository struct {
+	*baseRepository[model.AdminPermissions]
+}
+
+func NewAdminPermissionsRepositoryWithDB(db *gorm.DB) *AdminPermissionsRepository {
+	return &AdminPermissionsRepository{baseRepository: newBaseRepository[model.AdminPermissions](db)}
+}
+
+// FindByPermissionID 根据权限 ID 查找权限
+func (r *AdminPermissionsRepository) FindByPermissionID(ctx context.Context, permissionID uint64) (*model.AdminPermissions, error) {
+	return r.firstBy(ctx, "permission_id = ?", permissionID)
+}
+
+// Permission 返回权限仓储
+func (r repoSet) Permission() *AdminPermissionsRepository {
+	return NewAdminPermissionsRepositoryWithDB(r.db)
+}
+
+// UpdateByID 按主键更新指定字段
+func (r *AdminPermissionsRepository) UpdateByID(ctx context.Context, id uint64, updates interface{}) error {
+	return r.db.WithContext(ctx).Model(&model.AdminPermissions{}).Where("permission_id = ?", id).Updates(updates).Error
+}
+
+// FindByPermissionCode 根据权限编码查找权限
+func (r *AdminPermissionsRepository) FindByPermissionCode(ctx context.Context, code string) (*model.AdminPermissions, error) {
+	return r.firstBy(ctx, "permission_code = ?", code)
+}
+
+// ListActive 查询所有启用状态的权限
+func (r *AdminPermissionsRepository) ListActive(ctx context.Context) ([]model.AdminPermissions, error) {
+	return r.findBy(ctx, "status = 1")
+}
+
+// ListByParentID 查询指定父权限下的子权限
+func (r *AdminPermissionsRepository) ListByParentID(ctx context.Context, parentID uint64) ([]model.AdminPermissions, error) {
+	return r.findBy(ctx, "parent_id = ?", parentID)
+}
+
+// AdminPermissionsListFilter 权限列表筛选条件
+type AdminPermissionsListFilter struct {
+	PermissionName string
+	Status         int
+	PermissionType int
+}
+
+// ListWithFilter 分页查询权限（结构化筛选）
+func (r *AdminPermissionsRepository) ListWithFilter(ctx context.Context, page, pageSize int, f AdminPermissionsListFilter) ([]model.AdminPermissions, int64, error) {
+	q := r.db.WithContext(ctx).Model(&model.AdminPermissions{})
+	if f.PermissionName != "" {
+		q = q.Where("permission_name LIKE ?", "%"+f.PermissionName+"%")
+	}
+	if f.Status >= 0 {
+		q = q.Where("status = ?", f.Status)
+	}
+	if f.PermissionType > 0 {
+		q = q.Where("permission_type = ?", f.PermissionType)
+	}
+	return r.page(q, page, pageSize, "permission_id DESC")
+}

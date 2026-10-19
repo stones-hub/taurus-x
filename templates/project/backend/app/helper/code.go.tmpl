@@ -1,0 +1,27 @@
+// 业务编号生成工具。
+package helper
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+// GenerateCode 生成「前缀 + 秒级时间戳」的唯一编号（deep module）。
+//
+// 收敛各业务 service 里「XXX-YYYYMMDDHHmmss + 查重 + 毫秒兜底」的样板：
+// 多个模块需要可读的业务编号时，逻辑完全一致、只有前缀与查重函数不同。
+// exists 回调判断编号是否已存在；首次碰撞时追加毫秒后缀兜底。
+//
+// 注意：编号的真正唯一性依赖数据库唯一索引（本函数只是「尽量唯一」，
+// 无法解决并发下的读-写竞态）；需要更强保证的调用方应依赖唯一索引 +
+// 插入失败重试，而非本函数。
+func GenerateCode(ctx context.Context, prefix string, exists func(ctx context.Context, code string) bool) string {
+	now := time.Now()
+	stamp := now.Format("20060102150405")
+	code := fmt.Sprintf("%s-%s", prefix, stamp)
+	if exists(ctx, code) {
+		code = fmt.Sprintf("%s-%s%03d", prefix, stamp, now.Nanosecond()/1000000)
+	}
+	return code
+}

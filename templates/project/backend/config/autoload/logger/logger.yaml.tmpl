@@ -1,0 +1,22 @@
+# 日志配置
+loggers:
+  - name: default
+    prefix: ""
+    log_level: 0
+    output_type: file
+    log_file_path: logs/app.log
+    max_size: 100
+    max_backups: 5
+    max_age: 30
+    compress: true
+    formatter: default
+  - name: simple
+    prefix: ""
+    log_level: 0
+    output_type: file
+    log_file_path: logs/simple.log
+    max_size: 100
+    max_backups: 5
+    max_age: 30
+    compress: true
+    formatter: json

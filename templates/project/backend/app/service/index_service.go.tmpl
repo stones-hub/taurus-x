@@ -1,0 +1,16 @@
+package service
+
+import (
+	"github.com/google/wire"
+)
+
+// IndexService 首页服务
+type IndexService struct{}
+
+// IndexServiceSet 依赖注入集合（以 Set 结尾，自动扫描）
+var IndexServiceSet = wire.NewSet(wire.Struct(new(IndexService), "*"))
+
+// Name 返回服务名称
+func (s *IndexService) Name() string {
+	return "{{ .ProjectName }}"
+}

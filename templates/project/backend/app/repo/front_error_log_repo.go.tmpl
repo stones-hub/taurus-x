@@ -1,0 +1,50 @@
+package repo
+
+import (
+	"context"
+
+	"gorm.io/gorm"
+
+	"{{ .Module }}/app/model"
+)
+
+// FrontErrorLogRepository 前端错误日志数据访问层
+type FrontErrorLogRepository struct {
+	*baseRepository[model.FrontErrorLog]
+}
+
+func NewFrontErrorLogRepositoryWithDB(db *gorm.DB) *FrontErrorLogRepository {
+	return &FrontErrorLogRepository{baseRepository: newBaseRepository[model.FrontErrorLog](db)}
+}
+
+// FindByID 根据日志 ID 查找
+func (r *FrontErrorLogRepository) FindByID(ctx context.Context, id uint64) (*model.FrontErrorLog, error) {
+	return r.firstBy(ctx, "log_id = ?", id)
+}
+
+// FrontErrorLog 返回前端错误日志仓储
+func (r repoSet) FrontErrorLog() *FrontErrorLogRepository {
+	return NewFrontErrorLogRepositoryWithDB(r.db)
+}
+
+// FrontErrorLogListFilter 前端错误日志列表筛选条件
+type FrontErrorLogListFilter struct {
+	UserID uint64
+	Kind   string
+	URL    string
+}
+
+// ListWithFilter 分页查询前端错误日志（结构化筛选）
+func (r *FrontErrorLogRepository) ListWithFilter(ctx context.Context, page, pageSize int, f FrontErrorLogListFilter) ([]model.FrontErrorLog, int64, error) {
+	q := r.db.WithContext(ctx).Model(&model.FrontErrorLog{})
+	if f.UserID > 0 {
+		q = q.Where("user_id = ?", f.UserID)
+	}
+	if f.Kind != "" {
+		q = q.Where("kind = ?", f.Kind)
+	}
+	if f.URL != "" {
+		q = q.Where("url LIKE ?", "%"+f.URL+"%")
+	}
+	return r.page(q, page, pageSize, "log_id DESC")
+}

@@ -1,0 +1,32 @@
+package dto
+
+// PageQuery 分页查询参数（deep module）。
+//
+// 它是一个可匿名嵌入到各 ListRequest 的公共分页基底：承载「分页参数
+// 归一化」的全部行为（页号/页大小默认值 + 非法值兜底），让列表查询的
+// service 方法统一调用 Normalize()，不再各自手写 `if page <= 0 { page = 1 }`
+// 样板（漏做会让 offset 变负数，是反复出现的边界 bug）。
+//
+// 匿名嵌入后，PageNo/PageSize 字段会被 encoding/json 平铺序列化，
+// 对外 JSON 结构（page_no/page_size）保持不变。
+type PageQuery struct {
+	PageNo   int `json:"page_no"`
+	PageSize int `json:"page_size"`
+}
+
+// Normalize 归一化分页参数：页号 <=0 置 1，页大小 <=0 置默认 15。
+// 就地修改，调用方直接 `req.Normalize()` 后再拿 req.PageNo/req.PageSize。
+func (p *PageQuery) Normalize() {
+	p.NormalizePageSize(15)
+}
+
+// NormalizePageSize 归一化分页参数并指定页大小默认值。
+// 供「有意用非 15 默认页大小」的模块使用（如权限列表默认 50）。
+func (p *PageQuery) NormalizePageSize(defaultPageSize int) {
+	if p.PageNo <= 0 {
+		p.PageNo = 1
+	}
+	if p.PageSize <= 0 {
+		p.PageSize = defaultPageSize
+	}
+}

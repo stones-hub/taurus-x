@@ -1,0 +1,60 @@
+//go:build wireinject
+// +build wireinject
+
+package app
+
+import (
+	"github.com/google/wire"
+	"{{ .Module }}/app/controller"
+	"{{ .Module }}/app/repo"
+	"{{ .Module }}/app/service"
+)
+
+// Injector 应用程序结构
+type Injector struct {
+	AuthController          *controller.AuthController
+	DeptController          *controller.DeptController
+	IndexController         *controller.IndexController
+	LogController           *controller.LogController
+	LoginLogController      *controller.LoginLogController
+	PermissionController    *controller.PermissionController
+	RoleController          *controller.RoleController
+	UserController          *controller.UserController
+	Store                   *repo.Store
+	AuthService             *service.AuthService
+	AdminDeptService        *service.AdminDeptService
+	IndexService            *service.IndexService
+	LogService              *service.LogService
+	AdminLoginLogService    *service.AdminLoginLogService
+	AdminPermissionsService *service.AdminPermissionsService
+	AdminRoleService        *service.AdminRoleService
+	AdminUserService        *service.AdminUserService
+}
+
+// buildInjector 构建应用程序
+func buildInjector() (*Injector, func(), error) {
+	wire.Build(
+		// 应用结构
+		wire.Struct(new(Injector), "*"),
+		// 扫描到的 provider sets
+		controller.AuthControllerSet,
+		controller.DeptControllerSet,
+		controller.IndexControllerSet,
+		controller.LogControllerSet,
+		controller.LoginLogControllerSet,
+		controller.PermissionControllerSet,
+		controller.RoleControllerSet,
+		controller.UserControllerSet,
+		repo.StoreSet,
+		service.AuthServiceSet,
+		service.AdminDeptServiceSet,
+		service.IndexServiceSet,
+		service.LogServiceSet,
+		service.AdminLoginLogServiceSet,
+		service.AdminPermissionsServiceSet,
+		service.AdminRoleServiceSet,
+		service.AdminUserServiceSet,
+	)
+
+	return new(Injector), nil, nil
+}

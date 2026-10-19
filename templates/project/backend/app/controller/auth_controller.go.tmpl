@@ -1,0 +1,174 @@
+package controller
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/google/wire"
+	"github.com/stones-hub/taurus-pro-http/pkg/httpx"
+
+	"{{ .Module }}/app/dto"
+	"{{ .Module }}/app/middleware"
+	"{{ .Module }}/app/service"
+)
+
+// AuthController 认证控制器
+type AuthController struct {
+	AuthService *service.AuthService
+}
+
+// AuthControllerSet wire provider set
+var AuthControllerSet = wire.NewSet(wire.Struct(new(AuthController), "*"))
+
+// Login 用户登录
+func (c *AuthController) Login(w http.ResponseWriter, r *http.Request) {
+	var req dto.LoginRequest
+	if r.Header.Get("Content-Type") == "application/json" {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			Fail(w, http.StatusBadRequest, "请求参数解析失败: "+err.Error())
+			return
+		}
+	} else {
+		if err := r.ParseForm(); err != nil {
+			Fail(w, http.StatusBadRequest, "请求参数解析失败: "+err.Error())
+			return
+		}
+		req.Username = r.FormValue("username")
+		req.Password = r.FormValue("password")
+	}
+
+	if req.Username == "" || req.Password == "" {
+		Fail(w, http.StatusBadRequest, "用户名和密码不能为空")
+		return
+	}
+
+	user, err := c.AuthService.PasswordLogin(r.Context(), req.Username, req.Password)
+	if err != nil {
+		Fail(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+
+	token, err := middleware.GenerateJWTToken(fmt.Sprintf("%d", user.UserID), user.Username)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, "生成令牌失败: "+err.Error())
+		return
+	}
+
+	expiresAt := time.Now().Add(24 * time.Hour)
+	response := dto.LoginResponse{Token: token, User: dto.ToUserInfo(user), ExpiresAt: expiresAt}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "jwt_token",
+		Value:    token,
+		Expires:  expiresAt,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   false,
+		SameSite: http.SameSiteLaxMode,
+	})
+	setCSRFCookie(w)
+
+	OK(w, response)
+}
+
+// Register 用户注册
+func (c *AuthController) Register(w http.ResponseWriter, r *http.Request) {
+	var req dto.RegisterRequest
+	if r.Header.Get("Content-Type") == "application/json" {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			Fail(w, http.StatusBadRequest, "请求参数解析失败: "+err.Error())
+			return
+		}
+	} else {
+		if err := r.ParseForm(); err != nil {
+			Fail(w, http.StatusBadRequest, "请求参数解析失败: "+err.Error())
+			return
+		}
+		req.Username = r.FormValue("username")
+		req.Password = r.FormValue("password")
+		req.Email = r.FormValue("email")
+	}
+
+	if req.Username == "" || req.Password == "" {
+		Fail(w, http.StatusBadRequest, "用户名和密码不能为空")
+		return
+	}
+
+	user, err := c.AuthService.Register(r.Context(), req.Username, req.Password)
+	if err != nil {
+		Fail(w, http.StatusConflict, err.Error())
+		return
+	}
+
+	token, err := middleware.GenerateJWTToken(fmt.Sprintf("%d", user.UserID), user.Username)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, "生成令牌失败: "+err.Error())
+		return
+	}
+
+	expiresAt := time.Now().Add(24 * time.Hour)
+	response := dto.LoginResponse{Token: token, User: dto.ToUserInfo(user), ExpiresAt: expiresAt}
+	http.SetCookie(w, &http.Cookie{
+		Name: "jwt_token", Value: token, Expires: expiresAt, Path: "/",
+		HttpOnly: true, Secure: false, SameSite: http.SameSiteLaxMode,
+	})
+	setCSRFCookie(w)
+	httpx.SendResponse(w, http.StatusCreated, response, nil)
+}
+
+// Logout 用户登出
+func (c *AuthController) Logout(w http.ResponseWriter, _ *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name: "jwt_token", Value: "", Expires: time.Now().Add(-1 * time.Hour), Path: "/",
+		HttpOnly: true, Secure: false, SameSite: http.SameSiteLaxMode,
+	})
+	middleware.ClearCSRFToken(w)
+	Fail(w, http.StatusOK, "登出成功")
+}
+
+// RefreshToken 刷新 JWT 令牌
+func (c *AuthController) RefreshToken(w http.ResponseWriter, r *http.Request) {
+	token := extractJWTTokenFromRequest(r)
+	if token == "" {
+		Fail(w, http.StatusUnauthorized, "缺少JWT令牌")
+		return
+	}
+	newToken, err := middleware.RefreshJWTToken(w, token)
+	if err != nil {
+		Fail(w, http.StatusUnauthorized, "令牌刷新失败: "+err.Error())
+		return
+	}
+	expiresAt := time.Now().Add(24 * time.Hour)
+	response := dto.LoginResponse{Token: newToken, ExpiresAt: expiresAt}
+	http.SetCookie(w, &http.Cookie{
+		Name: "jwt_token", Value: newToken, Expires: expiresAt, Path: "/",
+		HttpOnly: true, Secure: false, SameSite: http.SameSiteLaxMode,
+	})
+	OK(w, response)
+}
+
+// setCSRFCookie 下发 CSRF Token Cookie（供受 CSRF 保护的写请求使用）
+func setCSRFCookie(w http.ResponseWriter) {
+	csrfToken, err := middleware.GenerateCSRFToken()
+	if err != nil {
+		return
+	}
+	middleware.SetCSRFToken(w, csrfToken)
+}
+
+// extractJWTTokenFromRequest 从请求中提取 JWT 令牌
+func extractJWTTokenFromRequest(r *http.Request) string {
+	if ah := r.Header.Get("Authorization"); ah != "" {
+		if strings.HasPrefix(ah, "Bearer ") {
+			return strings.TrimPrefix(ah, "Bearer ")
+		}
+		return ah
+	}
+	if c, err := r.Cookie("jwt_token"); err == nil {
+		return c.Value
+	}
+	return r.URL.Query().Get("token")
+}

@@ -1,0 +1,82 @@
+// 短信验证码工具（当前为伪实现：日志 + Redis）。
+package helper
+
+import (
+	"context"
+	"crypto/rand"
+	"fmt"
+	"log"
+	"math/big"
+	"strconv"
+	"time"
+
+	"{{ .Module }}/internal/taurus"
+)
+
+// VerificationCodeManager 短信验证码管理器（基于 Redis）
+type VerificationCodeManager struct {
+	expires time.Duration
+}
+
+// NewVerificationCodeManager 创建验证码管理器
+func NewVerificationCodeManager() *VerificationCodeManager {
+	return &VerificationCodeManager{expires: 5 * time.Minute}
+}
+
+// GenerateCode 生成 6 位数字验证码
+func (m *VerificationCodeManager) GenerateCode() (string, error) {
+	code := ""
+	for i := 0; i < 6; i++ {
+		n, err := rand.Int(rand.Reader, big.NewInt(10))
+		if err != nil {
+			return "", err
+		}
+		code += strconv.Itoa(int(n.Int64()))
+	}
+	return code, nil
+}
+
+// SendSMSCode 发送短信验证码（当前伪实现：限频 + 存 Redis）
+func (m *VerificationCodeManager) SendSMSCode(ctx context.Context, mobile string) (string, error) {
+	if mobile == "" {
+		return "", fmt.Errorf("手机号不能为空")
+	}
+
+	// 简单限频：1 分钟最多 1 次
+	rateKey := fmt.Sprintf("sms:rate:1m:%s", mobile)
+	if v, _ := taurus.Container.Redis.Get(ctx, rateKey); v != "" {
+		return "", fmt.Errorf("发送过于频繁，请稍后再试")
+	}
+	_ = taurus.Container.Redis.Set(ctx, rateKey, "1", time.Minute)
+
+	code, err := m.GenerateCode()
+	if err != nil {
+		return "", fmt.Errorf("生成验证码失败: %v", err)
+	}
+
+	// TODO: 接入第三方短信服务
+	log.Printf("发送短信验证码到 %s: %s\n", mobile, code)
+
+	key := fmt.Sprintf("verification_code:mobile:%s", mobile)
+	if err := taurus.Container.Redis.Set(ctx, key, code, m.expires); err != nil {
+		return "", fmt.Errorf("存储验证码失败: %v", err)
+	}
+	return code, nil
+}
+
+// VerifyCode 验证验证码（一次性）
+func (m *VerificationCodeManager) VerifyCode(ctx context.Context, loginType, loginValue, inputCode string) (bool, error) {
+	key := fmt.Sprintf("verification_code:%s:%s", loginType, loginValue)
+	cached, err := taurus.Container.Redis.Get(ctx, key)
+	if err != nil {
+		return false, fmt.Errorf("获取验证码失败: %v", err)
+	}
+	if cached == "" {
+		return false, fmt.Errorf("验证码不存在或已过期")
+	}
+	if cached != inputCode {
+		return false, fmt.Errorf("验证码错误")
+	}
+	_ = taurus.Container.Redis.Del(ctx, key)
+	return true, nil
+}

@@ -1,0 +1,75 @@
+package middleware
+
+import (
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/stones-hub/taurus-pro-common/pkg/util/tlimit"
+	"github.com/stones-hub/taurus-pro-common/pkg/util/tnet"
+	"github.com/stones-hub/taurus-pro-http/pkg/httpx"
+
+	"{{ .Module }}/internal/taurus"
+)
+
+// RateLimitMiddleware 组合限流中间件（IP 维度组合限流 + 基础限流）
+func RateLimitMiddleware() func(next http.Handler) http.Handler {
+	var (
+		compositeLimiter *tlimit.CompositeRateLimiter
+		basicLimiter     *tlimit.RateLimiter
+		once             sync.Once
+	)
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			once.Do(func() { initLimiters(&compositeLimiter, &basicLimiter) })
+
+			if !checkRateLimit(r, compositeLimiter, basicLimiter) {
+				httpx.SendResponse(w, http.StatusTooManyRequests, "请求过于频繁，请稍后重试", nil)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// initLimiters 延迟初始化限流器
+func initLimiters(composite **tlimit.CompositeRateLimiter, basic **tlimit.RateLimiter) {
+	config := taurus.Container.Config
+
+	if config.GetBool("http.rate_limit.composite.enabled") {
+		ipCapacity := config.GetInt("http.rate_limit.composite.ip_capacity")
+		globalCapacity := config.GetInt("http.rate_limit.composite.global_capacity")
+		fillInterval := time.Duration(config.GetInt("http.rate_limit.composite.fill_interval")) * time.Second
+		if ipCapacity > 0 && globalCapacity > 0 && fillInterval > 0 {
+			*composite = tlimit.NewCompositeRateLimiter(ipCapacity, globalCapacity, fillInterval)
+		}
+	}
+
+	if config.GetBool("http.rate_limit.basic.enabled") {
+		capacity := config.GetInt("http.rate_limit.basic.capacity")
+		fillInterval := time.Duration(config.GetInt("http.rate_limit.basic.fill_interval")) * time.Second
+		if capacity > 0 && fillInterval > 0 {
+			*basic = tlimit.NewRateLimiter(capacity, fillInterval)
+		}
+	}
+}
+
+// checkRateLimit 执行限流检查
+func checkRateLimit(r *http.Request, composite *tlimit.CompositeRateLimiter, basic *tlimit.RateLimiter) bool {
+	clientID := tnet.GetRemoteIP(r)
+
+	if composite != nil {
+		if !composite.Allow(clientID).Allowed {
+			return false
+		}
+	}
+
+	if basic != nil {
+		if !basic.Allow() {
+			return false
+		}
+	}
+
+	return true
+}

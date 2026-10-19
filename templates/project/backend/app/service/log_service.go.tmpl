@@ -1,0 +1,231 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/google/wire"
+
+	"{{ .Module }}/app/dto"
+	"{{ .Module }}/app/helper"
+	"{{ .Module }}/app/model"
+	"{{ .Module }}/app/repo"
+)
+
+// LogService 系统日志服务（访问日志 + 操作日志 + 前端错误日志）
+type LogService struct {
+	store             *repo.Store
+	accessLogRepo     *repo.AccessLogRepository
+	operationLogRepo  *repo.OperationLogRepository
+	frontErrorLogRepo *repo.FrontErrorLogRepository
+	userRepo          *repo.AdminUserRepository
+	frontErrorFile    *helper.DailyLogFile // 前端错误日志文件（按天分割）
+}
+
+// LogServiceSet wire provider set
+var LogServiceSet = wire.NewSet(NewLogService)
+
+// NewLogService 创建日志服务
+func NewLogService(store *repo.Store) *LogService {
+	return &LogService{
+		store:             store,
+		accessLogRepo:     store.AccessLog(),
+		operationLogRepo:  store.OperationLog(),
+		frontErrorLogRepo: store.FrontErrorLog(),
+		userRepo:          store.User(),
+		frontErrorFile:    helper.NewDailyLogFile("logs", "front-error"),
+	}
+}
+
+// ===== 访问日志 =====
+
+// GetAccessLogList 分页查询访问日志
+func (s *LogService) GetAccessLogList(ctx context.Context, req dto.AccessLogListRequest) (*dto.AccessLogListResponse, error) {
+	logs, total, err := s.accessLogRepo.ListWithFilter(ctx, req.PageNo, req.PageSize, repo.AccessLogListFilter{
+		UserID:     req.UserID,
+		Method:     req.Method,
+		Path:       req.Path,
+		StatusCode: req.StatusCode,
+		IP:         req.IP,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	usernameMap := s.batchUsernames(ctx, userIDsOfAccess(logs))
+	list := make([]*dto.AccessLogResponse, 0, len(logs))
+	for i := range logs {
+		l := logs[i]
+		list = append(list, &dto.AccessLogResponse{
+			LogID:        l.LogID,
+			UserID:       l.UserID,
+			Username:     usernameMap[l.UserID],
+			Method:       l.Method,
+			Path:         l.Path,
+			StatusCode:   l.StatusCode,
+			IP:           l.IP,
+			UserAgent:    l.UserAgent,
+			DurationMs:   l.DurationMs,
+			Query:        l.Query,
+			RequestBody:  l.RequestBody,
+			ResponseBody: l.ResponseBody,
+			CreatedAt:    helper.TimeToDatetime(l.CreatedAt),
+		})
+	}
+	return &dto.AccessLogListResponse{
+		PageNo:      req.PageNo,
+		PageSize:    req.PageSize,
+		ResultTotal: total,
+		List:        list,
+	}, nil
+}
+
+// ===== 操作日志 =====
+
+// GetOperationLogList 分页查询操作日志
+func (s *LogService) GetOperationLogList(ctx context.Context, req dto.OperationLogListRequest) (*dto.OperationLogListResponse, error) {
+	logs, total, err := s.operationLogRepo.ListWithFilter(ctx, req.PageNo, req.PageSize, repo.OperationLogListFilter{
+		UserID:   req.UserID,
+		Method:   req.Method,
+		Path:     req.Path,
+		Action:   req.Action,
+		Resource: req.Resource,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	usernameMap := s.batchUsernames(ctx, userIDsOfOperation(logs))
+	list := make([]*dto.OperationLogResponse, 0, len(logs))
+	for i := range logs {
+		l := logs[i]
+		list = append(list, &dto.OperationLogResponse{
+			LogID:        l.LogID,
+			UserID:       l.UserID,
+			Username:     usernameMap[l.UserID],
+			Method:       l.Method,
+			Path:         l.Path,
+			Action:       l.Action,
+			Resource:     l.Resource,
+			IP:           l.IP,
+			StatusCode:   l.StatusCode,
+			RequestBody:  l.RequestBody,
+			ResponseBody: l.ResponseBody,
+			Result:       l.Result,
+			ErrorMsg:     l.ErrorMsg,
+			CreatedAt:    helper.TimeToDatetime(l.CreatedAt),
+		})
+	}
+	return &dto.OperationLogListResponse{
+		PageNo:      req.PageNo,
+		PageSize:    req.PageSize,
+		ResultTotal: total,
+		List:        list,
+	}, nil
+}
+
+// ===== 前端错误日志 =====
+
+// ReportFrontError 记录前端上报的错误（存库 + 落文件）。
+// 入参只依赖 dto（+ 由 controller 注入的请求上下文信息），service 内部组装 model；
+// 返回 error 供调用方兜底处理，避免「错误上报链路静默失败」。
+func (s *LogService) ReportFrontError(ctx context.Context, req *dto.FrontErrorReportRequest, userID uint64, ip, userAgent string) error {
+	if req == nil {
+		return errors.New("请求参数不能为空")
+	}
+	entry := &model.FrontErrorLog{
+		UserID:    userID,
+		Message:   req.Message,
+		Source:    req.Source,
+		Stack:     req.Stack,
+		URL:       req.URL,
+		UserAgent: userAgent,
+		IP:        ip,
+		Kind:      req.Kind,
+	}
+	if err := s.frontErrorLogRepo.Create(ctx, entry); err != nil {
+		return fmt.Errorf("前端错误入库失败: %v", err)
+	}
+	s.frontErrorFile.Write(fmt.Sprintf("[front-error] %s kind=%s url=%s message=%s source=%s stack=%s",
+		time.Now().Format("2006-01-02 15:04:05"), entry.Kind, entry.URL, entry.Message, entry.Source, entry.Stack))
+	return nil
+}
+
+// GetFrontErrorLogList 分页查询前端错误日志
+func (s *LogService) GetFrontErrorLogList(ctx context.Context, req dto.FrontErrorLogListRequest) (*dto.FrontErrorLogListResponse, error) {
+	logs, total, err := s.frontErrorLogRepo.ListWithFilter(ctx, req.PageNo, req.PageSize, repo.FrontErrorLogListFilter{
+		UserID: req.UserID,
+		Kind:   req.Kind,
+		URL:    req.URL,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	usernameMap := s.batchUsernames(ctx, userIDsOfFrontError(logs))
+	list := make([]*dto.FrontErrorLogResponse, 0, len(logs))
+	for i := range logs {
+		l := logs[i]
+		list = append(list, &dto.FrontErrorLogResponse{
+			LogID:     l.LogID,
+			UserID:    l.UserID,
+			Username:  usernameMap[l.UserID],
+			Kind:      l.Kind,
+			Message:   l.Message,
+			Source:    l.Source,
+			Stack:     l.Stack,
+			URL:       l.URL,
+			UserAgent: l.UserAgent,
+			IP:        l.IP,
+			CreatedAt: helper.TimeToDatetime(l.CreatedAt),
+		})
+	}
+	return &dto.FrontErrorLogListResponse{
+		PageNo:      req.PageNo,
+		PageSize:    req.PageSize,
+		ResultTotal: total,
+		List:        list,
+	}, nil
+}
+
+// batchUsernames 批量查询用户名（user_id → username）
+func (s *LogService) batchUsernames(ctx context.Context, userIDs []uint64) map[uint64]string {
+	m := make(map[uint64]string)
+	for _, uid := range userIDs {
+		if _, ok := m[uid]; ok || uid == 0 {
+			continue
+		}
+		if u, _ := s.userRepo.FindByUserID(ctx, uid); u != nil {
+			m[uid] = u.Username
+		} else {
+			m[uid] = "未知用户"
+		}
+	}
+	return m
+}
+
+func userIDsOfAccess(logs []model.AccessLog) []uint64 {
+	ids := make([]uint64, 0, len(logs))
+	for _, l := range logs {
+		ids = append(ids, l.UserID)
+	}
+	return ids
+}
+
+func userIDsOfOperation(logs []model.OperationLog) []uint64 {
+	ids := make([]uint64, 0, len(logs))
+	for _, l := range logs {
+		ids = append(ids, l.UserID)
+	}
+	return ids
+}
+
+func userIDsOfFrontError(logs []model.FrontErrorLog) []uint64 {
+	ids := make([]uint64, 0, len(logs))
+	for _, l := range logs {
+		ids = append(ids, l.UserID)
+	}
+	return ids
+}

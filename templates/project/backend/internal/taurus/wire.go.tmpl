@@ -1,0 +1,40 @@
+//go:build wireinject
+// +build wireinject
+
+package taurus
+
+import (
+	"github.com/google/wire"
+)
+
+// buildComponents 框架组件依赖图。
+//
+// 各组件的 Provide* 函数统一放在 components.go（不带构建标签），这里只声明依赖图，
+// 这样 wire 生成的 wire_gen.go 不会再拷贝一份 Provide*，改组件只改一处。
+func buildComponents(opts *ConfigOptions) (*Components, func(), error) {
+	wire.Build(
+		ProvideConfigComponent,
+		ProvideDbComponent,
+		ProvideRedisComponent,
+		ProvideHttpComponent,
+		ProvideCronComponent,
+		ProvideLoggerComponent,
+{{- if .Has.consul }}
+		ProvideConsulComponent,
+{{- end }}
+{{- if .Has.opentelemetry }}
+		ProvideOtelComponent,
+{{- end }}
+{{- if .Has.tcp }}
+		ProvideTCPComponent,
+{{- end }}
+{{- if .Has.grpc }}
+		ProvideGRPCComponent,
+{{- end }}
+{{- if .Has.milvus }}
+		ProvideMilvusComponent,
+{{- end }}
+		wire.Struct(new(Components), "*"),
+	)
+	return new(Components), nil, nil
+}

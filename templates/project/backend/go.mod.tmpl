@@ -1,0 +1,14 @@
+module {{ .Module }}
+
+go {{ .GoVersion }}
+
+require (
+	github.com/google/wire {{ .WireVersion }}
+{{- range .Requires }}
+	{{ .Package }} {{ .Version }}
+{{- end }}
+{{- if .Has.grpc }}
+	google.golang.org/grpc v1.71.1
+{{- end }}
+	gorm.io/gorm v1.30.1
+)

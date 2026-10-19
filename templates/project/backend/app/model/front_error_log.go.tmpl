@@ -1,0 +1,19 @@
+package model
+
+import "time"
+
+// FrontErrorLog 前端错误日志表（前端 window.onerror / unhandledrejection 上报）
+type FrontErrorLog struct {
+	LogID     uint64    `json:"log_id" gorm:"primaryKey;autoIncrement;column:log_id;comment:日志ID"`
+	UserID    uint64    `json:"user_id" gorm:"index:idx_user_id;not null;default:0;column:user_id;comment:用户ID（0=未登录）"`
+	Message   string    `json:"message" gorm:"size:1000;not null;default:'';column:message;comment:错误信息"`
+	Source    string    `json:"source" gorm:"size:500;not null;default:'';column:source;comment:出错位置（file:line:col）"`
+	Stack     string    `json:"stack" gorm:"type:text;column:stack;comment:错误堆栈"`
+	URL       string    `json:"url" gorm:"size:500;not null;default:'';column:url;comment:出错页面 URL"`
+	UserAgent string    `json:"user_agent" gorm:"size:500;not null;default:'';column:user_agent;comment:浏览器 UA"`
+	IP        string    `json:"ip" gorm:"size:45;not null;default:'';column:ip;comment:客户端 IP"`
+	Kind      string    `json:"kind" gorm:"size:20;not null;default:'';column:kind;comment:错误类型（error/unhandledrejection）"`
+	CreatedAt time.Time `json:"created_at" gorm:"index:idx_created;not null;default:CURRENT_TIMESTAMP;column:created_at;comment:上报时间"`
+}
+
+func (FrontErrorLog) TableName() string { return "admin_front_error_logs" }

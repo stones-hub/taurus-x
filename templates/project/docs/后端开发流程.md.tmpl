@@ -1,0 +1,409 @@
+# 后端开发流程规范（权威）
+
+> 面向「在 `admin` 项目里开发新功能模块」的**后端侧流程总纲**。
+> 先读 [`docs/项目规范.md`](项目规范.md)（架构/RBAC/DTO/命名/下拉 option 等唯一权威规则）；前端侧见 [`docs/前端开发流程.md`](前端开发流程.md)。
+> 所有步骤源自本项目已完成的多个模块的实战沉淀，照着做可保证风格一致、一次到位、不留坑。
+
+---
+
+## 一、前置检查
+
+1. 通读 `docs/项目规范.md`，明确唯一的权威规则来源，**不要在别处重复定义规则**。
+2. 明确要做的模块落在哪个域（system / relation / sale / resource / finance / order / task / approval）。
+3. 若该模块依赖既有存量表/数据，先核对表结构与字段语义，**列出全部边界行为**（状态机、门控、校验、富集字段、级联联动），不要凭印象。
+
+   产出「边界行为清单」，逐条列出：列表筛选字段、排序字段、分页默认值（page_size 默认 15）；状态枚举及各状态含义/默认值；新增/编辑校验规则与错误文案；软删还是硬删及删除前置约束；富集字段；状态机/业务门控；级联联动；文件上传字段。
+
+---
+
+## 二、后端标准流程（每个模块 = 6 件套，顺序固定）
+
+每个模块 = **6 件套**：model → repo → dto → service → controller → 路由 + `make wire`。
+
+### Step 1. 建 model（贫血实体）
+
+文件：`backend/app/model/<实体单数>.go`
+
+```go
+package model
+
+import "time"
+
+// Notice 公告表（notices）
+type Notice struct {
+    NoticeID uint64     `json:"notice_id" gorm:"primaryKey;autoIncrement;column:notice_id;comment:ID"`
+    ParentID      *uint64    `json:"parent_id" gorm:"column:parent_id;comment:父类型ID"`
+    TypeName      string     `json:"type_name" gorm:"size:100;not null;column:type_name;comment:类型名称"`
+    Status        int8       `json:"status" gorm:"index:idx_status;not null;default:1;column:status;comment:状态 1启用 0禁用"`
+    CreatedAt     time.Time  `json:"created_at" gorm:"not null;default:CURRENT_TIMESTAMP;column:created_at"`
+    UpdatedAt     time.Time  `json:"updated_at" gorm:"not null;default:CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;column:updated_at"`
+}
+
+func (Notice) TableName() string { return "notices" }
+```
+
+**铁律**（详见 `项目规范.md` 贫血 Model 节）：
+- 只含字段 + `TableName()`，**不 import gorm、不写 `DB()`**。
+- gorm 约束全写在 struct tag；字段名、JSON tag、TableName、列名与表结构一致。
+- 可选字段用指针（`*uint64`）以区分「未填」与「0」。
+
+✅ 验收：无 gorm import、无 `DB()`；`TableName()` 正确。
+
+### Step 2. 建 repo（自建泛型仓储）
+
+文件：`backend/app/repo/<实体>_repo.go`
+
+```go
+package repo
+
+import (
+    "context"
+    "gorm.io/gorm"
+    "{{ .Module }}/app/model"
+)
+
+type NoticeRepository struct {
+    *baseRepository[model.Notice]
+}
+
+// 唯一构造（显式传 db，无参构造已废除）
+func NewNoticeRepositoryWithDB(db *gorm.DB) *NoticeRepository {
+    return &NoticeRepository{baseRepository: newBaseRepository[model.Notice](db)}
+}
+
+// Store/Tx accessor（单份定义，receiver repoSet，两作用域对称）
+func (r repoSet) Notice() *NoticeRepository { return NewNoticeRepositoryWithDB(r.db) }
+
+// 领域方法：简单单条件查询用私有辅助 firstBy/findBy 一行
+func (r *NoticeRepository) FindByNoticeID(ctx context.Context, id uint64) (*model.Notice, error) {
+    return r.firstBy(ctx, "notice_id = ?", id)
+}
+func (r *NoticeRepository) FindByParentID(ctx context.Context, parentID uint64) ([]model.Notice, error) {
+    return r.findBy(ctx, "parent_id = ?", parentID)
+}
+
+// 分页列表：filter struct + ListWithFilter（分页统一走 r.page）
+type NoticeListFilter struct {
+    TypeName string
+    Status   int8
+}
+func (r *NoticeRepository) ListWithFilter(ctx context.Context, page, pageSize int, f NoticeListFilter) ([]model.Notice, int64, error) {
+    q := r.db.WithContext(ctx).Model(&model.Notice{})
+    if f.TypeName != "" {
+        q = q.Where("type_name LIKE ?", "%"+f.TypeName+"%")
+    }
+    if f.Status >= 0 {
+        q = q.Where("status = ?", f.Status)
+    }
+    return r.page(q, page, pageSize, "notice_id DESC")
+}
+```
+
+**铁律**（详见 `项目规范.md` 自建仓储节）：
+- 继承 `baseRepository[T]`，`T` 只要求 `TableName()`（见 `app/repo/base.go`）。
+- **唯一构造 `NewXxxRepositoryWithDB(db)`**（无参 `NewXxxRepository()` 已废除）；service 一律经 `store.Xxx()` accessor 获取仓储，**不直接 new**。
+- 命名 `XxxRepository`（复数）；accessor 定义在各自 repo 文件内（receiver 是 `repoSet`，`Store`/`Tx` 内嵌共享）。
+- **「未找到」语义**：单条查询用私有 `firstBy`（返回 `(nil, nil)`），**不要**用裸 `First` 暴露 `gorm.ErrRecordNotFound`。
+- 简单单条件查询用 `firstBy`/`findBy` 一行；复杂查询（LIKE/IN/联表/动态多条件）手写 GORM 链式；分页统一 `XxxListFilter` + `ListWithFilter`（内部 `r.page`），**不手写 Count/Offset/Limit**。
+
+✅ 验收：继承 `baseRepository[T]`；唯一构造 WithDB + `repoSet` accessor；简单查询用 `firstBy`/`findBy`；分页用 `ListWithFilter` + `r.page`。
+
+### Step 3. 建 dto
+
+文件：`backend/app/dto/<域>_dto.go`
+
+- 请求体 `XxxRequest` / 响应体 `XxxResponse` / 列表项 `XxxResponseItem`。
+- **禁 `Req`/`Resp` 缩写、禁匿名 struct、禁 `[]interface{}`**（用 `[]uint64` 等明确类型）。
+- JSON tag 一律 snake_case（`page_no`、`permission_name`）。
+- 列表请求通用三字段：`PageNo` / `PageSize`；分页请求 DTO 匿名嵌入 `dto.PageQuery` 以复用 `Normalize()`；列表响应含 `ResultTotal` 与 `List []*XxxResponse`。
+
+✅ 验收：`XxxRequest/Response/ResponseItem` 命名；snake_case tag；无 `Req/Resp`、无匿名 struct、无 `[]interface{}`。
+
+### Step 4. 建 service（业务逻辑，不碰 `*gorm.DB`）
+
+文件：`backend/app/service/<实体>_service.go`
+
+```go
+type NoticeService struct {
+    noticeRepo *repo.NoticeRepository
+    store           *repo.Store
+}
+
+var NoticeServiceSet = wire.NewSet(NewNoticeService)  // 必须以 Set 结尾，auto-scanner 才会扫描到
+
+func NewNoticeService(store *repo.Store) *NoticeService {
+    return &NoticeService{
+        noticeRepo: store.Notice(),
+        store:           store,
+    }
+}
+```
+
+**铁律**：
+- service **只持有 repo 指针 + store**，绝不用 `*gorm.DB`（**禁止 import `gorm.io/gorm`**）。
+- 构造函数 **`NewXxxService(store *repo.Store)` 统一注入 Store**，仓储经 `store.Xxx()` accessor 获取（**禁止 `repo.NewXxxRepository()` 直接构造**，无参构造已废除）。
+- provider set 变量名**必须以 `Set`/`WireSet`/`ProviderSet` 结尾**，否则 auto-scanner 扫不到、Wire 装不上。
+- 列表查询走 repo 的 `XxxListFilter` + `ListWithFilter`（**禁止在 service 里用 WhereBuilder 拼条件字符串、禁止 `wb.Raw` 手写 SQL 片段**——条件构建全部下沉 repo）：
+
+```go
+list, total, err := s.noticeRepo.ListWithFilter(ctx, page, pageSize, repo.NoticeListFilter{
+    TypeName: typeName,
+    Status:   status,   // 状态「不过滤」用 -1 语义（QUERY_ALL）
+})
+```
+
+- 富集字段（父名称、创建人名、状态名等）在 service 里回填响应，**不在 model 加关联字段**（贫血）：枚举名走 `constants.GetXxxName`，外键显示名走统一的只读 Resolver。参见 `项目规范.md` 第 8 节（常量名映射收敛 constants 包）、第 9 节（外键显示名收敛单一 Resolver）。
+- 复杂提交用事务整体提交，事务 seam 是 `store.RunInTx`（见 `项目规范.md` 第 7 节），**service 不碰 `*gorm.DB` 开事务**。
+- 状态门控在 service 里算好 `can_edit` / `can_delete` 等布尔标志放响应。
+
+✅ 验收：逐条对照「边界行为清单」实现；列表走 `ListWithFilter`；service 不含 `*gorm.DB`。
+
+### Step 5. 建 controller（参数校验 + 委托，无业务逻辑）
+
+文件：`backend/app/controller/<实体>_controller.go`
+
+```go
+type NoticeController struct {
+    NoticeService *service.NoticeService
+}
+
+var NoticeControllerSet = wire.NewSet(wire.Struct(new(NoticeController), "*"))
+
+func (c *NoticeController) GetNoticeList(w http.ResponseWriter, r *http.Request) {
+    var req dto.NoticeListRequest
+    if !BindJSON(w, r, &req) { return }
+    req.Normalize()
+    resp, err := c.NoticeService.GetNoticeList(r.Context(), req)
+    if err != nil {
+        Fail(w, http.StatusInternalServerError, err.Error())
+        return
+    }
+    OK(w, resp)
+}
+```
+
+**铁律**：
+- controller **只做参数解析 + 校验 + 委托**，业务逻辑全在 service。
+- 统一走 `app/controller/common.go` 的三个深 helper（`BindJSON` / `OK` / `Fail`），**禁止裸写 `json.NewDecoder` + `httpx.SendResponse` 样板**。
+- 业务错误用 `http.StatusInternalServerError` 包裹 message；参数错误用 `StatusBadRequest`。
+- 文件上传用 `httpx.ParseMultipartData(r)` 或 `helper.ParseMultipartOrJSON`。
+
+✅ 验收：只做参数解析 + 校验 + 委托；统一响应；无业务逻辑。
+
+### Step 6. 注册路由 + `make wire`
+
+文件：`backend/app/routes/routes.go`
+
+```go
+taurus.Container.Http.AddRouterGroup(router.RouteGroup{
+    Prefix:     "/admin/notices",
+    Middleware: userProtectedChain,
+    Routes: []router.Router{
+        {Path: "/list", Handler: http.HandlerFunc(app.Core.NoticeController.GetNoticeList)},
+        {Path: "/detail", Handler: http.HandlerFunc(app.Core.NoticeController.GetNoticeDetail)},
+        {Path: "/add", Handler: http.HandlerFunc(app.Core.NoticeController.AddNotice)},
+        {Path: "/update", Handler: http.HandlerFunc(app.Core.NoticeController.UpdateNotice)},
+        {Path: "/delete", Handler: http.HandlerFunc(app.Core.NoticeController.DeleteNotice)},
+        {Path: "/update-status", Handler: http.HandlerFunc(app.Core.NoticeController.UpdateNoticeStatus)},
+    },
+})
+
+// 下拉选项（userBaseChain，无 Permission 校验，供 useOptions 数据源）
+taurus.Container.Http.AddRouterGroup(router.RouteGroup{
+    Prefix:     "/admin/option",
+    Middleware: userBaseChain,
+    Routes: []router.Router{
+        {Path: "/notices", Handler: http.HandlerFunc(app.Core.NoticeController.GetOptionNotice)},
+    },
+})
+```
+
+**路由挂载区分（重点）**：
+- **下拉选项接口**挂 `/admin/option/*`（`userBaseChain`，无 Permission 校验），供前端 `useOptions` 做数据源；**业务 list/CRUD 接口绝不挂到 `/admin/option` 下**（这会绕过权限校验）。
+- **业务 list/CRUD** 挂各自前缀（`userProtectedChain`，含 Permission 校验）。
+- 两条链定义（`routes.go` 顶部）：
+  - `userBaseChain` = `Recovery → JWT → PasswordChangeValidator → CSRF`（无 Permission）
+  - `userProtectedChain` = `Recovery → JWT → PasswordChangeValidator → Permission → CSRF`
+- 业务接口 path 必须与 `admin_permissions.path`（`permission_type=3` 的 path）一致，否则 RBAC 精确匹配失败、无权限的人打不开接口。
+- **下拉选项接口也常复用业务 list 的 handler**（如 `/admin/option/notices` 复用 `GetNoticeList`，只是挂了 `userBaseChain`）。
+
+改完重新生成 Wire 并构建：
+
+```bash
+cd backend
+make wire        # 重新生成 Wire DI（新增 controller/service 后必跑）
+go build ./...   # 构建
+```
+
+✅ 验收：后端 build 通过；每个接口 path 与 `admin_permissions.path` 一致；下拉选项确认走 `/admin/option/*`（userBaseChain）。
+
+---
+
+## 三、权限处理
+
+### 建表 SQL（落盘 `scripts/sql/`）
+
+```sql
+CREATE TABLE IF NOT EXISTS `xxx_records` (
+  `xxx_id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'ID',
+  `name` VARCHAR(100) NOT NULL COMMENT '名称',
+  `parent_id` BIGINT UNSIGNED DEFAULT NULL COMMENT '父ID',
+  `status` TINYINT NOT NULL DEFAULT 1 COMMENT '状态 1启用 0禁用',
+  `is_deleted` TINYINT NOT NULL DEFAULT 0 COMMENT '软删标记 0未删 1已删',
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  PRIMARY KEY (`xxx_id`),
+  KEY `idx_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='xxx表';
+```
+
+约定：主键 `xxx_id BIGINT UNSIGNED AUTO_INCREMENT`；统一带 `created_at`/`updated_at`（`ON UPDATE CURRENT_TIMESTAMP`）；软删用 `is_deleted`；**字段名/类型与 model 完全对应**。
+
+### 建三级权限 SQL（落盘 `scripts/sql/`）
+
+1. **先核对现有最大 `permission_id`**（增量脚本显式写 ID 时避免主键冲突）：`SELECT MAX(permission_id) FROM admin_permissions;`
+2. 建三级权限：
+   - `type=1` 菜单（父菜单 + 叶子菜单 `page/xxx.html`），父菜单已存在则复用其 `permission_id` 作 `parent_id`，不存在才新建。
+   - `type=2` 按钮（query/add/edit/delete/update-status…），**刷新按钮不再单独建 `.refresh`，复用 `.query`**。
+   - `type=3` 接口（path 精确匹配后端路由；`/admin/option/*` 走 `userBaseChain` **无需** API 权限）。
+3. `super_admin` 角色 code=super_admin 放行；非 super_admin 角色需对 type=3 接口配 API 权限（在 `admin_role_permissions` 里配角色）。
+4. 完成开发后执行 SQL 并验证：菜单可见、按钮按 `v-permission` 显示、接口权限按 type=3 path 放行/拦截、`/admin/option/*` 无需 API 权限也能访问。
+
+✅ 验收：permission_id 无主键冲突；三级权限齐全；type=3 path 与后端路由一致；无 `.refresh` 按钮权限；live DB 权限生效。
+
+### 路径修正（少数情况）
+
+若发现接口 path 与 `admin_permissions.path` 不一致，用**增量 UPDATE** 修正，不重新 INSERT：
+
+```sql
+UPDATE `admin_permissions` SET
+  `permission_name` = '<新名>',
+  `permission_code` = '<新 code>',
+  `path` = '/admin/xxx/list',
+  `updated_at` = NOW()
+WHERE `permission_id` = <id> AND `path` = '/admin/old/path';
+```
+
+---
+
+## 四、验证与收尾
+
+```bash
+cd backend && make wire && go build ./...
+```
+
+**必须**：后端 `go build ./...` 通过。
+
+**额外核对**（不遗漏边界）：
+- 状态枚举 / 默认值 / 错误文案 / 分页语义 / 软删 vs 硬删。
+- 富集字段（父名称、创建人名、状态名）是否齐全。
+- 状态机 / 业务门控的操作按钮后端是否暴露 `can_xxx`。
+
+---
+
+## 五、Checklist（提交前逐项自查）
+
+- [ ] model 贫血：仅字段 + `TableName()`，无 gorm import / `DB()`
+- [ ] repo 用 `baseRepository[T]`，命名 `XxxRepository`，唯一构造 `NewXxxRepositoryWithDB(db)` + `repoSet` accessor；未找到返回 `(nil,nil)`（`firstBy`）；分页用 `XxxListFilter` + `ListWithFilter`（`r.page`）
+- [ ] dto 用 `XxxRequest/Response/ResponseItem`，snake_case tag，无 `Req/Resp` 缩写、无匿名 struct、无 `[]interface{}`
+- [ ] service 构造函数注入 `store *repo.Store`（`NewXxxService(store)`），仓储走 `store.Xxx()`；`*Set` 变量以 Set 结尾；列表走 `ListWithFilter`（不手写 SQL）；不 import `gorm.io/gorm`
+- [ ] 事务用 `store.RunInTx`，跨表裸 SQL 下沉为仓储专用方法（未散落在 service）
+- [ ] 常量「值 → 中文名」映射收敛 `constants.GetXxxName`（未散落 service 私有 `xxxName`）
+- [ ] 外键显示名富集收敛到单一只读 Resolver（service 之间未为了取名字互相注入）
+- [ ] controller 请求体走 dto，统一 `BindJSON`/`OK`/`Fail` 深 helper，业务错误包裹 message
+- [ ] 路由 path 与 `admin_permissions.path` 一致；下拉挂 `/admin/option/*`（userBaseChain），业务挂各自前缀（userProtectedChain）
+- [ ] `make wire` 已跑，`go build ./...` 通过
+- [ ] 状态「不过滤」用 -1（QUERY_ALL）语义（`status >= 0`），枚举/外键用 0（`> 0`）
+- [ ] 密码相关用 `helper/crypto.go`（SHA-256+salt）
+- [ ] 有状态机门控的操作按钮：后端响应暴露 `can_xxx`（service 算好），禁 disabled 置灰
+- [ ] 建表 + 三级权限 SQL 落盘 `scripts/sql/` 留痕
+
+---
+
+## 六、命名对照速查
+
+| 层 | 命名 | 示例 |
+|----|------|------|
+| model 实体 | `Xxx`（单数） | `AdminUser`, `AdminRole`, `Notice` |
+| repo | `XxxRepository`（复数） | `AdminUserRepository`, `NoticeRepository` |
+| dto | `XxxRequest/Response/ResponseItem` | `NoticeListRequest`, `NoticeResponse` |
+| service | `XxxService` | `AdminRoleService`, `NoticeService` |
+| controller | `XxxController` | `RoleController`, `NoticeController` |
+| 常量 | `XxxType/Status` | `PermissionType`, `UserStatusEnabled` |
+
+## 七、公共工具速查
+
+| 文件 | 用途 |
+|------|------|
+| `backend/app/repo/base.go` | `baseRepository[T TableNamer]` 零条件原子操作（Create/CreateBatch/Delete/DeleteByID/FindByID/Count/Save）+ 私有查询辅助（firstBy/findBy/page + 包级 paginate） |
+| `backend/app/repo/store.go` | `Store`（工作单元）+ `Tx`（事务上下文）+ `repoSet`（accessor 载体）；事务 seam `store.RunInTx`（返回 error 回滚，nil 提交） |
+| `backend/app/helper/query.go` | `WhereBuilder` 动态条件（repo 内部复杂查询可用；service 层列表已统一走 `ListFilter`） |
+| `backend/app/helper/crypto.go` | `GenerateSalt/HashPassword/VerifyPassword`（SHA-256+salt） |
+| `backend/app/helper/validate.go` | 密码强度 / 手机号校验 |
+| `backend/app/helper/verification_code.go` | 验证码生成 / 校验（Redis 存取） |
+| `backend/app/controller/common.go` | 控制器深 helper `BindJSON` / `OK` / `Fail` |
+| `backend/app/constants` | 枚举 + `GetXxxName`（值→中文名映射唯一数据源） |
+| `backend/app/service/name_resolver.go` | 约定位置：外键 ID→显示名只读富集（底座未自带，出现跨域富集时新建，见 `项目规范.md` 第 9 节） |
+
+## 八、Wire 说明
+
+- `app/wire.go`（`//go:build wireinject`）由 `internal/wire/gen_wire.go` **自动生成**（`make wire` 会先删除再重建，勿手改）+ `wire_gen.go`（生成）
+- `make wire` = 编译 `internal/wire/gen_wire.go` 扫描 `app/` 下 `*Set` 变量 → 生成 wire.go → `wire ./internal/taurus`（针对包，见 9.3）
+- `*repo.Store` 由 `repo.StoreSet = wire.NewSet(NewStore)`（`app/repo/store.go`）提供；service 构造函数统一注入 `store *repo.Store`
+- **新增 controller/service 后必须 `make wire`**，否则 `app.Core.XxxController` undefined
+
+---
+
+## 九、中间件与日志专项（踩坑沉淀，写新中间件/日志必读）
+
+### 9.1 中间件禁止「包级 var 直接 new repo」
+
+**错误写法**（会运行期 nil pointer panic）：
+
+```go
+var x = repo.NewStore().Xxx()   // ❌ 包被 import 时就执行
+```
+
+原因：包级 var 在**包被 import 时**初始化，此刻早于 `taurus.BuildComponents()` 装配 `taurus.Container.DbList`，`defaultDB()` 返回 `nil`，`baseRepository.db` 为 nil，运行期调用 `r.db.WithContext()` 触发 SIGSEGV。
+
+**正确写法**：用 `sync.Once` **惰性初始化**：
+
+```go
+var (
+    xOnce sync.Once
+    xRepo *repo.XxxRepository
+)
+func getXxxRepo() *repo.XxxRepository {
+    xOnce.Do(func() { xRepo = repo.NewStore().Xxx() })  // 经 Store accessor（无参 repo.NewXxxRepository() 已废除）
+    return xRepo
+}
+```
+
+> 铁律：**任何**在 middleware 里直接 new repo/service 的包级变量，都必须改成 `sync.Once` + getter。
+
+### 9.2 日志中间件必须排除自身，防「日志记录日志」递归
+
+记录请求/响应的日志中间件（访问日志/操作日志）**必须跳过日志自身的查询接口与上报接口**，否则每次「看日志列表」都会把上一次日志的完整 response_body 塞进新日志，JSON 层层转义、指数级膨胀。
+
+```go
+if strings.HasPrefix(r.URL.Path, "/admin/log") || r.URL.Path == "/report-front-error" {
+    next.ServeHTTP(w, r)
+    return
+}
+```
+
+同样地，**下拉框选项接口**（`/admin/option/*`）因高频调用，操作日志中间件应显式跳过。
+
+### 9.3 Makefile 的 wire 要对「包」而非「单文件」
+
+`wire ./pkg/wire.go`（单文件模式）只加载该文件自身，看不到同包其它 .go 文件里定义的 provider helper，会误报 `undefined: XxxHelper`。**必须用 `wire ./pkg`（针对目录/包）**：
+
+```makefile
+wire:
+	@wire ./internal/taurus          # ✅ 针对包
+	# @wire ./internal/taurus/wire.go # ❌ 单文件，看不到同包函数
+```
+
+### 9.4 日志领域公共代码收敛
+
+访问日志/操作日志中间件共享的「响应体捕获（statusRecorder）、请求体读取（readBody）、字符串截断（truncate）、大小上限（maxBodyLogSize）、跳过判断（shouldSkipLogging）」应收敛到 `app/middleware/log_common.go`，不要散落在多个中间件文件里重复定义。

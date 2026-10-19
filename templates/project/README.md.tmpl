@@ -1,0 +1,208 @@
+# {{ .ProjectName }}
+
+由 [taurus-x](https://github.com/stones-hub/taurus-x) 生成的后台管理底座：Go + Vue3 单体部署，
+前端构建产物由 Go 进程直接托管（SPA history 回退），对外只暴露一个端口。
+
+底座只包含**管理后台最小闭环**：登录鉴权、用户 / 角色 / 权限（RBAC 三级：菜单 / 按钮 / 接口）、
+部门与部门成员、四类日志（登录 / 访问 / 操作 / 前端错误）。**不含任何业务模块**，业务从空白开始按
+`docs/后端开发流程.md` 与 `docs/前端开发流程.md` 往上长。
+
+---
+
+## 一、技术栈
+
+| 层 | 选型 |
+|----|------|
+| 后端 | Go {{ .GoVersion }}、Google Wire DI、GORM、Redis |
+| 框架组件 | taurus-pro 套件（见下表） |
+| 前端 | Vue 3 + TypeScript + Vite + Element Plus + Pinia + vue-router |
+| 数据库 | MySQL 8.x（建表只走 `scripts/sql/`，**不开 GORM AutoMigrate**） |
+
+### 已启用的框架组件
+
+| 组件 | 作用 | 配置目录 |
+|------|------|----------|
+| common | 日志 / JWT / 工具库 | `backend/config/` |
+| config | 配置加载与环境变量替换 | `backend/config/` |
+| http | HTTP 服务与中间件 | `backend/config/autoload/http/` |
+| storage | MySQL + Redis | `backend/config/autoload/db/`、`redis/` |
+{{- if .Has.consul }}
+| consul | 服务注册发现 | `backend/config/autoload/consul/` |
+{{- end }}
+{{- if .Has.opentelemetry }}
+| opentelemetry | 链路追踪 / 指标上报 | `backend/config/autoload/otel/` |
+{{- end }}
+{{- if .Has.tcp }}
+| tcp | 自带 TCP 长连接服务 | `backend/config/autoload/tcp/` |
+{{- end }}
+{{- if .Has.grpc }}
+| grpc | 自带 gRPC 服务 | `backend/config/autoload/grpc/` |
+{{- end }}
+{{- if .Has.milvus }}
+| milvus | 向量库客户端池 | `backend/config/autoload/milvus/` |
+{{- end }}
+
+未选中的可选组件**完全不存在**于本项目：不在 `go.mod`、不在 `internal/taurus`、不在
+`config/autoload/`、不在 `docker-compose.yml`。需要时再按已有组件的写法补。
+
+---
+
+## 二、目录结构
+
+```
+{{ .ProjectName }}/
+├── backend/
+│   ├── bin/main.go              # 入口
+│   ├── app/
+│   │   ├── bootstrap.go         # 启动 / 信号 / 优雅关闭
+│   │   ├── wire.go|wire_gen.go  # 应用层 DI（make wire 生成）
+│   │   ├── routes/routes.go     # 路由注册 + SPA 静态托管
+│   │   ├── middleware/          # JWT / 权限 / CSRF / 限流 / 三类日志
+│   │   ├── controller/          # 入参校验 + 调 service + 统一响应
+│   │   ├── service/             # 业务编排（事务、权限判断、DTO 组装）
+│   │   ├── repo/                # 数据访问（baseRepository + Store 工作单元）
+│   │   ├── model/               # 贫血模型（12 张底座表）
+│   │   ├── dto/                 # 请求 / 响应结构
+│   │   ├── helper/              # 密码散列 / 校验 / 验证码 / 分页等
+│   │   └── constants/           # 枚举 + 值→中文名映射
+│   ├── internal/taurus/         # 框架层组件图（Components + Provide* + wire）
+│   └── config/                  # 配置（autoload/ 按组件分目录）
+├── frontend/
+│   └── src/{api,types,router,views,composables,components,directives,stores}
+├── scripts/sql/init.sql         # 建表 + 底座权限数据 + 初始管理员
+├── docs/                        # 项目规范 / 前后端开发流程 / 部署文档
+├── Dockerfile
+└── docker-compose.yml
+```
+
+---
+
+## 三、本地起步
+
+### 1. 准备 MySQL / Redis 并导入初始化 SQL
+
+```bash
+mysql -u <用户> -p -e "CREATE DATABASE IF NOT EXISTS {{ .DBName }} DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
+mysql -u <用户> -p {{ .DBName }} < scripts/sql/init.sql
+```
+
+### 2. 配置环境变量
+
+```bash
+cd backend
+cp .env.example .env.local   # 填 DB_DSN / REDIS_* / JWT_SECRET
+```
+
+> `.env.local` 的值会被**原样文本替换**进 `config/` 下的配置文件，再做 YAML/TOML 解析：
+> **不要加引号**，不要在值里写 `}` 或换行。`JWT_SECRET` 用 `openssl rand -hex 32` 生成。
+
+### 3. 起后端
+
+```bash
+cd backend
+make wire     # 仅在增删 controller/service 后需要
+make build    # 产出 build/{{ .ProjectName }}
+./build/{{ .ProjectName }} -config ./config -env .env.local
+```
+
+> ⚠️ 必须**以 `backend/` 为工作目录**运行：`-config ./config`、前端产物 `../frontend/dist`、
+> 日志 `logs/` 都是相对路径。
+
+### 4. 起前端
+
+```bash
+cd frontend
+pnpm install
+pnpm dev      # 开发（Vite dev server，接口代理见 vite.config.ts）
+pnpm build    # 生产构建（含 vue-tsc 类型检查），产出 dist/，由后端托管
+```
+
+### 5. 登录
+
+浏览器打开 `http://127.0.0.1:9080/`，用下面的初始管理员账号登录。
+
+---
+
+## 四、初始管理员账号
+
+| 项 | 值 |
+|----|-----|
+| 用户名 | `{{ .AdminUsername }}` |
+| 初始密码 | `{{ .AdminPassword }}` |
+| 角色 | `super_admin`（代码里直接放行全部菜单/按钮/接口权限） |
+
+密码在 `scripts/sql/init.sql` 里以 `SHA-256(密码 + salt)` 的小写 hex 存入
+`admin_user_logins.login_credential`，`salt` 是 16 字节随机数的 32 位 hex，**每次生成项目都不同**。
+算法与 `backend/app/helper/crypto.go` 的 `HashPassword`/`GenerateSalt` 完全一致。
+
+> ⚠️ **首次登录后立即改密**（个人信息 → 修改密码），并把本节的明文密码从仓库里删掉。
+> 本文件会随代码进版本库，明文密码留在这里等于没有密码。
+
+---
+
+## 五、开发约定（必读）
+
+| 文档 | 内容 |
+|------|------|
+| [`docs/项目规范.md`](docs/项目规范.md) | **唯一权威规则**：分层边界、RBAC、DTO、命名、分页哨兵、前端交互 |
+| [`docs/后端开发流程.md`](docs/后端开发流程.md) | 后端新模块 6 步（model → repo → dto → service → controller → routes + 权限 SQL） |
+| [`docs/前端开发流程.md`](docs/前端开发流程.md) | 前端新模块 4 步（types → api → router → views） |
+| [`docs/部署文档.md`](docs/部署文档.md) | 裸机（supervisor）与 Docker（compose）两种部署方式 |
+
+几条最容易踩的硬约束：
+
+1. **建表与权限数据只走 `scripts/sql/`**，不开 GORM AutoMigrate；变更写增量脚本留痕。
+2. **接口 path 必须与 `admin_permissions.path` 完全一致**（`permission_type=3` 精确匹配）。
+3. 新模块的三级权限（菜单/按钮/接口）要一次配齐；刷新按钮**复用 `.query`**，不单独建权限。
+4. `/admin/option/*` 走 `userBaseChain`（只校验登录），**无需**接口权限。
+5. 密码相关一律用 `app/helper/crypto.go`，不要自己写散列。
+
+---
+
+## 六、Docker
+
+```bash
+# 先按 docs/部署文档.md 第 5.3 节在项目根目录写一份 .env
+# （至少要有 MYSQL_PASSWORD / JWT_SECRET / DB_DSN，JWT_SECRET 未设置时 compose 会直接拒绝启动）
+docker compose up -d --build
+```
+
+`docker compose` 只编排**本项目实际选中的组件**。详见 [`docs/部署文档.md`](docs/部署文档.md)。
+
+---
+
+## 七、已知风险与待办
+
+底座是从一个在用的管理后台抽取的，以下问题**已知、尚未修复**，在上生产前请逐条处理：
+
+### 安全
+
+1. **密码散列用 SHA-256 + salt，强度不足**。SHA-256 是快速散列，对离线爆破几乎没有成本门槛。
+   生产前应换成 `bcrypt` 或 `argon2id`（`golang.org/x/crypto`）。改动点集中在
+   `app/helper/crypto.go` 的三个函数；因为 `salt` 与 `login_credential` 都在
+   `admin_user_logins` 里，可以做「登录时发现是旧格式就重算并升级」的平滑迁移。
+2. **`config/autoload/http/http.yaml` 的 JWT 密钥有弱默认值**。`.env.local` / compose 的
+   `JWT_SECRET` 没设置时会退回该默认值，等于任何人都能签发合法 token。
+   compose 已用 `${JWT_SECRET:?...}` 强制必填，**裸机部署没有这层保护，务必自行确认已设置**。
+3. **本 README 第四节含初始管理员明文密码**。首次登录改密后请删除该节内容。
+4. **`.env.local` / `.env` 必须留在版本库外**（已在 `.gitignore` 里），并设 `chmod 600`。
+5. 访问日志与操作日志会落**请求体与响应体**（截断）。涉及密码、令牌、个人敏感信息的接口
+   应在 `app/middleware/` 的日志中间件里加字段脱敏，目前**没有脱敏**。
+
+### 功能缺陷
+
+6. **`admin_depts.dept_code` 是 `NOT NULL DEFAULT ''` 上的唯一索引**，而 `AddDept`
+   允许 `dept_code` 为空 —— 于是**第二个不填编码的部门会因唯一键冲突而创建失败**。
+   修法二选一：把 `dept_code` 改成可空（`*string`，像 `mobile`/`email` 那样，MySQL 允许多个
+   NULL），或在 service 层强制 `dept_code` 必填。
+7. **`/admin/user/change-password`、`set-password`、`bind-mobile`、`unbind-mobile`
+   挂在 `userProtectedChain` 上**（走接口权限校验）。`super_admin` 不受影响，但
+   **普通角色不配这几条接口权限就改不了自己的密码**。给每个角色都配上，或把「改自己」
+   的那几个接口移到 `userBaseChain`。
+8. 日志表没有归档 / 清理机制，`admin_access_logs` 会随流量无上限增长。上生产前加分区、
+   定期归档或定时清理（可用 `app/crontab/`）。
+
+### 其它
+
+9. `docs/` 下的流程文档用「公告（Notice）」作为贯穿的示例域，**那是示例，不是已实现的模块**，
+   仓库里没有对应代码和表。

@@ -1,0 +1,180 @@
+package helper
+
+import (
+	"fmt"
+	"time"
+)
+
+// timeFormats 支持的常见时间格式（自动匹配）
+var timeFormats = []string{
+	time.RFC3339,
+	"2006-01-02 15:04:05",
+	"2006-01-02 15:04",
+	"2006-01-02",
+	"2006/01/02 15:04:05",
+	"2006/01/02",
+	"02-01-2006",
+	"15:04:05",
+}
+
+// ParseStringToTime 自动识别任意格式字符串 → 标准 time.Time（空串或无法解析返回零值）
+func ParseStringToTime(timeStr string) time.Time {
+	if timeStr == "" {
+		return time.Time{}
+	}
+
+	for _, format := range timeFormats {
+		t, err := time.ParseInLocation(format, timeStr, time.Local)
+		if err == nil {
+			return t
+		}
+	}
+
+	// 所有格式都不匹配 → 返回零值
+	return time.Time{}
+}
+
+// ParseStringToTimePtr 同 ParseStringToTime，但返回 *time.Time（nil 表示空/无法解析，给 Model 用）
+func ParseStringToTimePtr(timeStr string) *time.Time {
+	if timeStr == "" {
+		return nil
+	}
+	t := ParseStringToTime(timeStr)
+	if t.IsZero() {
+		return nil
+	}
+	return &t
+}
+
+// TimePtrToDatetime *time.Time → "2006-01-02 15:04:05"（nil/零值返回 ""）
+func TimePtrToDatetime(t *time.Time) string {
+	if t == nil || t.IsZero() {
+		return ""
+	}
+	return t.Format("2006-01-02 15:04:05")
+}
+
+// TimePtrToDatetimePtr *time.Time → *string 的 "2006-01-02 15:04:05"（nil 返回 nil）
+func TimePtrToDatetimePtr(t *time.Time) *string {
+	if t == nil || t.IsZero() {
+		return nil
+	}
+	s := t.Format("2006-01-02 15:04:05")
+	return &s
+}
+
+// TimePtrToDate *time.Time → "2006-01-02"（nil/零值返回 ""）
+func TimePtrToDate(t *time.Time) string {
+	if t == nil || t.IsZero() {
+		return ""
+	}
+	return t.Format("2006-01-02")
+}
+
+// TimeToDatetime time.Time → "2006-01-02 15:04:05"（零值返回 ""）
+func TimeToDatetime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format("2006-01-02 15:04:05")
+}
+
+// TimeToDate time.Time → "2006-01-02"（零值返回 ""）
+func TimeToDate(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format("2006-01-02")
+}
+
+// FormatDateField 万能格式化时间：自动识别 time.Time / RFC3339 字符串。
+// layout 传 "2006-01-02" 或 "2006-01-02 15:04:05"。用于原生 SQL 查询返回的 map 行里的时间字段格式化。
+func FormatDateField(m map[string]interface{}, key string, layout string) {
+	val, ok := m[key]
+	if !ok || val == nil {
+		return
+	}
+
+	if t, ok := val.(time.Time); ok {
+		if !t.IsZero() {
+			m[key] = t.Format(layout)
+		}
+		return
+	}
+
+	str, ok := val.(string)
+	if !ok || str == "" {
+		return
+	}
+
+	t := ParseStringToTime(str)
+	if !t.IsZero() {
+		m[key] = t.Format(layout)
+	}
+}
+
+// GetMonthStartDay 获取传入日期所在月份的第一天。
+// inputDate: 格式 yyyy-MM-dd，例："2026-05-15"；return 当月第一天 yyyy-MM-dd。
+func GetMonthStartDay(inputDate string) (string, error) {
+	t, err := time.Parse("2006-01-02", inputDate)
+	if err != nil {
+		return "", fmt.Errorf("日期解析失败: %w", err)
+	}
+	firstDay := time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, t.Location())
+	return firstDay.Format("2006-01-02"), nil
+}
+
+// GetMonthLastDay 获取传入日期所在月份的最后一天。
+// inputDate: 格式 yyyy-MM-dd，例："2026-05-01"；return 当月最后一天 yyyy-MM-dd。
+func GetMonthLastDay(inputDate string) (string, error) {
+	t, err := time.Parse("2006-01-02", inputDate)
+	if err != nil {
+		return "", fmt.Errorf("日期解析失败: %w", err)
+	}
+	nextMonthFirst := t.AddDate(0, 1, 0)
+	lastDay := nextMonthFirst.AddDate(0, 0, -1)
+	return lastDay.Format("2006-01-02"), nil
+}
+
+// MonthRange 单月起止日期结构体。
+type MonthRange struct {
+	MonthStart string `json:"month_start"` // 当月第一天 yyyy-MM-dd
+	MonthEnd   string `json:"month_end"`   // 当月最后一天 yyyy-MM-dd
+}
+
+// GetEveryMonthRange 输入起止日期，返回区间内每个自然月的第一天、最后一天。
+func GetEveryMonthRange(startDate, endDate string) ([]MonthRange, error) {
+	layout := "2006-01-02"
+	start, err := time.Parse(layout, startDate)
+	if err != nil {
+		return nil, err
+	}
+	end, err := time.Parse(layout, endDate)
+	if err != nil {
+		return nil, err
+	}
+
+	var list []MonthRange
+	currentYear, currentMonth, _ := start.Date()
+
+	for {
+		monthStart := time.Date(currentYear, currentMonth, 1, 0, 0, 0, 0, time.UTC)
+		monthEnd := monthStart.AddDate(0, 1, 0).AddDate(0, 0, -1)
+
+		if monthStart.After(end) {
+			break
+		}
+
+		list = append(list, MonthRange{
+			MonthStart: monthStart.Format(layout),
+			MonthEnd:   monthEnd.Format(layout),
+		})
+
+		currentMonth++
+		if currentMonth > 12 {
+			currentMonth = 1
+			currentYear++
+		}
+	}
+	return list, nil
+}

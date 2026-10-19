@@ -1,0 +1,222 @@
+/* 全局主题：现代靛蓝/紫渐变管理后台 */
+
+:root {
+  /* 覆盖 Element Plus 主色 */
+  --el-color-primary: #6366f1;
+  --el-color-primary-light-3: #818cf8;
+  --el-color-primary-light-5: #a5b4fc;
+  --el-color-primary-light-7: #c7d2fe;
+  --el-color-primary-light-8: #e0e7ff;
+  --el-color-primary-light-9: #eef2ff;
+  --el-color-primary-dark-2: #4f46e5;
+
+  /* ===== 字体：小巧但清晰 ===== */
+  --el-font-size-base: 13px;        /* 默认正文 */
+  --el-font-size-small: 12px;       /* 次要文字 */
+  --el-font-size-extra-small: 11px; /* 辅助/角标 */
+  --el-font-size-large: 14px;       /* 较大文字 */
+
+  /* 表格字体与内边距（更宽松） */
+  --el-table-font-size: 12px;
+  --el-table-header-text-color: #374151;
+  --el-table-header-bg-color: #f8fafc;
+  --el-table-row-hover-bg-color: #f5f7fa;
+  --el-table-border-color: #eef0f3;
+  --el-table-header-padding: 12px 0;
+  --el-table-cell-padding: 12px 0;
+
+  /* 表单间距（更宽松） */
+  --el-form-item-margin-bottom: 22px;
+  --el-form-label-font-size: 13px;
+
+  /* 卡片内边距（更宽松） */
+  --el-card-padding: 24px;
+
+  /* 布局配色 */
+  --sidebar-bg: linear-gradient(180deg, #1e1b4b 0%, #312e81 50%, #1e293b 100%);
+  --sidebar-text: #cbd5e1;
+  --sidebar-active-bg: rgba(99, 102, 241, 0.22);
+  --sidebar-active-text: #ffffff;
+  --content-bg: #f5f7fa;
+  --header-bg: #ffffff;
+  --border-color: #e5e7eb;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: 'Inter', 'PingFang SC', 'Microsoft YaHei', -apple-system, BlinkMacSystemFont,
+    'Segoe UI', Roboto, sans-serif;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #374151;
+  background: var(--content-bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* 滚动条美化 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* ===== Element Plus 通用控件 ===== */
+.el-button {
+  border-radius: 8px;
+}
+.el-card {
+  border-radius: 12px;
+  border: none;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+.el-input__wrapper,
+.el-textarea__inner {
+  border-radius: 8px;
+}
+
+/* 表单标签：颜色略沉、字重适中，更清晰；不换行 */
+.el-form-item__label {
+  color: #4b5563;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+/* 表格单元格文字行高更舒展 */
+.el-table .cell {
+  line-height: 1.6;
+}
+
+/* 输入框内字号跟随全局 */
+.el-input__inner,
+.el-textarea__inner {
+  font-size: var(--el-font-size-base);
+}
+
+/* ====================================================================
+ * 公共业务样式（列表页 / 编辑页 / 表单通用），统一管理避免各页面重复
+ * ==================================================================== */
+
+/* 列表页：整页容器 + 卡片内筛选/表格/分页的标准布局 */
+.list-page {
+  padding: 0;
+}
+.list-page .el-card {
+  border-radius: 12px;
+}
+
+/* 列表筛选栏：inline 表单项留出呼吸感 */
+.list-page .el-form--inline .el-form-item,
+.el-form--inline.filter-form .el-form-item {
+  margin-right: 20px;
+  margin-bottom: 16px;
+}
+
+/* 列表筛选栏：包裹 inline 表单，与下方工具栏分隔留呼吸 */
+.filter-bar {
+  padding-bottom: 4px;
+}
+
+/* 操作按钮栏（新增 / 刷新 等） */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+/* 表格下方分页：右对齐 */
+.table-pagination {
+  margin-top: 20px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* 编辑页 / 表单页 标题 */
+.page-title {
+  font-weight: 600;
+  color: #1f2937;
+  font-size: 15px;
+}
+
+/* 表单页头部：返回按钮 + 标题（返回按钮在左，标题紧随其后） */
+.edit-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 分组标题（el-card header 里的区块标题） */
+.section-title {
+  font-weight: 600;
+  color: #1f2937;
+  font-size: 15px;
+}
+
+/* 表单底部操作按钮：右对齐 + 上间距 */
+.form-actions {
+  text-align: right;
+  padding-top: 12px;
+}
+
+/* 提示条（el-alert）在表单里的下间距 */
+.tip {
+  margin-bottom: 20px;
+}
+
+/* 树形/多选勾选容器（权限树、角色分配等） */
+.perm-tree-box,
+.select-box {
+  width: 100%;
+  max-height: 560px;
+  overflow-y: auto;
+  border: 1px solid #eef0f3;
+  border-radius: 8px;
+  padding: 10px 14px;
+}
+
+/* 空数据提示 */
+.empty-tip {
+  color: #9ca3af;
+  font-size: 12px;
+}
+
+/* 保留换行的多行文本（详情页「备注」等长文本原样展示 \n 换行，不被 HTML 折叠） */
+.pre-wrap {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ====================================================================
+ * 日志详情抽屉公共样式（访问日志/操作日志详情里的请求体/响应体 pre 展示）
+ * ==================================================================== */
+.log-body {
+  margin: 0;
+  padding: 12px;
+  background: #f5f7fa;
+  border: 1px solid #e4e7ed;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 320px;
+  overflow-y: auto;
+}

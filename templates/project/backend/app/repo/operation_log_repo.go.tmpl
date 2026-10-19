@@ -1,0 +1,58 @@
+package repo
+
+import (
+	"context"
+
+	"gorm.io/gorm"
+
+	"{{ .Module }}/app/model"
+)
+
+// OperationLogRepository 操作日志数据访问层
+type OperationLogRepository struct {
+	*baseRepository[model.OperationLog]
+}
+
+func NewOperationLogRepositoryWithDB(db *gorm.DB) *OperationLogRepository {
+	return &OperationLogRepository{baseRepository: newBaseRepository[model.OperationLog](db)}
+}
+
+// FindByID 根据日志 ID 查找
+func (r *OperationLogRepository) FindByID(ctx context.Context, id uint64) (*model.OperationLog, error) {
+	return r.firstBy(ctx, "log_id = ?", id)
+}
+
+// OperationLog 返回操作日志仓储
+func (r repoSet) OperationLog() *OperationLogRepository {
+	return NewOperationLogRepositoryWithDB(r.db)
+}
+
+// OperationLogListFilter 操作日志列表筛选条件
+type OperationLogListFilter struct {
+	UserID   uint64
+	Method   string
+	Path     string
+	Action   string
+	Resource string
+}
+
+// ListWithFilter 分页查询操作日志（结构化筛选）
+func (r *OperationLogRepository) ListWithFilter(ctx context.Context, page, pageSize int, f OperationLogListFilter) ([]model.OperationLog, int64, error) {
+	q := r.db.WithContext(ctx).Model(&model.OperationLog{})
+	if f.UserID > 0 {
+		q = q.Where("user_id = ?", f.UserID)
+	}
+	if f.Method != "" {
+		q = q.Where("method = ?", f.Method)
+	}
+	if f.Path != "" {
+		q = q.Where("path LIKE ?", "%"+f.Path+"%")
+	}
+	if f.Action != "" {
+		q = q.Where("action = ?", f.Action)
+	}
+	if f.Resource != "" {
+		q = q.Where("resource = ?", f.Resource)
+	}
+	return r.page(q, page, pageSize, "log_id DESC")
+}

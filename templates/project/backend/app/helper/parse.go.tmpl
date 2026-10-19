@@ -1,0 +1,44 @@
+package helper
+
+// parse 字符串 → 数值 的解析工具（用于表单数字字段转换，解析失败返回零值）。
+
+import (
+	"math"
+	"strconv"
+)
+
+// ParseUint 解析字符串为 uint64，失败返回 0
+func ParseUint(s string) uint64 {
+	v, _ := strconv.ParseUint(s, 10, 64)
+	return v
+}
+
+// ParseInt8 解析字符串为 int8，失败返回 0
+func ParseInt8(s string) int8 {
+	v, _ := strconv.ParseInt(s, 10, 8)
+	return int8(v)
+}
+
+// ParseFloat 解析字符串为 float64，失败返回 0
+func ParseFloat(s string) float64 {
+	v, _ := strconv.ParseFloat(s, 64)
+	return v
+}
+
+// RoundFloat 四舍五入保留 dec 位小数（dec<0 返回原值）。
+func RoundFloat(val float64, dec int) float64 {
+	if dec < 0 {
+		return val
+	}
+	shift := math.Pow10(dec)
+	return math.Round(val*shift) / shift
+}
+
+// StrSliceToAny []string → []interface{}（用于 GORM 变参 IN 条件展开）。
+func StrSliceToAny(s []string) []interface{} {
+	out := make([]interface{}, 0, len(s))
+	for _, v := range s {
+		out = append(out, v)
+	}
+	return out
+}

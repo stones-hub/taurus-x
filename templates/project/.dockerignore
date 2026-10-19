@@ -1,0 +1,25 @@
+# git
+.git
+.gitignore
+.idea
+.vscode
+
+# 依赖与构建产物
+**/node_modules
+**/dist
+**/build
+**/release
+
+# Go 编译缓存与产物
+backend/logs
+backend/downloads
+backend/*.local
+backend/build
+
+# 文档/脚本无需进镜像
+docs
+scripts/sql
+
+# 其它
+*.md
+.DS_Store

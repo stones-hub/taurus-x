@@ -1,0 +1,26 @@
+package taurus
+
+// Container 框架层全局组件容器
+var Container *Components
+
+// BuildComponents 构建所有框架组件
+// configPath 为配置文件或目录路径
+// env 为环境变量文件路径
+func BuildComponents(configPath, env string) (func(), error) {
+	var (
+		cleanup func()
+		err     error
+	)
+
+	// build Components（注意：用 = 而非 := 避免遮蔽包级 Container）
+	Container, cleanup, err = buildComponents(&ConfigOptions{
+		ConfigPath:  configPath,
+		Env:         env,
+		PrintEnable: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return cleanup, nil
+}

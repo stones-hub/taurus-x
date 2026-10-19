@@ -1,0 +1,38 @@
+package controller
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/stones-hub/taurus-pro-http/pkg/httpx"
+)
+
+// 本文件收敛 controller 层的统一响应 boilerplate（deep helper）。
+//
+// 之前每个 handler 都手写「解码 + 判错 + httpx.SendResponse 错误包装」的
+// 样板，导致响应形态散落（错误文案塞 data.message、code 值用 http.StatusXXX
+// 数字）且容易不一致。这里把三种高频动作收进三个小函数，controller 只剩
+// 业务委托，响应契约（{code, message, data} + 错误时 data={"message":"..."}）
+// 完全不变（前端 http.ts 按 body.code 2xx 判成功、extractError 读 data.message）。
+
+// BindJSON 解码 JSON 请求体到 dst；失败时自动回写 400「请求参数格式错误」
+// 并返回 false（调用方直接 return，不应继续处理）。
+func BindJSON(w http.ResponseWriter, r *http.Request, dst interface{}) bool {
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		Fail(w, http.StatusBadRequest, "请求参数格式错误")
+		return false
+	}
+	return true
+}
+
+// OK 成功响应（body.code = 200）。
+func OK(w http.ResponseWriter, data interface{}) {
+	httpx.SendResponse(w, http.StatusOK, data, nil)
+}
+
+// Fail 错误响应（body.code = code，data = {"message": message}）。
+// code 沿用 HTTP 状态码语义（400 参数错误 / 401 未授权 / 404 不存在 / 500 业务错误），
+// 前端按 body.code 判定并弹 message。
+func Fail(w http.ResponseWriter, code int, message string) {
+	httpx.SendResponse(w, code, map[string]string{"message": message}, nil)
+}

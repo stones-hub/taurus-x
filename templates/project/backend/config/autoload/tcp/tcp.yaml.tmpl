@@ -1,0 +1,14 @@
+tcp:
+  # 默认关闭：选了 tcp 组件只代表代码和依赖就绪。
+  # 开启前需要先在 app/hooks 或自己的 init 里注册 handler（见下面的 handler 配置），
+  # 否则启动会因为找不到 handler 失败。
+  enable: ${TCP_ENABLE:false}
+
+  address: "${TCP_ADDRESS::8081}"       # 独立监听端口，与 HTTP 一起启动、一起优雅关闭
+  protocol: "${TCP_PROTOCOL:json}"      # json / binary
+  handler: "${TCP_HANDLER:default}"     # 需用 tcp.RegisterHandler(name, handler) 注册过
+  max_connections: 1000
+  max_message_size: 1048576             # 单条消息上限（字节），默认 1MB
+  buffer_size: 1024
+  idle_timeout: 300                     # 空闲断开（秒）
+  rate_limiter: 100                     # 每连接每秒消息数上限

@@ -1,0 +1,120 @@
+// 原生 SQL 返回的 map[string]interface{} 行的安全取值工具（等价 tmap）。
+//
+// MySQL driver 下 DECIMAL 列返回 []byte、INT 列返回 int64、FLOAT 返回 float64、
+// DATE 列返回 time.Time。这些函数统一处理 []byte/string/数值/time.Time 转换，取不到返回 def。
+package helper
+
+import (
+	"fmt"
+	"strconv"
+	"time"
+)
+
+// toString 把任意值安全转成 string（[]byte/time.Time 优先）。
+func toString(v interface{}) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case []byte:
+		return string(t)
+	case string:
+		return t
+	case time.Time:
+		if t.IsZero() {
+			return ""
+		}
+		return t.Format("2006-01-02")
+	case fmt.Stringer:
+		return t.String()
+	case int64:
+		return strconv.FormatInt(t, 10)
+	case int:
+		return strconv.Itoa(t)
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	default:
+		return fmt.Sprintf("%v", t)
+	}
+}
+
+// MapGetString 取 string
+func MapGetString(m map[string]interface{}, key string, def string) string {
+	v, ok := m[key]
+	if !ok || v == nil {
+		return def
+	}
+	s := toString(v)
+	if s == "" {
+		return def
+	}
+	return s
+}
+
+// MapGetInt64 取 int64
+func MapGetInt64(m map[string]interface{}, key string, def int64) int64 {
+	v, ok := m[key]
+	if !ok || v == nil {
+		return def
+	}
+	switch t := v.(type) {
+	case int64:
+		return t
+	case int:
+		return int64(t)
+	case uint64:
+		return int64(t)
+	case float64:
+		return int64(t)
+	case []byte:
+		n, err := strconv.ParseInt(string(t), 10, 64)
+		if err != nil {
+			return def
+		}
+		return n
+	case string:
+		n, err := strconv.ParseInt(t, 10, 64)
+		if err != nil {
+			return def
+		}
+		return n
+	default:
+		return def
+	}
+}
+
+// MapGetInt 取 int
+func MapGetInt(m map[string]interface{}, key string, def int) int {
+	return int(MapGetInt64(m, key, int64(def)))
+}
+
+// MapGetFloat64 取 float64
+func MapGetFloat64(m map[string]interface{}, key string, def float64) float64 {
+	v, ok := m[key]
+	if !ok || v == nil {
+		return def
+	}
+	switch t := v.(type) {
+	case float64:
+		return t
+	case float32:
+		return float64(t)
+	case int64:
+		return float64(t)
+	case int:
+		return float64(t)
+	case []byte:
+		f, err := strconv.ParseFloat(string(t), 64)
+		if err != nil {
+			return def
+		}
+		return f
+	case string:
+		f, err := strconv.ParseFloat(t, 64)
+		if err != nil {
+			return def
+		}
+		return f
+	default:
+		return def
+	}
+}

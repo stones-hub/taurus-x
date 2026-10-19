@@ -1,0 +1,476 @@
+# {{ .ProjectName }} 部署文档（Ubuntu 22.04 LTS）
+
+> 目标环境：Ubuntu 22.04.2 LTS（Jammy），**全新服务器，未安装任何相关软件**。
+> 代码获取：**git 下载**，统一放在 `/data/app`。
+> 前端纯静态资源由 Go 后端托管（history 路由回退），**无需 node 常驻**。
+>
+> 提供两种部署方式，二选一：
+> - **方式一：裸机部署** —— 直接装 Go/MySQL/Redis，supervisor 管 Go 进程，Go 直接对外 `9080`。
+> - **方式二：Docker 部署** —— docker compose 一键编排 mysql/redis/app 三个容器，对外 `9080`。
+>
+> 两种方式**默认都不含 nginx**（Go 直接对外 9080）；如需 `80/443` 入口、HTTPS、多域名，再按「可选：nginx 反向代理」章节加一层。
+
+---
+
+## 一、架构与依赖总览
+
+```
+浏览器 ──> 域名:9080 ──> Go 服务
+                           ├── /auth/*、/admin/* …  业务 API
+                           ├── /report-front-error   前端错误上报（公共）
+                           ├── /assets/* 等          前端构建产物
+                           └── / 及其它路径          SPA history 回退 index.html
+
+（可选）浏览器 ──> 域名:80/443 ──> nginx ──> Go 服务(9080)
+```
+
+依赖组件：
+
+| 组件 | 用途 | 端口 | 说明 |
+|------|------|------|------|
+| Go | 后端运行 | 9080 | {{ .GoVersion }}（`go.mod` 声明） |
+| MySQL | 业务数据库 | 3306 | 8.x |
+| Redis | 验证码 / 登录态 / 限流计数 | 6379 | 5.x+ |
+| supervisor | Go 进程守护（仅方式一） | - | 裸机用 |
+| Docker | 容器编排（仅方式二） | - | Docker 用 |
+| nginx | 反向代理（**可选**） | 80/443 | 两种方式都可加 |
+{{- if .Has.consul }}
+| Consul | 服务注册发现 | 8500 | 已选组件，compose 内置 `consul` 服务（dev 模式，生产请换集群部署） |
+{{- end }}
+{{- if .Has.milvus }}
+| Milvus | 向量库 | 19530 / 9091 | 已选组件，compose 内置 standalone + 依赖的 etcd / minio |
+{{- end }}
+{{- if .Has.opentelemetry }}
+| OpenTelemetry Collector | 链路追踪上报 | 4317 | 已选组件，**不在 compose 内**；自备 collector 后在 `config/autoload/otel/` 填地址并打开开关 |
+{{- end }}
+{{- if .Has.tcp }}
+| 自带 TCP 服务 | 长连接服务 | 8081 | 已选组件，默认关闭；注册好 handler 后打开 `TCP_ENABLE` |
+{{- end }}
+{{- if .Has.grpc }}
+| 自带 gRPC 服务 | RPC 服务 | 50051 | 已选组件，默认关闭；注册好 service 后打开 `GRPC_ENABLE` |
+{{- end }}
+
+> 构建前端需 node（20.19+ / 22.12+，Vite 8 要求），但**只在构建时**需要，运行时不需；推荐本机构建后上传 `dist`。
+
+---
+
+## 二、目录规划（代码统一放 `/data/app`）
+
+```
+/data/app/                    # 应用根目录（git clone 到此处）
+├── backend/
+│   ├── build/
+│   │   └── {{ .ProjectName }}       # 后端二进制（构建产物）
+│   ├── config/                # 配置文件（必须）
+│   ├── .env.local             # 环境变量（方式一用；方式二走 compose environment）
+│   └── logs/                  # 运行时日志
+└── frontend/
+    └── dist/                  # 前端构建产物（必须）
+```
+
+> ⚠️ **关键约束**：Go 服务**必须以 `backend/` 为工作目录运行**，因为：
+> - 启动参数 `-config ./config`、`-env .env.local` 是相对路径；
+> - 静态托管 `spaHandler` 用 `../frontend/dist` 相对路径读前端产物；
+> - 日志 `logs/` 也是相对 `backend/` 的路径。
+>
+> （Docker 方式下镜像内目录结构还原成 `/app/backend` + `/app/frontend/dist`，同样满足此约束。）
+
+---
+
+## 三、获取代码（git）
+
+```bash
+sudo mkdir -p /data/app
+cd /data/app
+git clone <你的仓库地址> .
+git checkout main
+```
+
+> 服务器无法访问代码仓库时，可在有网机器 `git archive` 打包后传输。
+
+---
+
+## 四、方式一：裸机部署
+
+### 4.1 安装 Go 1.25
+
+```bash
+wget https://go.dev/dl/go{{ .GoVersion }}.linux-amd64.tar.gz
+sudo rm -rf /usr/local/go
+sudo tar -C /usr/local -xzf go{{ .GoVersion }}.linux-amd64.tar.gz
+
+echo 'export PATH=$PATH:/usr/local/go/bin' | sudo tee /etc/profile.d/go.sh
+source /etc/profile.d/go.sh
+go version   # go{{ .GoVersion }} linux/amd64
+```
+
+> 若「本机构建后只上传二进制」，服务器可跳过装 Go（见 4.4 构建小节）。
+
+### 4.2 安装与配置 MySQL
+
+```bash
+sudo apt update
+sudo apt install -y mysql-server
+sudo systemctl enable --now mysql
+sudo mysql_secure_installation   # 设 root 密码、删匿名用户、禁 root 远程
+```
+
+建库建账号：
+
+```sql
+-- sudo mysql 后执行
+CREATE DATABASE IF NOT EXISTS {{ .DBName }} DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+CREATE USER '{{ .DBName }}'@'localhost' IDENTIFIED BY '<强密码>';
+GRANT ALL PRIVILEGES ON {{ .DBName }}.* TO '{{ .DBName }}'@'localhost';
+FLUSH PRIVILEGES;
+EXIT;
+```
+
+导入初始化 SQL：
+
+```bash
+cd /data/app
+mysql -u {{ .DBName }} -p {{ .DBName }} < scripts/sql/init.sql   # 建表 + 底座菜单权限 + 初始管理员
+```
+
+> 初始管理员账号与默认密码见 `README.md`，**首次登录后必须立即改密**。
+> 后续表结构变更按增量 SQL 落盘 `scripts/sql/`，不要重复执行 `init.sql`。
+
+### 4.3 安装与配置 Redis
+
+```bash
+sudo apt install -y redis-server
+sudo systemctl enable --now redis-server
+```
+
+默认监听 127.0.0.1、无密码够用；加密码改 `/etc/redis/redis.conf` 的 `requirepass` 并同步 `.env.local`。
+{{- if or .Has.consul .Has.milvus }}
+
+> ⚠️ 裸机方式下，{{ if .Has.consul }}Consul{{ end }}{{ if and .Has.consul .Has.milvus }} 与 {{ end }}{{ if .Has.milvus }}Milvus{{ end }} 需要**自行按官方文档安装**（apt 源里没有），
+> 然后把地址填进 `config/autoload/` 下对应组件的配置。只想先跑起来的话，把这些组件的
+> `enable` 置为 `false`，底座自身不依赖它们。Docker 方式已在 compose 里内置，无需手装。
+{{- end }}
+
+### 4.4 构建 Go 二进制 + 前端
+
+```bash
+# 后端
+cd /data/app/backend
+cp .env.example .env.local && vim .env.local   # 填 DB_DSN / JWT_SECRET / REDIS 等
+make build                                     # 产出 build/{{ .ProjectName }}
+
+# 前端（本机构建后上传，服务器无需 node）
+# 本机: cd frontend && pnpm install && pnpm build
+# scp -r frontend/dist 服务器:/data/app/frontend/
+```
+
+`.env.local` 必填：
+
+| 变量 | 说明 |
+|------|------|
+| `DB_DSN` | `{{ .DBName }}:<密码>@tcp(127.0.0.1:3306)/{{ .DBName }}?charset=utf8mb4&parseTime=True&loc=Local`（**不要加引号**，值会被原样代入配置文件） |
+| `REDIS_HOST/PORT/PASSWORD` | Redis 连接 |
+| `JWT_SECRET` | **必改**随机长串 |
+| `SERVER_PORT` | `9080` |
+| `SERVER_ADDRESS` | `0.0.0.0`（直接对外）或 `127.0.0.1`（走 nginx 时） |
+
+### 4.5 安装 supervisor 并接管 Go
+
+```bash
+sudo apt install -y supervisor
+sudo systemctl enable --now supervisor
+```
+
+`/etc/supervisor/conf.d/{{ .ProjectName }}.conf`：
+
+```ini
+[program:{{ .ProjectName }}]
+command=/data/app/backend/build/{{ .ProjectName }} -config ./config -env .env.local
+directory=/data/app/backend
+user=root
+autostart=true
+autorestart=true
+startsecs=3
+stopasgroup=true
+killasgroup=true
+redirect_stderr=true
+stdout_logfile=/data/app/backend/logs/supervisor.log
+```
+
+```bash
+sudo supervisorctl reread && sudo supervisorctl update
+sudo supervisorctl status     # {{ .ProjectName }} RUNNING
+```
+
+> `directory=/data/app/backend` 必须指向 backend（相对路径依赖）。
+
+### 4.6 启动后验证
+
+```bash
+curl http://127.0.0.1:9080/health   # 健康检查
+curl http://127.0.0.1:9080/         # 前端首页
+```
+
+---
+
+## 五、方式二：Docker 部署
+
+### 5.1 前置要求
+
+```bash
+sudo apt install -y docker.io docker-compose-plugin
+sudo systemctl enable --now docker
+```
+
+### 5.2 拉代码 + 准备产物目录
+
+```bash
+mkdir -p /data/app && cd /data/app
+git clone <你的仓库地址> .
+git checkout main
+
+# bind mount 目录：app 容器非 root（uid=1000），需先 chown
+mkdir -p docker-data/logs
+sudo chown -R 1000:1000 docker-data
+```
+
+### 5.3 配置敏感值（compose 的 .env）
+
+```bash
+cd /data/app
+cat > .env <<'EOF'
+MYSQL_ROOT_PASSWORD=改强密码
+MYSQL_PASSWORD=改强密码
+AUTHORIZATION=改随机串
+JWT_SECRET=改随机长串
+DB_DSN={{ .DBName }}:改强密码@tcp(mysql:3306)/{{ .DBName }}?charset=utf8mb4&parseTime=True&loc=Local
+EOF
+chmod 600 .env
+```
+
+> compose `environment` 里 `${VAR:-默认值}` / `${VAR:?...}` 的取值都从本 `.env` 读取；
+> 改完 `docker compose up -d` 重建容器生效。`JWT_SECRET` 没设置时 compose 会直接报错拒绝启动（故意如此）。
+> 注意这些值会被**原样**代入 `config/` 下的配置文件，**不要加引号**、不要在值里写 `}` 或换行。
+
+### 5.4 构建并启动
+
+```bash
+cd /data/app
+docker compose up -d --build
+docker compose ps
+```
+
+- 首次启动 MySQL 自动导入 `scripts/sql/init.sql`（建表 + 底座菜单权限 + 初始管理员）。
+- app 容器对外 `9080:9080`，前端静态由 Go 托管。
+
+#### 5.4.1 国内网络：Go 依赖代理
+
+`Dockerfile` 后端构建阶段默认已设置 `GOPROXY=https://goproxy.cn,direct`，执行 `docker compose up -d --build app` 时会使用该代理下载 Go 依赖，无需额外配置；实际可用性仍取决于目标机网络。
+
+如需切换为其它代理（如公司内部代理、`https://goproxy.io,direct` 或官方 `https://proxy.golang.org,direct`），用 `--build-arg` 覆盖即可，不改 Dockerfile：
+
+```bash
+docker compose build --build-arg GOPROXY=https://goproxy.io,direct app
+docker compose up -d app
+```
+
+若官方基础镜像（`golang`、`node`、`alpine` 等）在 Docker Hub 拉取超时/不可达，**不要配置随机的全局镜像代理**（来源不可控、可能被污染）；改为显式指定一个你信任的加速源，手动预拉并重新打标为 Dockerfile 里原始的镜像名，默认不强制拉取更新时可复用本地镜像；BuildKit 仍可能查询元数据，需以实际构建结果为准：
+
+```bash
+# 示例：从某个明确选定的加速源拉取，再 tag 回 Dockerfile 中的原始标签
+docker pull <明确选定的加速源>/library/golang:1.25-alpine
+docker tag <明确选定的加速源>/library/golang:1.25-alpine golang:1.25-alpine
+
+docker pull <明确选定的加速源>/library/node:22-alpine
+docker tag <明确选定的加速源>/library/node:22-alpine node:22-alpine
+
+docker pull <明确选定的加速源>/library/alpine:3.20
+docker tag <明确选定的加速源>/library/alpine:3.20 alpine:3.20
+
+docker compose up -d --build app
+```
+
+### 5.5 查看运行产物
+
+```bash
+tail -f /data/app/docker-data/logs/app.log      # 日志
+docker exec {{ .ProjectName }}-app tail -f /app/backend/logs/app.log   # 或进容器看
+```
+
+### 5.6 常用命令
+
+```bash
+docker compose ps
+docker compose logs -f app
+docker compose restart app
+docker compose down            # 停机（保留数据卷）
+docker compose down -v         # 停机并清库（危险）
+```
+
+### 5.7 代码更新 / 发版
+
+**无论是前端还是后端代码更新，统一执行这一条即可**：
+
+```bash
+cd /data/app
+git pull
+docker compose up -d --build app
+```
+
+说明：
+- `--build` 会重新构建 app 镜像（前端 dist + 后端二进制一起重新打包）；
+- `up -d app` 只重启 app 容器，**mysql / redis 容器与数据卷不动**；
+- 数据库数据存在 `mysql-data` 卷里，**执行上述命令不会把数据库还原为初始状态**（初始化 SQL 只在数据卷首次为空时执行一次）。
+
+> ⚠️ 日常发版**绝对不要加 `-v`**（`docker compose down -v` 会删除数据卷、清库）。只要不用 `-v`，数据永远安全。
+
+只改配置（compose `environment` / `.env`，不涉及代码）时，重载即可：
+
+```bash
+docker compose up -d app
+```
+
+### 5.8 数据库结构更新（仅当改了表结构时）
+
+因为 MySQL 的 `/docker-entrypoint-initdb.d/` 只在**数据卷首次初始化时**执行，之后不会自动跑。
+**普通功能更新不需要这一步**；只有当代码更新**改了表结构**（加表 / 加字段 / 改索引等）时才需要手动执行增量 SQL：
+
+```bash
+# 方式 1：执行一份增量 SQL 文件（推荐，留档）
+docker exec -i {{ .ProjectName }}-mysql mysql -u{{ .DBName }} -p<密码> {{ .DBName }} < 增量结构.sql
+
+# 方式 2：进容器交互式执行
+docker exec -it {{ .ProjectName }}-mysql mysql -u{{ .DBName }} -p {{ .DBName }}
+```
+
+> 增量 SQL 建议落盘 `scripts/sql/` 留痕（如 `scripts/sql/xxx_增量.sql`），并发版时一并提交。
+
+
+---
+
+## 六、可选：nginx 反向代理
+
+> 两种部署方式**默认不需要 nginx**（Go 直接对外 9080）。仅当你需要 `80/443` 入口、HTTPS、或多个域名统一入口时，再加这一层。Go 服务保持 9080，nginx 反代过去。
+
+### 6.1 安装 nginx
+
+```bash
+sudo apt install -y nginx
+sudo systemctl enable --now nginx
+```
+
+### 6.2 反代配置（方式一/方式二通用）
+
+新建 `/etc/nginx/conf.d/{{ .ProjectName }}.conf`：
+
+```nginx
+server {
+    listen 80;
+    server_name {{ .ProjectName }}.example.com;
+
+    client_max_body_size 20m;      # 请求体上限，按实际需要调整
+
+    location / {
+        proxy_pass http://127.0.0.1:9080;   # Docker 方式同样反代到宿主机 9080
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 60s;
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+    }
+}
+```
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+> **为什么全部 `location /` 反代给 Go**：Go 自己区分 API/静态/SPA 回退，nginx 无需拆 location、无需自配静态目录。
+
+### 6.3 HTTPS（可选 443）
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name {{ .ProjectName }}.example.com;
+    ssl_certificate     /etc/nginx/ssl/{{ .ProjectName }}.pem;
+    ssl_certificate_key /etc/nginx/ssl/{{ .ProjectName }}.key;
+    client_max_body_size 20m;
+    location / {
+        proxy_pass http://127.0.0.1:9080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
+server {
+    listen 80;
+    server_name {{ .ProjectName }}.example.com;
+    return 301 https://$host$request_uri;
+}
+```
+
+---
+
+## 七、验证
+
+```bash
+# 直连 Go（两种方式都是 9080）
+curl http://127.0.0.1:9080/health
+curl http://127.0.0.1:9080/
+curl http://127.0.0.1:9080/login     # SPA history 回退
+
+# 加了 nginx 后
+curl http://127.0.0.1/health
+curl http://{{ .ProjectName }}.example.com/
+```
+
+---
+
+## 八、常见问题（FAQ）
+
+| 现象 | 排查 |
+|------|------|
+| supervisor `FATAL` | `supervisorctl tail -f {{ .ProjectName }}`；`.env.local` 缺失、DB/Redis 连不上、`directory` 没指向 `/data/app/backend/` |
+| Docker app 启动即退 | `docker compose logs app`；环境变量缺（如未设 `JWT_SECRET`）、DB/Redis 连不上、`docker-data` 目录权限（需 chown 1000:1000） |
+| nginx 502 | Go 没起来；`proxy_pass` 的 9080 与 Go `SERVER_PORT` 不一致 |
+| nginx 413 | `client_max_body_size` 太小 |
+| 前端白屏 / 接口 404 | `frontend/dist` 位置（裸机 `/data/app/frontend/dist`；Docker 打进镜像 `/app/frontend/dist`） |
+| 刷新子路由 404 | 确认 Go 做 SPA 回退（history 模式），nginx 全量 `location /` 反代而非自 serve 静态 |
+| MySQL 连不上 | DSN 账号密码、账号 host（localhost vs 127.0.0.1）、库是否存在 |
+| Redis 连不上 | `.env.local`/compose 的 `REDIS_*` 与实际一致 |
+| 配置值解析报错 | 环境变量值**加了引号**或含 `}` / 换行（配置是先文本替换再解析 YAML/TOML） |
+| 登录提示密码错误 | 确认用的是 `README.md` 里的初始管理员账号；`init.sql` 是否真的导入成功 |
+
+---
+
+## 九、两种方式对照
+
+| 项 | 方式一：裸机 | 方式二：Docker |
+|----|------------|---------------|
+| 安装内容 | Go + MySQL + Redis + supervisor | 仅 Docker + compose 插件 |
+| 进程管理 | supervisor | docker restart 策略 |
+| 环境变量 | `.env.local` 文件 | compose `environment` 注入 |
+| 对外端口 | 9080 | 9080（`ports: 9080:9080`） |
+| nginx | 可选加 | 可选加（反代到宿主机 9080） |
+| 日志查看 | `/data/app/backend/logs` | `/data/app/docker-data/logs` |
+| 数据持久化 | 本机 MySQL/Redis | mysql-data / redis-data 卷 |
+
+---
+
+## 十、版本清单
+
+| 项 | 版本 |
+|----|------|
+| OS | Ubuntu 22.04.2 LTS |
+| Go | {{ .GoVersion }} |
+| MySQL | 8.x |
+| Redis | 5.x+ |
+| supervisor | 官方源（方式一） |
+| Docker | docker.io + compose plugin（方式二） |
+| nginx | 官方源（可选） |
+| 前端 | Vue3 + Vite 8（构建需 node 20.19+/22.12+） |
+| 部署目录 | /data/app |

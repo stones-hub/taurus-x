@@ -1,0 +1,10 @@
+# 系统版本
+version: "${VERSION:v1.0.0}"
+app_name: "${APP_NAME:{{ .ProjectName }}}"
+pprof_enabled: true
+
+# Go 运行时配置
+go:
+  max_procs: 8 # 最大cpu核心数
+  gc: 150 # 垃圾回收比例
+  memory_limit: 12 # 内存限制 单位GB

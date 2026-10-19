@@ -1,0 +1,33 @@
+package controller
+
+import (
+	"net/http"
+
+	"github.com/google/wire"
+
+	"{{ .Module }}/app/dto"
+	"{{ .Module }}/app/service"
+)
+
+// LoginLogController 登录日志控制器
+type LoginLogController struct {
+	LoginLogService *service.AdminLoginLogService
+}
+
+// LoginLogControllerSet wire provider set
+var LoginLogControllerSet = wire.NewSet(wire.Struct(new(LoginLogController), "*"))
+
+// GetLoginLogList 获取登录日志列表（POST /admin/login-log/list）
+func (c *LoginLogController) GetLoginLogList(w http.ResponseWriter, r *http.Request) {
+	var req dto.LoginLogListRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	req.Normalize()
+	resp, err := c.LoginLogService.GetLoginLogList(r.Context(), req.PageNo, req.PageSize, req.LoginStatus)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, resp)
+}

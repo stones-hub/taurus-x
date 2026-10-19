@@ -1,0 +1,85 @@
+package controller
+
+import (
+	"net/http"
+
+	"github.com/google/wire"
+
+	"{{ .Module }}/app/dto"
+	tmid "{{ .Module }}/app/middleware"
+	"{{ .Module }}/app/service"
+	"github.com/stones-hub/taurus-pro-common/pkg/util/tnet"
+)
+
+// LogController 系统日志控制器
+type LogController struct {
+	LogService *service.LogService
+}
+
+// LogControllerSet wire provider set
+var LogControllerSet = wire.NewSet(wire.Struct(new(LogController), "*"))
+
+// GetAccessLogList 获取访问日志列表（POST /admin/log/access/list）
+func (c *LogController) GetAccessLogList(w http.ResponseWriter, r *http.Request) {
+	var req dto.AccessLogListRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	req.Normalize()
+	resp, err := c.LogService.GetAccessLogList(r.Context(), req)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, resp)
+}
+
+// GetOperationLogList 获取操作日志列表（POST /admin/log/operation/list）
+func (c *LogController) GetOperationLogList(w http.ResponseWriter, r *http.Request) {
+	var req dto.OperationLogListRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	req.Normalize()
+	resp, err := c.LogService.GetOperationLogList(r.Context(), req)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, resp)
+}
+
+// GetFrontErrorLogList 获取前端错误日志列表（POST /admin/log/front-error/list）
+func (c *LogController) GetFrontErrorLogList(w http.ResponseWriter, r *http.Request) {
+	var req dto.FrontErrorLogListRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	req.Normalize()
+	resp, err := c.LogService.GetFrontErrorLogList(r.Context(), req)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, resp)
+}
+
+// ReportFrontError 前端错误上报（公共路由，无需登录）
+func (c *LogController) ReportFrontError(w http.ResponseWriter, r *http.Request) {
+	var req dto.FrontErrorReportRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+
+	var userID uint64
+	if uid, ok := tmid.CurrentUserIDFromJWT(r); ok {
+		userID = uid
+	}
+
+	if err := c.LogService.ReportFrontError(r.Context(), &req, userID, tnet.GetRemoteIP(r), r.UserAgent()); err != nil {
+		// 错误上报兜底失败：不打日志会静默吞掉，这里降级记录但不影响对前端的 200 响应
+		Fail(w, http.StatusInternalServerError, "前端错误上报失败")
+		return
+	}
+	OK(w, nil)
+}

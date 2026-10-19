@@ -1,0 +1,45 @@
+consul:
+  # 默认关闭：选了 consul 组件只代表代码和依赖就绪，真正启用请把 CONSUL_ENABLE 设为 true。
+  # 开启后进程启动时会注册服务、退出时注销。
+  enable: ${CONSUL_ENABLE:false}
+
+  client:
+    address: "${CONSUL_ADDRESS:127.0.0.1:8500}"
+    token: "${CONSUL_TOKEN: }"       # 留空表示不带 token（占位符默认值不能为空串，用一个空格占位）
+    timeout: 5                        # 请求超时（秒）
+    scheme: "${CONSUL_SCHEME:http}"
+    datacenter: "${CONSUL_DATACENTER:dc1}"
+    wait_time: 10                     # 等待 consul 返回的时间（秒）
+    retry_time: 3                     # 重试间隔（秒）
+    max_retrys: 3                     # 最大重试次数
+    http_basic_auth:                  # consul 开了 basic auth 才需要填
+      username: "${CONSUL_USERNAME: }"
+      password: "${CONSUL_PASSWORD: }"
+
+  service:
+    name: "{{ .ProjectName }}"
+    id: "${CONSUL_SERVICE_ID:{{ .ProjectName }}-1}"
+    tags: ["http"]
+    address: "${CONSUL_SERVICE_ADDRESS:127.0.0.1}"
+    port: ${SERVER_PORT:9080}
+    meta: { version: "v0.0.1", type: "http" }
+    healths:
+      - http: "http://${CONSUL_SERVICE_ADDRESS:127.0.0.1}:${SERVER_PORT:9080}/health"
+        http_method: "GET"
+        http_headers:
+          Accept: ["application/json"]
+        tcp: ""
+        interval: 10                  # 健康检查间隔（秒）
+        timeout: 5                    # 健康检查超时（秒）
+        deregister_after: 60          # 连续不健康多久后摘除（秒）
+        tls_skip_verify: false
+
+  watch:
+    wait_time: 10
+    retry_time: 3
+
+  invoke:
+    load_balance_strategy: 0          # 0 随机 / 1 轮询 / 2 最少连接
+    timeout: 5
+    retry_count: 3
+    retry_interval: 1

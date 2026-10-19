@@ -1,0 +1,210 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: {{ .ProjectName }}-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root123456}
+      MYSQL_DATABASE: {{ .DBName }}
+      MYSQL_USER: {{ .DBName }}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-change-me-123456}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+      - --default-time-zone=+08:00
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # 首次初始化自动导入建表 + 底座菜单权限 + 初始管理员
+      - ./scripts/sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u{{ .DBName }}", "-p${MYSQL_PASSWORD:-change-me-123456}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - {{ .ProjectName }}-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: {{ .ProjectName }}-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    networks:
+      - {{ .ProjectName }}-net
+{{- if .Has.consul }}
+
+  consul:
+    image: hashicorp/consul:1.19
+    container_name: {{ .ProjectName }}-consul
+    restart: unless-stopped
+    command: ["agent", "-dev", "-client=0.0.0.0", "-ui"]
+    ports:
+      # 8500 = HTTP API + Web UI
+      - "8500:8500"
+    networks:
+      - {{ .ProjectName }}-net
+{{- end }}
+{{- if .Has.milvus }}
+
+  # ---- Milvus standalone 需要 etcd（元数据）+ minio（对象存储）两个依赖 ----
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.14
+    container_name: {{ .ProjectName }}-etcd
+    restart: unless-stopped
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command:
+      - etcd
+      - --advertise-client-urls=http://127.0.0.1:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --data-dir=/etcd
+    volumes:
+      - etcd-data:/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - {{ .ProjectName }}-net
+
+  minio:
+    image: minio/minio:RELEASE.2024-08-17T01-24-54Z
+    container_name: {{ .ProjectName }}-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-me-minio}
+    command: ["minio", "server", "/minio_data", "--console-address", ":9001"]
+    volumes:
+      - minio-data:/minio_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - {{ .ProjectName }}-net
+
+  milvus:
+    image: milvusdb/milvus:v2.4.9
+    container_name: {{ .ProjectName }}-milvus
+    restart: unless-stopped
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-change-me-minio}
+    volumes:
+      - milvus-data:/var/lib/milvus
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      # 19530 = gRPC（SDK 连这个），9091 = metrics / health
+      - "19530:19530"
+      - "9091:9091"
+    networks:
+      - {{ .ProjectName }}-net
+{{- end }}
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: {{ .ProjectName }}-app:latest
+    container_name: {{ .ProjectName }}-app
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+{{- if .Has.consul }}
+      consul:
+        condition: service_started
+{{- end }}
+{{- if .Has.milvus }}
+      milvus:
+        condition: service_started
+{{- end }}
+    # 非 root 运行，uid/gid 与镜像内一致（1000）；bind mount 目录需 chown 1000:1000
+    user: "1000:1000"
+    # 注意：下面的值会被「原样」代入 config/ 下的配置文件（先文本替换再解析 YAML/TOML），
+    # 一律不要加引号，也不要在值里写 `}` 和换行。
+    environment:
+      # http
+      SERVER_ADDRESS: 0.0.0.0
+      SERVER_PORT: 9080
+      AUTHORIZATION: ${AUTHORIZATION:-change-me-654321}
+      # db
+      DB_NAME: {{ .DBName }}
+      DB_DSN: ${DB_DSN:-{{ .DBName }}:change-me-123456@tcp(mysql:3306)/{{ .DBName }}?charset=utf8mb4&parseTime=True&loc=Local}
+      # redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # jwt（生产务必改成随机长串：openssl rand -hex 32）
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET 必须在 .env 里显式设置}
+{{- if .Has.consul }}
+      # consul（服务注册发现）
+      CONSUL_ENABLE: "true"
+      CONSUL_ADDRESS: consul:8500
+{{- end }}
+{{- if .Has.opentelemetry }}
+      # opentelemetry（默认关闭，填好 collector 地址后再打开）
+      OTEL_ENABLE: "false"
+{{- end }}
+{{- if .Has.tcp }}
+      # tcp 服务（默认关闭，注册好 handler 后再打开）
+      TCP_ENABLE: "false"
+      TCP_ADDRESS: ":8081"
+{{- end }}
+{{- if .Has.grpc }}
+      # grpc 服务（默认关闭，注册好 service 后再打开）
+      GRPC_ENABLE: "false"
+      GRPC_ADDRESS: ":50051"
+{{- end }}
+{{- if .Has.milvus }}
+      # milvus 向量库
+      MILVUS_ENABLE: "true"
+      MILVUS_ADDRESS: milvus:19530
+{{- end }}
+      TZ: Asia/Shanghai
+    ports:
+      - "9080:9080"
+{{- if .Has.tcp }}
+      # 打开 TCP_ENABLE 后生效
+      - "8081:8081"
+{{- end }}
+{{- if .Has.grpc }}
+      # 打开 GRPC_ENABLE 后生效
+      - "50051:50051"
+{{- end }}
+    volumes:
+      # 日志 bind mount 到宿主机目录，方便直接在宿主机查看
+      # 宿主机相对路径（相对 docker-compose.yml 所在目录）
+      - ./docker-data/logs:/app/backend/logs
+    networks:
+      - {{ .ProjectName }}-net
+
+networks:
+  {{ .ProjectName }}-net:
+    driver: bridge
+
+volumes:
+  mysql-data:
+  redis-data:
+{{- if .Has.milvus }}
+  etcd-data:
+  minio-data:
+  milvus-data:
+{{- end }}

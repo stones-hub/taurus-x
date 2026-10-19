@@ -1,0 +1,27 @@
+package model
+
+import (
+	"time"
+)
+
+// AdminUser 用户基础信息表（admin_users）
+type AdminUser struct {
+	UserID        uint64     `json:"user_id" gorm:"primaryKey;autoIncrement;column:user_id;comment:用户ID"`
+	Username      string     `json:"username" gorm:"uniqueIndex:uk_username;size:60;not null;column:username;comment:用户名"`
+	Realname      string     `json:"realname" gorm:"size:60;not null;default:'';column:realname;comment:真实姓名"`
+	Nickname      string     `json:"nickname" gorm:"size:60;not null;default:'';column:nickname;comment:昵称"`
+	Avatar        string     `json:"avatar" gorm:"size:255;not null;default:'';column:avatar;comment:头像URL"`
+	Mobile        *string    `json:"mobile" gorm:"uniqueIndex:uk_mobile;size:20;column:mobile;comment:手机号码"`
+	Email         *string    `json:"email" gorm:"uniqueIndex:uk_email;size:100;column:email;comment:邮箱地址"`
+	Gender        int8       `json:"gender" gorm:"not null;default:0;column:gender;comment:性别：0未知，1男，2女"`
+	Birthday      *time.Time `json:"birthday" gorm:"type:date;column:birthday;comment:生日"`
+	Position      string     `json:"position" gorm:"size:100;not null;default:'';column:position;comment:职位"`
+	Status        int8       `json:"status" gorm:"index:idx_status;not null;default:1;column:status;comment:状态：1启用，0禁用，-1删除"`
+	UserSource    int8       `json:"user_source" gorm:"index:idx_user_source;not null;default:1;column:user_source;comment:用户来源：1自主注册，2企业微信同步，3其他SSO"`
+	LastLoginTime *time.Time `json:"last_login_time" gorm:"column:last_login_time;comment:最后登录时间"`
+	LastLoginIP   string     `json:"last_login_ip" gorm:"size:45;not null;default:'';column:last_login_ip;comment:最后登录IP"`
+	CreatedAt     time.Time  `json:"created_at" gorm:"not null;default:CURRENT_TIMESTAMP;column:created_at;comment:创建时间"`
+	UpdatedAt     time.Time  `json:"updated_at" gorm:"not null;default:CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;column:updated_at;comment:修改时间"`
+}
+
+func (AdminUser) TableName() string { return "admin_users" }

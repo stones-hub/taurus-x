@@ -1,0 +1,140 @@
+package dto
+
+// DeptListResponse 部门列表响应
+type DeptListResponse struct {
+	PageNo      int                     `json:"page_no"`
+	PageSize    int                     `json:"page_size"`
+	ResultTotal int64                   `json:"result_total"`
+	List        []*DeptListResponseItem `json:"list"`
+}
+
+// DeptListResponseItem 部门列表项
+type DeptListResponseItem struct {
+	DeptID         uint64 `json:"dept_id"`
+	DeptName       string `json:"dept_name"`
+	ParentID       uint64 `json:"parent_id"`
+	ParentDeptName string `json:"parent_dept_name"`
+	DeptCode       string `json:"dept_code"`
+	Description    string `json:"description"`
+	SortOrder      int    `json:"sort_order"`
+	DeptSource     int8   `json:"dept_source"`
+	Status         int8   `json:"status"`
+	AddTime        string `json:"add_time"`
+	UpdateTime     string `json:"update_time"`
+	UserCount      int64  `json:"user_count"`
+}
+
+// DeptListRequest 部门列表查询请求
+type DeptListRequest struct {
+	PageQuery
+	DeptName string `json:"dept_name"`
+	Status   int    `json:"status"`
+}
+
+// AddDeptRequest 新增部门请求
+type AddDeptRequest struct {
+	DeptName    string `json:"dept_name"`
+	ParentID    uint64 `json:"parent_id"`
+	DeptCode    string `json:"dept_code"`
+	Description string `json:"description"`
+	SortOrder   int    `json:"sort_order"`
+	DeptSource  int8   `json:"dept_source"`
+}
+
+// UpdateDeptRequest 更新部门请求
+type UpdateDeptRequest struct {
+	DeptID      uint64 `json:"dept_id"`
+	DeptName    string `json:"dept_name"`
+	ParentID    uint64 `json:"parent_id"`
+	Description string `json:"description"`
+	SortOrder   int    `json:"sort_order"`
+}
+
+// EditDeptInfoResponse 编辑部门信息响应
+type EditDeptInfoResponse struct {
+	DeptID      uint64 `json:"dept_id"`
+	DeptName    string `json:"dept_name"`
+	ParentID    uint64 `json:"parent_id"`
+	DeptCode    string `json:"dept_code"`
+	Description string `json:"description"`
+	SortOrder   int    `json:"sort_order"`
+	DeptSource  int8   `json:"dept_source"`
+	Status      int8   `json:"status"`
+}
+
+// DeptOptionItem 部门选项（下拉选择父部门用）
+type DeptOptionItem struct {
+	DeptID   uint64 `json:"dept_id"`
+	DeptName string `json:"dept_name"`
+	ParentID uint64 `json:"parent_id"`
+}
+
+// DeptIDRequest 仅部门 ID 的请求
+type DeptIDRequest struct {
+	DeptID uint64 `json:"dept_id"`
+}
+
+// UpdateDeptStatusRequest 更新部门状态请求
+type UpdateDeptStatusRequest struct {
+	DeptID uint64 `json:"dept_id"`
+	Status int8   `json:"status"`
+}
+
+// GetAllDeptsRequest 获取所有部门请求（可排除某部门）
+type GetAllDeptsRequest struct {
+	ExcludeDeptID uint64 `json:"exclude_dept_id"`
+}
+
+// DeptUserListResponse 部门员工列表响应
+type DeptUserListResponse struct {
+	PageNo      int                 `json:"page_no"`
+	PageSize    int                 `json:"page_size"`
+	ResultTotal int64               `json:"result_total"`
+	List        []*DeptUserResponse `json:"list"`
+}
+
+// DeptUserResponse 部门员工项
+type DeptUserResponse struct {
+	ID        uint64 `json:"id"`
+	UserID    uint64 `json:"user_id"`
+	Username  string `json:"username"`
+	Realname  string `json:"realname"`
+	Mobile    string `json:"mobile"`
+	IsPrimary int8   `json:"is_primary"`
+	IsManager int8   `json:"is_manager"`
+	Status    int8   `json:"status"`
+	AddTime   string `json:"add_time"`
+}
+
+// DeptUserListRequest 部门员工列表查询请求
+type DeptUserListRequest struct {
+	DeptID uint64 `json:"dept_id"`
+	PageQuery
+}
+
+// AddDeptUserRequest 添加部门员工请求
+type AddDeptUserRequest struct {
+	DeptID    uint64   `json:"dept_id"`
+	UserIDs   []uint64 `json:"user_ids"`
+	IsPrimary int8     `json:"is_primary"`
+	IsManager int8     `json:"is_manager"`
+}
+
+// UpdateDeptUserRequest 更新部门员工请求
+type UpdateDeptUserRequest struct {
+	ID        uint64 `json:"id"`
+	IsPrimary int8   `json:"is_primary"`
+	IsManager int8   `json:"is_manager"`
+	Status    int8   `json:"status"`
+}
+
+// RemoveDeptUserRequest 移除部门员工请求
+type RemoveDeptUserRequest struct {
+	ID uint64 `json:"id"`
+}
+
+// BatchUpdateDeptUserRequest 批量更新部门员工请求
+type BatchUpdateDeptUserRequest struct {
+	DeptID  uint64   `json:"dept_id"`
+	UserIDs []uint64 `json:"user_ids"`
+}

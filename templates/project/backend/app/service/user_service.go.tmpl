@@ -1,0 +1,185 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/google/wire"
+	"{{ .Module }}/app/constants"
+	"{{ .Module }}/app/dto"
+	"{{ .Module }}/app/helper"
+	authstore "{{ .Module }}/app/helper/store"
+	"{{ .Module }}/app/model"
+	"{{ .Module }}/app/repo"
+)
+
+// AdminUserService 账号认证与个人信息服务
+type AdminUserService struct {
+	userRepo         *repo.AdminUserRepository
+	loginRepo        *repo.AdminUserLoginRepository
+	verificationCode *helper.VerificationCodeManager
+	authStore        *authstore.AuthRedisStore
+	store            *repo.Store
+}
+
+// AdminUserServiceSet wire provider set
+var AdminUserServiceSet = wire.NewSet(NewAdminUserService)
+
+// NewAdminUserService 创建 AdminUserService（内部手动装配仓储）
+func NewAdminUserService(store *repo.Store) *AdminUserService {
+	return &AdminUserService{
+		userRepo:         store.User(),
+		loginRepo:        store.UserLogin(),
+		verificationCode: helper.NewVerificationCodeManager(),
+		authStore:        authstore.NewAuthRedisStore(),
+		store:            store,
+	}
+}
+
+// ==================== 用户管理（管理员视角） ====================
+
+// GetUserList 分页查询用户列表（支持 用户名/手机号/邮箱 模糊 + 状态过滤）
+func (s *AdminUserService) GetUserList(ctx context.Context, page, pageSize int, keyword string, status int) (*dto.UserListResponse, error) {
+	users, total, err := s.userRepo.ListByKeyword(ctx, page, pageSize, keyword, status)
+	if err != nil {
+		return nil, err
+	}
+
+	items := make([]*dto.UserInfo, 0, len(users))
+	for i := range users {
+		items = append(items, dto.ToUserInfo(&users[i]))
+	}
+	return &dto.UserListResponse{
+		PageNo:      page,
+		PageSize:    pageSize,
+		ResultTotal: total,
+		List:        items,
+	}, nil
+}
+
+// GetUserInfo 获取单个用户信息
+func (s *AdminUserService) GetUserInfo(ctx context.Context, userID uint64) (*dto.UserInfo, error) {
+	user, err := s.userRepo.FindByUserID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if user == nil {
+		return nil, errors.New("用户不存在")
+	}
+	return dto.ToUserInfo(user), nil
+}
+
+// AddUser 新增用户（账号密码），返回新用户 ID
+func (s *AdminUserService) AddUser(ctx context.Context, req *dto.AddUserRequest) (uint64, error) {
+	if req.Username == "" || req.Password == "" || req.Mobile == "" {
+		return 0, errors.New("用户名、密码、手机号不能为空")
+	}
+	if err := helper.ValidatePasswordStrength(req.Password); err != nil {
+		return 0, err
+	}
+	if !helper.ValidateMobile(req.Mobile) {
+		return 0, errors.New("手机号格式不正确")
+	}
+	existing, err := s.userRepo.FindByUsername(ctx, req.Username)
+	if err != nil {
+		return 0, err
+	}
+	if existing != nil {
+		return 0, errors.New("用户名已存在")
+	}
+	existing, err = s.userRepo.FindByMobile(ctx, req.Mobile)
+	if err != nil {
+		return 0, err
+	}
+	if existing != nil {
+		return 0, errors.New("手机号已被使用")
+	}
+
+	var birthday *time.Time
+	if req.Birthday != "" {
+		if t, err := time.Parse("2006-01-02", req.Birthday); err == nil {
+			birthday = &t
+		}
+	}
+	var email *string
+	if req.Email != "" {
+		email = &req.Email
+	}
+	var mobile *string
+	if req.Mobile != "" {
+		mobile = &req.Mobile
+	}
+
+	userSource := req.UserSource
+	if userSource == 0 {
+		userSource = constants.UserSourceAdminCreated
+	}
+
+	user := &model.AdminUser{
+		Username:   req.Username,
+		Realname:   req.Realname,
+		Nickname:   req.Nickname,
+		Avatar:     req.Avatar,
+		Mobile:     mobile,
+		Email:      email,
+		Gender:     req.Gender,
+		Birthday:   birthday,
+		Status:     constants.UserStatusEnabled,
+		UserSource: userSource,
+	}
+	if err := s.userRepo.Create(ctx, user); err != nil {
+		return 0, err
+	}
+
+	// 创建用户名密码登录方式
+	if err := s.loginRepo.SyncPassword(ctx, user.UserID, req.Username, req.Password); err != nil {
+		return 0, err
+	}
+	return user.UserID, nil
+}
+
+// UpdateUser 更新用户基本信息（密码/角色由调用方分别处理）
+func (s *AdminUserService) UpdateUser(ctx context.Context, req *dto.UpdateUserRequest) error {
+	user, err := s.userRepo.FindByUserID(ctx, req.UserID)
+	if err != nil {
+		return err
+	}
+	if user == nil {
+		return errors.New("用户不存在")
+	}
+	updateData := map[string]interface{}{
+		"realname": req.Realname,
+		"nickname": req.Nickname,
+		"gender":   req.Gender,
+	}
+	if req.Email != "" {
+		updateData["email"] = req.Email
+	}
+	if req.Birthday != "" {
+		if t, err := time.Parse("2006-01-02", req.Birthday); err == nil {
+			updateData["birthday"] = &t
+		}
+	}
+	return s.userRepo.UpdateByID(ctx, req.UserID, updateData)
+}
+
+// UpdateUserStatus 更新用户状态（1启用/0禁用/-1删除）
+func (s *AdminUserService) UpdateUserStatus(ctx context.Context, userID uint64, status int) error {
+	if status != int(constants.UserStatusEnabled) && status != int(constants.UserStatusDisabled) && status != -1 {
+		return errors.New("状态值必须为0(禁用)、1(启用)或-1(删除)")
+	}
+	user, err := s.userRepo.FindByUserID(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if user == nil {
+		return errors.New("用户不存在")
+	}
+	return s.userRepo.UpdateByID(ctx, userID, map[string]interface{}{"status": status})
+}
+
+// DeleteUser 删除用户（软删：状态置 -1）
+func (s *AdminUserService) DeleteUser(ctx context.Context, userID uint64) error {
+	return s.UpdateUserStatus(ctx, userID, -1)
+}

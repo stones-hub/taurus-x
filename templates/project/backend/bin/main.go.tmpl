@@ -1,0 +1,41 @@
+//lint:file-ignore ST1001 dot imports are allowed here
+
+package main
+
+import (
+	"log"
+	"time"
+
+	"{{ .Module }}/app"
+	"{{ .Module }}/app/helper/permission"
+	tmid "{{ .Module }}/app/middleware"
+	"{{ .Module }}/app/routes"
+)
+
+func main() {
+	setGlobalTimezone()
+	initPermissionDependency()
+	routes.RegisterRoutes()
+	app.Run()
+}
+
+// setGlobalTimezone 设置全局时区为上海时区
+func setGlobalTimezone() {
+	shanghaiLoc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		log.Printf("⚠️  加载上海时区失败: %v，将使用系统默认时区", err)
+		return
+	}
+	time.Local = shanghaiLoc
+	log.Printf("✅ 全局时区已设置为上海时区 (Asia/Shanghai)")
+	log.Printf("📅 当前时间: %s", time.Now().Format("2006-01-02 15:04:05 MST"))
+}
+
+// initPermissionDependency 初始化权限检查器（注入到中间件，打破循环依赖）
+func initPermissionDependency() {
+	if app.Core == nil || app.Core.AdminRoleService == nil {
+		log.Fatal("❌ Core 或 AdminRoleService 未初始化，权限检查器注入失败")
+	}
+	tmid.SetPermissionChecker(permission.NewChecker(app.Core.AdminRoleService))
+	log.Println("✅ 权限检查器注入成功")
+}

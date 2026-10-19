@@ -1,0 +1,200 @@
+# 前端开发流程规范（权威）
+
+> 面向「在本项目里开发新功能模块」的**前端侧流程总纲**。
+> 先读 [`docs/项目规范.md`](项目规范.md)（架构/RBAC/DTO/命名/下拉 option/前端交互等唯一权威规则）；后端侧见 [`docs/后端开发流程.md`](后端开发流程.md)。
+> 一个模块前端 = **4 件套**：types → api → router → views。
+
+---
+
+## 〇、前端 4 件套要点速查
+
+| 维度 | 约定 |
+|------|------|
+| path | path 用 `page/xxx.html`，登记进后端权限 SQL |
+| 行为 | 页面行为按规范设计 |
+| types/api | 与后端 dto 严格同名 |
+| 权限 SQL | 跟随后端三级权限 SQL |
+
+> 前端没有「建表 / 建权限 SQL」步骤——表结构、权限 SQL 都在后端侧处理（见 `后端开发流程.md`）。
+
+---
+
+## 一、前端 4 件套标准流程
+
+### Step 1. 建 types（与后端 dto 严格同名）
+
+文件：`frontend/src/types/<域>.ts`
+
+- 类型名与后端 DTO **严格同名**（`NoticeListRequest` / `NoticeResponse` / `NoticeRequest`），请求/响应类型分开不合并，禁止 `Req/Resp` 缩写。
+- JSON 字段沿用后端 snake_case。
+- `index.ts` 只做 re-export + 通用 `ApiResponse`，不要在每处重复定义。
+- 枚举/哨兵值收敛为常量（如 `NoticeStatus` / `QUERY_ALL`），不散落魔法值；「值 → 中文名 / 状态 → el-tag type」映射统一收敛到各域 `types/*.ts` 的 `xxxStatusTagType`，页面不内联三元、不重复定义。
+- **抽取值常量（枚举/映射表）必须用普通 `import`，严禁 `import type`**（`import type` 导值在运行时 undefined）。
+
+```ts
+export interface NoticeListRequest { page_no: number; page_size: number; title: string; status: number }
+export interface NoticeListResponse { page_no: number; page_size: number; result_total: number; list: NoticeResponse[] }
+export interface NoticeResponse { notice_id: number; title: string; status: number; status_name: string }
+```
+
+✅ 验收：types 名与后端 DTO 同名；枚举/映射收敛成常量；值常量用普通 `import`。
+
+### Step 2. 建 api（对齐后端路径）
+
+文件：`frontend/src/api/<域>.ts`
+
+```ts
+export function apiGetNoticeList(params: NoticeListRequest) {
+  return request<NoticeListResponse>({ url: '/admin/notices/list', method: 'post', data: params })
+}
+export function apiAddNotice(data: NoticeRequest) {
+  return request<{ status: string }>({ url: '/admin/notices/add', method: 'post', data })
+}
+```
+
+- 下拉选项接口统一放 `frontend/src/api/option.ts`（`apiOptionXxx`），**业务 CRUD/list 放各自 api 文件**。
+- **判成功看 `body.code` 在 2xx 区间，不看 HTTP 状态码**（`httpx.SendResponse` 对 4xx/5xx 返回 HTTP 200 + body.code）；`extractError` 兼容 `data` 为 string 或 `object.message`。
+- 非 GET 请求 `http.ts` 已自动回传 `x-csrf-token` header。
+- 错误提示统一用 `src/utils/error.ts` 的 `extractMessage(e, fallback)`，不各自 `(e as any).message` 断言。
+
+✅ 验收：api url 与后端路径一致；判成功看 `body.code`；错误用 `extractMessage`。
+
+### Step 3. 建 router（path 用 page/xxx.html）
+
+文件：`frontend/src/router/index.ts`
+
+- path 用 `page/xxx.html`、`page/xxx-add.html` 形式，无前导 `/`（menu link 也是无前导 `/`，`normalizeLink` 补 `/`）。
+- name 用 kebab-case（`notice` / `notice-add`）。
+- 列表页 + 新增/编辑页 = 2 个路由（`xxx` 列表、`xxx-add` 编辑页共用增/改）。
+- **子页面必须声明 `meta.activeMenu`**（聚焦导航，替代旧的路径后缀反推）：除「列表页本身」外，所有**非列表子页**（新增/编辑/详情，以及各种单步操作页）都要加一行 `meta: { activeMenu: '<所属列表页 link>' }`，link 用**绝对路径**（带前导 `/`），例如：
+  ```ts
+  { path: 'page/notice/notices-add.html', name: 'notice-add', component: () => import('../views/notice/edit.vue'),
+    meta: { activeMenu: '/page/notice/notices.html' } }
+  ```
+  作用：进入子页面后，顶栏/侧栏菜单仍高亮其所属列表页（`home/index.vue` 与 `SidebarMenu.vue` 已改为优先读 `meta.activeMenu`；未声明时才回退旧路径归一化，**新页面一律声明，不依赖回退**）。
+
+✅ 验收：router path 用 page/xxx.html；name kebab-case；子页面已声明 `meta.activeMenu`。
+
+### Step 4. 建 views（列表页 + 编辑页）
+
+文件：`frontend/src/views/<域>/index.vue`（列表）+ `edit.vue`（新增/编辑共用）
+
+**列表页标准结构**（详见 `项目规范.md` 前端交互章节 + 第 20/21/22/22a 条）：
+
+**（零）列表页骨架统一走 `useListPage` 组合式（`src/composables/useListPage.ts`）**：
+
+- 列表页的分页状态（`page_no/page_size/result_total`）、`loading`/`list`、`loadTableData`/`search`/`reset`/`handlePageChange`/`handleSizeChange`、详情抽屉（`detail`/`detailVisible`/`detailLoading`/`openDetail`）**一律用 `useListPage` 返回，禁止再逐页手写**这套骨架。
+- 三个泛型 `<RowType, FilterType, ParamsType>`：`FilterType` 是筛选 form 的可空字段（`xxx: number | null`）；`ParamsType = Omit<XxxListRequest, 'page_no' | 'page_size'>`（buildParams 的返回值类型）。
+- `buildParams(form)` 负责把可空筛选值映射为后端正真参数，**分页哨兵语义集中在 buildParams**（status 传 `QUERY_ALL(-1)`、枚举/外键传 `0`，逐页核对后端判断模式，见 `项目规范.md`「列表筛选『不过滤』哨兵语义」）。
+- 有详情抽屉才传 `fetchDetail + pickId`；纯 CRUD 列表（编辑跳独立页、无抽屉）不传这两项。
+- `initForm({...})` 必须调用（记录筛选字段初始值，供 `reset()` 还原）。
+
+```ts
+const { list, loading, pagination, form, initForm, loadTableData, search, reset, handlePageChange, handleSizeChange, detail, detailVisible, detailLoading, openDetail } =
+  useListPage<NoticeResponse, NoticeFilter, Omit<NoticeListRequest, 'page_no' | 'page_size'>>({
+    fetcher: (p) => apiGetNoticeList(p),
+    buildParams: (f) => ({ title: f.title, status: f.status ?? QUERY_ALL }),
+    fetchDetail: (id) => apiGetNoticeDetail(id as number),
+    pickId: (row) => row.notice_id,
+  })
+initForm({ title: '', status: null })
+```
+
+- 模板里分页绑定 `pagination.page_no/page_size/result_total`（**不是** `form.xxx`）；筛选 `v-model` 仍绑 `form.xxx`；查询/重置 `@click="search"/"reset"`（原 `searchData`/`resetFilters`）。
+- **例外**（这些不是标准「筛选 + 独立列表」骨架，不强制套 useListPage）：情境型列表（多 scope + 多动作 + 双抽屉）、单步操作页；以及「详情接口返回复合结构（如 `{info, details}`）或详情需额外二次加载」的页面，**只套列表骨架、详情抽屉保留手写**。
+
+- 筛选栏 `<div class="filter-bar">` 包裹 inline 表单；工具栏 `<div class="toolbar">`；「查询/重置/刷新」三按钮 + `filter-bar` 包裹是每个列表页必备结构。
+  - 查询按钮 `type="primary"` + `:icon="Search"`；紧跟重置按钮（普通样式无 icon，`@click="resetFilters"`）。
+  - `reset()`（useListPage 提供）必须把所有筛选字段重置为 form 初始值再 `search()`，分页字段不回退。若页面有独立于 form 的级联子表单 `cascadeForm`，则定义一个薄 wrapper `function resetFilters() { 重置 cascadeForm; reset() }` 覆盖级联字段。
+  - 工具栏主操作（新增/添加）`type="primary"` + `:icon="Plus"`；刷新按钮普通样式 + `:icon="Refresh"`，`@click="loadTableData"`。
+  - 图标从 `@element-plus/icons-vue` 导入 `Search`/`Refresh`/`Plus`，按实际使用导入。
+- `loadTableData` 全 `await`；动态下拉 `null as number | null` 初始值、提交 `?? 0`、回显 `|| null`；「不过滤」传 `-1`（`QUERY_ALL`，status 字段）或 `0`（枚举/外键字段，见 `项目规范.md`「列表筛选『不过滤』哨兵语义」）。
+- 操作按钮按状态 `v-if="row.can_xxx"` + `v-permission` 双控，**不可用隐藏不展示，禁 disabled**。
+- 详情查看统一放「编号」列 click 打开 `el-drawer` 抽屉（**不从列表跳独立详情页**，详见 `项目规范.md`「详情链接位置」）；switch 改状态后 `loadTableData()` 刷新。
+- **刷新按钮复用 `.query` 权限**（`PERM.refresh` = query 权限码），不要为刷新单独建按钮权限。
+- 关联筛选项（外键/关联字段）一律做成下拉，走 `/admin/option/*`（`useOptions` 组合式），**严禁手填 ID**。
+
+**编辑页 / 操作页统一表单结构**（新增/编辑以及各种单步操作页，**一切表单页**都照此，不搞纯 `el-form-item` 纵向堆叠）：
+
+- 表单 `label-width="120px"` + `el-row :gutter="20"` + `el-col`，字段按内容宽窄选 span：
+  - `span="8"`：密集表单（字段多、内容短，如用户、部门），3 列
+  - `span="12"`：适中表单（字段少，如角色），2 列
+  - `span="24"`：整行（textarea 备注/长文本、单选框组等）
+  - 多级级联（四级）`span="6"`（4 个占满一行）
+- **禁止**只写 `el-form-item` 不套 `el-row + el-col`；也禁止 `style="max-width"` 限制表单宽度，让其随栅格铺满。
+- `el-divider content-position="left"` 分节。
+- 头部返回按钮（`page-title` 前，`.edit-head` 布局）+ 提交区按钮统一（见 `项目规范.md`「表单页头部返回按钮 + 提交区按钮统一」）：返回按钮 `link type="primary" :icon="ArrowLeft"` 文字「返回」；提交区「提交」在左、「取消」在右；提交按钮文字一律「提交」（除非确有多动作语义）。
+- 关联下拉走 `useOptions`（**严禁手填 ID**）；级联用 `watch` + `{ flush: 'sync' }` 驱动（**不用 `@change`**，除非表格逐行绑定且无回显的例外）。
+- 「添加行/卡片」按钮：表格型放表格上方 `size="small"` + `primary` plain；卡片/列表型放底部左对齐 `dashed`；空状态通栏虚线提示。
+- 详情抽屉里的字段展示自己封装成复用组件（建议 `DetailCard` 双列字段卡 + `DetailSection` 分节），**不要在每个页面重复写 `el-descriptions`**；状态列统一 `el-tag size="small"`，明细表统一 `size="small"`。底座未自带这些组件，第一个需要详情抽屉的模块负责建立它们。
+
+### 命名约定（新代码遵守，存量差异不强制重命名）
+
+> 参见 `项目规范.md`「前端命名约定」。要点：
+- 表格行参数统一 `row`（不用 `data`）。
+- 跳转方法 `goXxx` / `openXxx`（不用 `addTableData`/`editTableData`）：跳独立页 `goAdd`/`goEdit(row)`/`goDelete(row)`；弹抽屉/弹窗 `openDetail(row)`/`openVerify(row)`/`openAccept(row)`。
+- 返回来源页统一 `goBack`（不用 `onCancel` 命名返回）。
+- 列表加载 `loadTableData`、查询 `search`、重置 `reset`（useListPage 返回名；未用 useListPage 的旧列表页保留 `searchData`/`resetFilters`）、提交 `onSubmit`/`onSave`。
+- 状态 → el-tag 映射统一 `xxxStatusTagType`。
+
+---
+
+## 二、委派分包开发时的硬约束清单（写进 agent prompt）
+
+> 把一个模块的前端拆给别人（或拆给子代理）做时，最常见的失败是「各自发挥」导致风格分叉。委派时 prompt 里必须逐条写死以下条款：
+
+1. 枚举/哨兵值一律收敛为各域 `types/*.ts` 的 `XxxStatus`/`XxxStatusTagType` 常量，禁止散落魔法值（状态/类型数字）。
+2. 前端类型名严格同名后端 dto（不要自己加模块前缀）。
+3. 列表详情统一 `el-drawer` 抽屉、编号列点击打开，禁止独立详情页。
+4. 表单一律 `el-row` + `el-col` 栅格，不纯 `el-form-item` 堆叠、不用 `max-width` 限宽。
+5. 用户显示名只用 `realname`（禁 `nickname`）。
+6. 列表「不过滤」传 `QUERY_ALL=-1`（status）或 `0`（枚举/外键）。
+7. 列表页 filter-bar + toolbar + 查询/重置/刷新三按钮、操作按钮 `can_xxx` + `v-permission` 双门控（v-if 隐藏禁 disabled）、动态下拉初始值 `null as number | null`、级联 `watch` + `flush:'sync'`。
+8. **列表页骨架统一走 `useListPage` 组合式**（禁止逐页手写 `loadTableData`/分页状态/详情抽屉状态）；分页哨兵语义集中在 `buildParams`（status 传 -1、枚举/外键传 0，逐页核对后端判断模式）；模板分页绑 `pagination.*`、查询/重置 `@click="search"/"reset"`。
+
+交付后用 `vue-tsc` + `pnpm build` 双验证（build 能抓到 vue-tsc 漏检的 `v-else` 无邻 `v-if` 模板错误）。
+
+---
+
+## 三、构建与验证
+
+```bash
+cd frontend
+pnpm build          # vue-tsc 类型检查 + vite 构建
+npx vue-tsc --noEmit  # 可选：单独跑类型检查（build 含 vue-tsc，且抓得更全）
+```
+
+**必须**：`pnpm build`（含 vue-tsc）通过。
+
+---
+
+## 四、Checklist（提交前逐项自查）
+
+- [ ] types 与后端 dto 严格同名，按域拆文件；枚举/映射收敛成常量；值常量用普通 `import`
+- [ ] api 对齐后端路径；下拉选项走 `option.ts` 的 `apiOptionXxx`；判成功看 `body.code`；错误用 `extractMessage`
+- [ ] router path 用 `page/xxx.html`，name kebab-case
+- [ ] 子页面（新增/编辑/操作页）路由已声明 `meta.activeMenu` 指向所属列表页
+- [ ] 列表页：filter-bar 包裹 + 查询/重置/刷新三按钮 + 图标，`can_xxx` 门控 v-if 隐藏
+- [ ] 列表页骨架走 `useListPage`（含分页状态/loadTableData/search/reset/详情抽屉状态），`buildParams` 集中哨兵语义，`initForm` 已调用；分页绑 `pagination.*`
+- [ ] 动态下拉 `null as number | null` 初值、提交 `?? 0`、回显 `|| null`；级联 `watch {flush:'sync'}`
+- [ ] 表单一律走 `el-row` + `el-col` 栅格；多级级联 `span="6"`
+- [ ] 关联筛选项/编辑项走 `/admin/option/*` 下拉，严禁手填 ID
+- [ ] 刷新按钮复用 `.query` 权限
+- [ ] 提交按钮文字「提交」（除非特殊语义）、返回按钮 `goBack`、命名遵循 `项目规范.md`「前端命名约定」
+- [ ] `pnpm build`（含 vue-tsc）通过
+
+---
+
+## 五、公共工具速查（前端）
+
+| 文件 | 用途 |
+|------|------|
+| `frontend/src/api/http.ts` | `request<T>` 封装（判 `body.code`、`extractError`、CSRF 回传） |
+| `frontend/src/api/option.ts` | 下拉选项接口 `apiOptionXxx`（`/admin/option/*`） |
+| `frontend/src/composables/useOptions.ts` | 下拉选项加载（`options/loading/load`，`pickValue`/`pickLabel`） |
+| `frontend/src/composables/useListPage.ts` | 列表页骨架（分页/loading/list/loadTableData/search/reset/详情抽屉状态） |
+| `frontend/src/components/PermTree.vue` | 权限树选择 |
+| `frontend/src/directives/permission.ts` | `v-permission` 按钮权限指令（`binding.arg`/`binding.value` 双兼容） |
+| `frontend/src/utils/error.ts` | `extractMessage(e, fallback)` 错误信息提取 |
+| `frontend/src/styles/index.css` | 公共样式（`.list-page`/`.filter-bar`/`.toolbar`/`.table-pagination`/`.form-actions`/`.edit-head`/`.pre-wrap`/`.log-body`…） |
+| `frontend/src/types/<域>.ts` | DTO 同名类型 + 枚举/`xxxStatusTagType` 映射 |

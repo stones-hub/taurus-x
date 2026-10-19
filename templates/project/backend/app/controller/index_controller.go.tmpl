@@ -1,0 +1,25 @@
+package controller
+
+import (
+	"net/http"
+
+	"github.com/google/wire"
+
+	"{{ .Module }}/app/service"
+)
+
+// IndexController 首页控制器
+type IndexController struct {
+	IndexService *service.IndexService
+}
+
+// IndexControllerSet 依赖注入集合（以 Set 结尾，自动扫描）
+var IndexControllerSet = wire.NewSet(wire.Struct(new(IndexController), "*"))
+
+// Health 健康检查
+func (c *IndexController) Health(w http.ResponseWriter, r *http.Request) {
+	OK(w, map[string]interface{}{
+		"status": "ok",
+		"name":   c.IndexService.Name(),
+	})
+}

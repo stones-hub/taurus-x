@@ -1,0 +1,80 @@
+package service
+
+import (
+	"context"
+
+	"github.com/google/wire"
+
+	"{{ .Module }}/app/dto"
+	"{{ .Module }}/app/repo"
+)
+
+// AdminLoginLogService 登录日志服务
+type AdminLoginLogService struct {
+	store        *repo.Store
+	loginLogRepo *repo.AdminUserLoginLogRepository
+	userRepo     *repo.AdminUserRepository
+}
+
+// AdminLoginLogServiceSet wire provider set
+var AdminLoginLogServiceSet = wire.NewSet(NewAdminLoginLogService)
+
+// NewAdminLoginLogService 创建登录日志服务
+func NewAdminLoginLogService(store *repo.Store) *AdminLoginLogService {
+	return &AdminLoginLogService{
+		store:        store,
+		loginLogRepo: store.UserLoginLog(),
+		userRepo:     store.User(),
+	}
+}
+
+// GetLoginLogList 分页查询登录日志（状态过滤），并回填用户名
+func (s *AdminLoginLogService) GetLoginLogList(ctx context.Context, page, pageSize int, loginStatus int8) (*dto.LoginLogListResponse, error) {
+	logs, total, err := s.loginLogRepo.ListWithFilter(ctx, page, pageSize, repo.AdminUserLoginLogListFilter{
+		LoginStatus: loginStatus,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// 批量查用户名（user_id → username）
+	usernameMap := make(map[uint64]string)
+	userIDs := make([]uint64, 0, len(logs))
+	for _, log := range logs {
+		if _, ok := usernameMap[log.UserID]; !ok {
+			userIDs = append(userIDs, log.UserID)
+		}
+	}
+	for _, uid := range userIDs {
+		if u, _ := s.userRepo.FindByUserID(ctx, uid); u != nil {
+			usernameMap[uid] = u.Username
+		}
+	}
+
+	list := make([]*dto.LoginLogResponse, 0, len(logs))
+	for i := range logs {
+		log := logs[i]
+		username := usernameMap[log.UserID]
+		if username == "" {
+			username = "未知用户"
+		}
+		list = append(list, &dto.LoginLogResponse{
+			LogID:         log.LogID,
+			UserID:        log.UserID,
+			Username:      username,
+			LoginType:     log.LoginType,
+			LoginIP:       log.LoginIP,
+			UserAgent:     log.UserAgent,
+			LoginStatus:   log.LoginStatus,
+			FailureReason: log.FailureReason,
+			LoginTime:     log.LoginTime.Format("2006-01-02 15:04:05"),
+		})
+	}
+
+	return &dto.LoginLogListResponse{
+		PageNo:      page,
+		PageSize:    pageSize,
+		ResultTotal: total,
+		List:        list,
+	}, nil
+}

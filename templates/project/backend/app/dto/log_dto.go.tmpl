@@ -1,0 +1,145 @@
+package dto
+
+// LoginLogListResponse 登录日志列表响应
+type LoginLogListResponse struct {
+	PageNo      int                 `json:"page_no"`
+	PageSize    int                 `json:"page_size"`
+	ResultTotal int64               `json:"result_total"`
+	List        []*LoginLogResponse `json:"list"`
+}
+
+// LoginLogResponse 登录日志列表项
+type LoginLogResponse struct {
+	LogID         uint64 `json:"log_id"`
+	UserID        uint64 `json:"user_id"`
+	Username      string `json:"username"`
+	LoginType     string `json:"login_type"`
+	LoginIP       string `json:"login_ip"`
+	UserAgent     string `json:"user_agent"`
+	LoginStatus   int8   `json:"login_status"`
+	FailureReason string `json:"failure_reason"`
+	LoginTime     string `json:"login_time"`
+}
+
+// LoginLogListRequest 登录日志查询请求
+type LoginLogListRequest struct {
+	PageQuery
+	LoginStatus int8 `json:"login_status"`
+}
+
+// ===== 访问日志 =====
+
+// AccessLogListRequest 访问日志查询请求
+type AccessLogListRequest struct {
+	PageQuery
+	UserID     uint64 `json:"user_id"`     // 用户ID（0=不过滤）
+	Method     string `json:"method"`      // HTTP 方法（空=不过滤）
+	Path       string `json:"path"`        // 请求路径（模糊匹配，空=不过滤）
+	StatusCode int    `json:"status_code"` // 状态码（0=不过滤）
+	IP         string `json:"ip"`          // 客户端 IP（模糊匹配，空=不过滤）
+}
+
+// AccessLogResponse 访问日志列表项
+type AccessLogResponse struct {
+	LogID        uint64 `json:"log_id"`
+	UserID       uint64 `json:"user_id"`
+	Username     string `json:"username"`
+	Method       string `json:"method"`
+	Path         string `json:"path"`
+	StatusCode   int    `json:"status_code"`
+	IP           string `json:"ip"`
+	UserAgent    string `json:"user_agent"`
+	DurationMs   int64  `json:"duration_ms"`
+	Query        string `json:"query"`
+	RequestBody  string `json:"request_body"`
+	ResponseBody string `json:"response_body"`
+	CreatedAt    string `json:"created_at"`
+}
+
+// AccessLogListResponse 访问日志列表响应
+type AccessLogListResponse struct {
+	PageNo      int                 `json:"page_no"`
+	PageSize    int                 `json:"page_size"`
+	ResultTotal int64               `json:"result_total"`
+	List        []*AccessLogResponse `json:"list"`
+}
+
+// ===== 操作日志 =====
+
+// OperationLogListRequest 操作日志查询请求
+type OperationLogListRequest struct {
+	PageQuery
+	UserID   uint64 `json:"user_id"`   // 用户ID（0=不过滤）
+	Method   string `json:"method"`    // HTTP 方法（空=不过滤）
+	Path     string `json:"path"`      // 接口路径（模糊匹配，空=不过滤）
+	Action   string `json:"action"`    // 动作类型（空=不过滤）
+	Resource string `json:"resource"`  // 资源模块（空=不过滤）
+}
+
+// OperationLogResponse 操作日志列表项
+type OperationLogResponse struct {
+	LogID        uint64 `json:"log_id"`
+	UserID       uint64 `json:"user_id"`
+	Username     string `json:"username"`
+	Method       string `json:"method"`
+	Path         string `json:"path"`
+	Action       string `json:"action"`
+	Resource     string `json:"resource"`
+	IP           string `json:"ip"`
+	StatusCode   int    `json:"status_code"`
+	RequestBody  string `json:"request_body"`
+	ResponseBody string `json:"response_body"`
+	Result       string `json:"result"`
+	ErrorMsg     string `json:"error_msg"`
+	CreatedAt    string `json:"created_at"`
+}
+
+// OperationLogListResponse 操作日志列表响应
+type OperationLogListResponse struct {
+	PageNo      int                   `json:"page_no"`
+	PageSize    int                   `json:"page_size"`
+	ResultTotal int64                 `json:"result_total"`
+	List        []*OperationLogResponse `json:"list"`
+}
+
+// ===== 前端错误日志 =====
+
+// FrontErrorLogListRequest 前端错误日志查询请求
+type FrontErrorLogListRequest struct {
+	PageQuery
+	UserID uint64 `json:"user_id"` // 用户ID（0=不过滤）
+	Kind   string `json:"kind"`    // 错误类型（空=不过滤）
+	URL    string `json:"url"`     // 页面 URL（模糊匹配，空=不过滤）
+}
+
+// FrontErrorLogResponse 前端错误日志列表项
+type FrontErrorLogResponse struct {
+	LogID     uint64 `json:"log_id"`
+	UserID    uint64 `json:"user_id"`
+	Username  string `json:"username"`
+	Kind      string `json:"kind"`
+	Message   string `json:"message"`
+	Source    string `json:"source"`
+	Stack     string `json:"stack"`
+	URL       string `json:"url"`
+	UserAgent string `json:"user_agent"`
+	IP        string `json:"ip"`
+	CreatedAt string `json:"created_at"`
+}
+
+// FrontErrorLogListResponse 前端错误日志列表响应
+type FrontErrorLogListResponse struct {
+	PageNo      int                    `json:"page_no"`
+	PageSize    int                    `json:"page_size"`
+	ResultTotal int64                  `json:"result_total"`
+	List        []*FrontErrorLogResponse `json:"list"`
+}
+
+// FrontErrorReportRequest 前端错误上报请求（公共路由）
+type FrontErrorReportRequest struct {
+	Message string `json:"message"` // 错误信息
+	Source  string `json:"source"`  // 出错位置
+	Stack   string `json:"stack"`   // 错误堆栈
+	URL     string `json:"url"`     // 页面 URL
+	Kind    string `json:"kind"`    // 错误类型
+}

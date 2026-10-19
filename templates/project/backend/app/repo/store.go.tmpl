@@ -1,0 +1,64 @@
+package repo
+
+import (
+	"context"
+	"errors"
+
+	"github.com/google/wire"
+	"gorm.io/gorm"
+)
+
+// Store 是「用例级」的工作单元（Unit of Work），也是整个 repo 包对外唯一的装配 seam。
+//
+// 它承载两种「仓储作用域」的发放：
+//   - 连接池作用域：s.Orders() / s.Users() ... 返回绑定到默认连接池的仓储，用于单操作；
+//   - 事务作用域：s.RunInTx(ctx, fn)，回调拿到 *Tx，通过 tx.Orders() 拿到绑定到当前事务 DB 的仓储。
+//
+// 两种作用域复用同一套 NewXxxRepositoryWithDB(db) 构造，零重复代码；service 层
+// 永远只依赖 Store / Tx / 仓储类型，不需要 import gorm，也不需要自己 new 仓储。
+//
+// 各仓储的连接池作用域 accessor（Store.Xxx()）与事务作用域 accessor（Tx.Xxx()）
+// 均内聚在对应 *_repo.go 文件内，本文件只保留 Store/Tx 的定义与事务入口。
+// repoSet 持有 db 并发放所有仓储 accessor，Store 与 Tx 共用，消除两份 accessor 的重复与不对称。
+type repoSet struct {
+	db *gorm.DB
+}
+
+type Store struct {
+	repoSet
+}
+
+// Tx 事务上下文（deep module）。
+//
+// 它是「用例级事务」的唯一 seam：调用方拿到一个 Tx 后，只能通过
+// Order()/Demand()/... 等 accessor 获取「绑定到当前事务 DB」的仓储，
+// 永远接触不到 *gorm.DB 本身。这就把连接/事务/仓储装配这些实现细节
+// 全部收进 repo 包内部，service 层不再需要 import gorm。
+//
+// 各仓储的事务作用域 accessor（Tx.Xxx()）均内聚在对应 *_repo.go 文件内，
+// 本文件只保留 Store/Tx 的定义与事务入口。
+type Tx struct {
+	repoSet
+}
+
+// NewStore 创建基于默认数据库连接的工作单元。
+func NewStore() *Store {
+	return &Store{repoSet{db: defaultDB()}}
+}
+
+// StoreSet wire provider set：提供 *Store 工作单元。
+var StoreSet = wire.NewSet(NewStore)
+
+// RunInTx 在单个数据库事务中执行 fn，是全项目唯一的事务入口。
+//
+// fn 内任何返回 error 都会回滚整个事务；返回 nil 则提交。
+// 回调拿到的是 *Tx（事务作用域 repo 工厂），而非 *gorm.DB，从而把
+// 连接/事务/仓储装配的实现细节封闭在 repo 包内部。
+func (s *Store) RunInTx(ctx context.Context, fn func(tx *Tx) error) error {
+	if s.db == nil {
+		return errors.New("database is not initialized")
+	}
+	return s.db.WithContext(ctx).Transaction(func(txdb *gorm.DB) error {
+		return fn(&Tx{repoSet{db: txdb}})
+	})
+}

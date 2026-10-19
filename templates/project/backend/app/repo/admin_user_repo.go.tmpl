@@ -1,0 +1,54 @@
+package repo
+
+import (
+	"context"
+
+	"gorm.io/gorm"
+
+	"{{ .Module }}/app/model"
+)
+
+// AdminUserRepository 用户数据访问层
+type AdminUserRepository struct {
+	*baseRepository[model.AdminUser]
+}
+
+func NewAdminUserRepositoryWithDB(db *gorm.DB) *AdminUserRepository {
+	return &AdminUserRepository{baseRepository: newBaseRepository[model.AdminUser](db)}
+}
+
+// FindByUserID 根据用户 ID 查找用户
+func (r *AdminUserRepository) FindByUserID(ctx context.Context, userID uint64) (*model.AdminUser, error) {
+	return r.firstBy(ctx, "user_id = ?", userID)
+}
+
+// User 返回用户仓储
+func (r repoSet) User() *AdminUserRepository { return NewAdminUserRepositoryWithDB(r.db) }
+
+// UpdateByID 按主键更新指定字段
+func (r *AdminUserRepository) UpdateByID(ctx context.Context, id uint64, updates interface{}) error {
+	return r.db.WithContext(ctx).Model(&model.AdminUser{}).Where("user_id = ?", id).Updates(updates).Error
+}
+
+// FindByUsername 根据用户名查找用户
+func (r *AdminUserRepository) FindByUsername(ctx context.Context, username string) (*model.AdminUser, error) {
+	return r.firstBy(ctx, "username = ?", username)
+}
+
+// FindByMobile 根据手机号查找用户
+func (r *AdminUserRepository) FindByMobile(ctx context.Context, mobile string) (*model.AdminUser, error) {
+	return r.firstBy(ctx, "mobile = ?", mobile)
+}
+
+// ListByKeyword 分页查询用户（关键字模糊 + 状态过滤）
+func (r *AdminUserRepository) ListByKeyword(ctx context.Context, page, pageSize int, keyword string, status int) ([]model.AdminUser, int64, error) {
+	q := r.db.WithContext(ctx).Model(&model.AdminUser{})
+	if keyword != "" {
+		like := "%" + keyword + "%"
+		q = q.Where("(username LIKE ? OR mobile LIKE ? OR email LIKE ?)", like, like, like)
+	}
+	if status >= 0 {
+		q = q.Where("status = ?", status)
+	}
+	return r.page(q, page, pageSize, "user_id DESC")
+}

@@ -1,0 +1,260 @@
+package routes
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/stones-hub/taurus-pro-http/pkg/middleware"
+	"github.com/stones-hub/taurus-pro-http/pkg/router"
+
+	"{{ .Module }}/app"
+	tmid "{{ .Module }}/app/middleware"
+	"{{ .Module }}/internal/taurus"
+)
+
+// frontendDistDir 前端构建产物目录（相对后端运行目录 backend/）。
+const frontendDistDir = "../frontend/dist"
+
+// spaHandler 托管前端 SPA 静态资源并对 history 路由做 index.html 回退。
+// 单域名部署：唯一入口是 Go 服务，前端 pnpm build 产物由后端 Serve。
+func spaHandler(w http.ResponseWriter, r *http.Request) {
+	// 仅接受 GET/HEAD，避免把 POST 等误投到静态资源
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.NotFound(w, r)
+		return
+	}
+
+	// 清理路径，防止目录穿越
+	upath := r.URL.Path
+	if upath == "" || upath[0] != '/' {
+		upath = "/" + upath
+	}
+	cleanPath := filepath.Clean(upath)
+	if strings.Contains(cleanPath, "..") {
+		http.NotFound(w, r)
+		return
+	}
+
+	fullPath := filepath.Join(frontendDistDir, cleanPath)
+	// 命中静态文件则直接返回
+	if info, err := os.Stat(fullPath); err == nil && !info.IsDir() {
+		http.ServeFile(w, r, fullPath)
+		return
+	}
+	// 目录则尝试 index.html
+	if info, err := os.Stat(fullPath); err == nil && info.IsDir() {
+		idx := filepath.Join(fullPath, "index.html")
+		if _, err := os.Stat(idx); err == nil {
+			http.ServeFile(w, r, idx)
+			return
+		}
+	}
+	// SPA history 模式回退到根 index.html
+	indexPath := filepath.Join(frontendDistDir, "index.html")
+	if _, err := os.Stat(indexPath); err == nil {
+		http.ServeFile(w, r, indexPath)
+		return
+	}
+	http.NotFound(w, r)
+}
+
+// recovery 统一 panic 恢复中间件
+func recovery() router.MiddlewareFunc {
+	return middleware.RecoveryMiddleware(func(err any, stack string) {
+		fmt.Printf("Error: %v\nStack: %s\n", err, stack)
+	})
+}
+
+// RegisterRoutes 注册全部路由
+func RegisterRoutes() {
+	// 健康检查
+	taurus.Container.Http.AddRouter(router.Router{
+		Path:       "/health",
+		Handler:    http.HandlerFunc(app.Core.IndexController.Health),
+		Middleware: []router.MiddlewareFunc{recovery()},
+	})
+
+	// 前端 SPA 静态托管（catch-all 兜底，最后注册以复用 Go 1.22 ServeMux 最长前缀匹配）。
+	// 未命中任何 API 路径的请求走这里：命中静态资源则返回文件，否则回退 index.html（history 模式）。
+	taurus.Container.Http.AddRouter(router.Router{
+		Path:    "/",
+		Handler: http.HandlerFunc(spaHandler),
+	})
+
+	// 认证路由（无需 JWT）：登录 / 登出
+	taurus.Container.Http.AddRouterGroup(router.RouteGroup{
+		Prefix:     "/auth",
+		Middleware: []router.MiddlewareFunc{recovery(), tmid.AccessLogMiddleware()},
+		Routes: []router.Router{
+			{Path: "/login", Handler: http.HandlerFunc(app.Core.AuthController.Login)},
+			{Path: "/logout", Handler: http.HandlerFunc(app.Core.AuthController.Logout)},
+		},
+	})
+
+	// 基础用户链：JWT + 改密校验 + 访问日志 + CSRF（不校验接口权限，供「自己改自己」的基础功能）
+	userBaseChain := []router.MiddlewareFunc{
+		recovery(),
+		tmid.JWTMiddleware(),
+		tmid.PasswordChangeValidatorMiddleware(),
+		tmid.AccessLogMiddleware(),
+		tmid.CSRFMiddleware(),
+	}
+
+	// 完整权限链：+ Permission + 操作日志（受接口权限校验的写操作）
+	userProtectedChain := []router.MiddlewareFunc{
+		recovery(),
+		tmid.JWTMiddleware(),
+		tmid.PasswordChangeValidatorMiddleware(),
+		tmid.AccessLogMiddleware(),
+		tmid.PermissionMiddleware(),
+		tmid.OperationLogMiddleware(),
+		tmid.CSRFMiddleware(),
+	}
+
+	// 令牌刷新
+	taurus.Container.Http.AddRouterGroup(router.RouteGroup{
+		Prefix:     "/user",
+		Middleware: userBaseChain,
+		Routes: []router.Router{
+			{Path: "/refresh-token", Handler: http.HandlerFunc(app.Core.AuthController.RefreshToken)},
+		},
+	})
+
+	// 当前用户基础功能（/admin/user/*，不校验接口权限）
+	taurus.Container.Http.AddRouterGroup(router.RouteGroup{
+		Prefix:     "/admin/user",
+		Middleware: userBaseChain,
+		Routes: []router.Router{
+			{Path: "/current-info", Handler: http.HandlerFunc(app.Core.UserController.GetCurrentUserInfo)},
+			{Path: "/update-profile", Handler: http.HandlerFunc(app.Core.UserController.UpdateProfile)},
+			{Path: "/menus-buttons", Handler: http.HandlerFunc(app.Core.RoleController.MenusButtons)},
+		},
+	})
+
+	// 当前用户受接口权限保护的写操作（/admin/user/*，走权限校验）
+	taurus.Container.Http.AddRouterGroup(router.RouteGroup{
+		Prefix:     "/admin/user",
+		Middleware: userProtectedChain,
+		Routes: []router.Router{
+			{Path: "/change-password", Handler: http.HandlerFunc(app.Core.UserController.ChangePassword)},
+			{Path: "/set-password", Handler: http.HandlerFunc(app.Core.UserController.SetPassword)},
+			{Path: "/bind-mobile", Handler: http.HandlerFunc(app.Core.UserController.BindMobile)},
+			{Path: "/unbind-mobile", Handler: http.HandlerFunc(app.Core.UserController.UnbindMobile)},
+		},
+	})
+
+	// 用户管理（管理员视角，/admin/user/*，走接口权限校验）
+	taurus.Container.Http.AddRouterGroup(router.RouteGroup{
+		Prefix:     "/admin/user",
+		Middleware: userProtectedChain,
+		Routes: []router.Router{
+			{Path: "/list", Handler: http.HandlerFunc(app.Core.UserController.GetUserList)},
+			{Path: "/info", Handler: http.HandlerFunc(app.Core.UserController.GetUserInfo)},
+			{Path: "/add", Handler: http.HandlerFunc(app.Core.UserController.AddUser)},
+			{Path: "/update", Handler: http.HandlerFunc(app.Core.UserController.UpdateUser)},
+			{Path: "/delete", Handler: http.HandlerFunc(app.Core.UserController.DeleteUser)},
+			{Path: "/update-status", Handler: http.HandlerFunc(app.Core.UserController.UpdateUserStatus)},
+		},
+	})
+
+	// 发送验证码（无需 JWT，供登录/绑定/解绑共用）
+	taurus.Container.Http.AddRouterGroup(router.RouteGroup{
+		Prefix:     "/admin/user",
+		Middleware: []router.MiddlewareFunc{recovery()},
+		Routes: []router.Router{
+			{Path: "/send-code", Handler: http.HandlerFunc(app.Core.UserController.SendCode)},
+		},
+	})
+
+	// 登录日志（/admin/login-log/*）
+	taurus.Container.Http.AddRouterGroup(router.RouteGroup{
+		Prefix:     "/admin/login-log",
+		Middleware: userProtectedChain,
+		Routes: []router.Router{
+			{Path: "/list", Handler: http.HandlerFunc(app.Core.LoginLogController.GetLoginLogList)},
+		},
+	})
+
+	// 系统日志（访问日志/操作日志/前端错误日志查询）
+	taurus.Container.Http.AddRouterGroup(router.RouteGroup{
+		Prefix:     "/admin/log",
+		Middleware: userProtectedChain,
+		Routes: []router.Router{
+			{Path: "/access/list", Handler: http.HandlerFunc(app.Core.LogController.GetAccessLogList)},
+			{Path: "/operation/list", Handler: http.HandlerFunc(app.Core.LogController.GetOperationLogList)},
+			{Path: "/front-error/list", Handler: http.HandlerFunc(app.Core.LogController.GetFrontErrorLogList)},
+		},
+	})
+
+	// 前端错误上报（公共路由，无需登录）
+	taurus.Container.Http.AddRouter(router.Router{
+		Path:       "/report-front-error",
+		Handler:    http.HandlerFunc(app.Core.LogController.ReportFrontError),
+		Middleware: []router.MiddlewareFunc{recovery()},
+	})
+
+	// 角色管理（RBAC）
+	taurus.Container.Http.AddRouterGroup(router.RouteGroup{
+		Prefix:     "/admin/role",
+		Middleware: userProtectedChain,
+		Routes: []router.Router{
+			{Path: "/list", Handler: http.HandlerFunc(app.Core.RoleController.GetRoleList)},
+			{Path: "/add", Handler: http.HandlerFunc(app.Core.RoleController.AddRole)},
+			{Path: "/update", Handler: http.HandlerFunc(app.Core.RoleController.UpdateRole)},
+			{Path: "/delete", Handler: http.HandlerFunc(app.Core.RoleController.DeleteRole)},
+			{Path: "/update-status", Handler: http.HandlerFunc(app.Core.RoleController.UpdateRoleStatus)},
+			{Path: "/edit-info", Handler: http.HandlerFunc(app.Core.RoleController.GetEditRoleInfo)},
+			{Path: "/user-roles", Handler: http.HandlerFunc(app.Core.RoleController.GetUserRolesAndPermissions)},
+			{Path: "/assign", Handler: http.HandlerFunc(app.Core.RoleController.UpdateUserRoles)},
+		},
+	})
+
+	// 权限管理
+	taurus.Container.Http.AddRouterGroup(router.RouteGroup{
+		Prefix:     "/admin/permission",
+		Middleware: userProtectedChain,
+		Routes: []router.Router{
+			{Path: "/list", Handler: http.HandlerFunc(app.Core.PermissionController.GetPermissionList)},
+			{Path: "/tree", Handler: http.HandlerFunc(app.Core.PermissionController.GetPermissionTree)},
+			{Path: "/add", Handler: http.HandlerFunc(app.Core.PermissionController.AddPermission)},
+			{Path: "/update", Handler: http.HandlerFunc(app.Core.PermissionController.UpdatePermission)},
+			{Path: "/delete", Handler: http.HandlerFunc(app.Core.PermissionController.DeletePermission)},
+			{Path: "/update-status", Handler: http.HandlerFunc(app.Core.PermissionController.UpdatePermissionStatus)},
+			{Path: "/update-is-system", Handler: http.HandlerFunc(app.Core.PermissionController.UpdatePermissionIsSystem)},
+			{Path: "/edit-info", Handler: http.HandlerFunc(app.Core.PermissionController.GetEditPermissionInfo)},
+		},
+	})
+
+	// 部门管理（/admin/dept/*）
+	taurus.Container.Http.AddRouterGroup(router.RouteGroup{
+		Prefix:     "/admin/dept",
+		Middleware: userProtectedChain,
+		Routes: []router.Router{
+			{Path: "/list", Handler: http.HandlerFunc(app.Core.DeptController.GetDeptList)},
+			{Path: "/add", Handler: http.HandlerFunc(app.Core.DeptController.AddDept)},
+			{Path: "/update", Handler: http.HandlerFunc(app.Core.DeptController.UpdateDept)},
+			{Path: "/delete", Handler: http.HandlerFunc(app.Core.DeptController.DeleteDept)},
+			{Path: "/update-status", Handler: http.HandlerFunc(app.Core.DeptController.UpdateDeptStatus)},
+			{Path: "/edit-info", Handler: http.HandlerFunc(app.Core.DeptController.GetEditDeptInfo)},
+			{Path: "/user-list", Handler: http.HandlerFunc(app.Core.DeptController.GetDeptUserList)},
+			{Path: "/add-user", Handler: http.HandlerFunc(app.Core.DeptController.AddDeptUser)},
+			{Path: "/update-user", Handler: http.HandlerFunc(app.Core.DeptController.UpdateDeptUser)},
+			{Path: "/remove-user", Handler: http.HandlerFunc(app.Core.DeptController.RemoveDeptUser)},
+			{Path: "/batch-update-user", Handler: http.HandlerFunc(app.Core.DeptController.BatchUpdateDeptUser)},
+		},
+	})
+
+	// 选项（/admin/option/*，无接口权限校验，供下拉选项使用）
+	taurus.Container.Http.AddRouterGroup(router.RouteGroup{
+		Prefix:     "/admin/option",
+		Middleware: userBaseChain,
+		Routes: []router.Router{
+			{Path: "/depts", Handler: http.HandlerFunc(app.Core.DeptController.GetAllDepts)},
+			{Path: "/dept-users", Handler: http.HandlerFunc(app.Core.DeptController.GetDeptUserList)},
+			{Path: "/users", Handler: http.HandlerFunc(app.Core.UserController.GetUserList)},
+		},
+	})
+}

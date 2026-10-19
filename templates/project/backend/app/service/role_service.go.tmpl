@@ -1,0 +1,539 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"sort"
+
+	"github.com/google/wire"
+
+	"{{ .Module }}/app/constants"
+	"{{ .Module }}/app/dto"
+	"{{ .Module }}/app/model"
+	"{{ .Module }}/app/repo"
+)
+
+// AdminRoleService RBAC 角色权限服务
+type AdminRoleService struct {
+	roleRepo           *repo.AdminRoleRepository
+	permissionRepo     *repo.AdminPermissionsRepository
+	rolePermissionRepo *repo.AdminRolePermissionsRepository
+	userRoleRepo       *repo.AdminUserRoleRepository
+	store              *repo.Store
+}
+
+// AdminRoleServiceSet wire provider set（构造函数，内部手动装配仓储）
+var AdminRoleServiceSet = wire.NewSet(NewAdminRoleService)
+
+// NewAdminRoleService 创建角色权限服务
+func NewAdminRoleService(store *repo.Store) *AdminRoleService {
+	return &AdminRoleService{
+		roleRepo:           store.Role(),
+		permissionRepo:     store.Permission(),
+		rolePermissionRepo: store.RolePermission(),
+		userRoleRepo:       store.UserRole(),
+		store:              store,
+	}
+}
+
+// IsUserSuperAdmin 检查用户是否是超级管理员
+func (s *AdminRoleService) IsUserSuperAdmin(ctx context.Context, userID uint64) (bool, error) {
+	userRoles, err := s.userRoleRepo.FindByUserID(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	for _, userRole := range userRoles {
+		role, err := s.roleRepo.FindByRoleIDAnyStatus(ctx, userRole.RoleID)
+		if err != nil {
+			return false, err
+		}
+		if role != nil && role.RoleCode == constants.SuperAdminRoleCode && role.Status == 1 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// GetUserAllPermissions 获取用户所有权限（去重）
+func (s *AdminRoleService) GetUserAllPermissions(ctx context.Context, userID uint64) ([]model.AdminPermissions, error) {
+	// 一条 join 直接取用户所有权限（去重、仅启用），替代原来的三次查询 + 手工去重
+	return s.userRoleRepo.FindUserPermissions(ctx, userID)
+}
+
+// GetUserMenusAndButtons 获取用户有权限的菜单树和按钮权限列表
+func (s *AdminRoleService) GetUserMenusAndButtons(ctx context.Context, userID uint64) (dto.UserMenuButtonResponse, error) {
+	response := dto.UserMenuButtonResponse{
+		Menus:   make([]*dto.MenuNode, 0),
+		Buttons: make([]string, 0),
+	}
+
+	isSuperAdmin, err := s.IsUserSuperAdmin(ctx, userID)
+	if err != nil {
+		return response, err
+	}
+
+	var userPermissions []model.AdminPermissions
+	if isSuperAdmin {
+		userPermissions, err = s.permissionRepo.ListActive(ctx)
+		if err != nil {
+			return response, err
+		}
+	} else {
+		originPerms, err := s.GetUserAllPermissions(ctx, userID)
+		if err != nil {
+			return response, err
+		}
+		permIDMap := make(map[uint64]*model.AdminPermissions)
+		for i := range originPerms {
+			permIDMap[originPerms[i].PermissionID] = &originPerms[i]
+		}
+		for i := range originPerms {
+			if err := s.collectMenuParentRecursive(ctx, &originPerms[i], permIDMap); err != nil {
+				return response, err
+			}
+		}
+		userPermissions = make([]model.AdminPermissions, 0, len(permIDMap))
+		for _, v := range permIDMap {
+			userPermissions = append(userPermissions, *v)
+		}
+	}
+
+	menuPermissions := make([]model.AdminPermissions, 0)
+	buttonPermissions := make([]model.AdminPermissions, 0)
+	for _, perm := range userPermissions {
+		if perm.Status != 1 {
+			continue
+		}
+		switch perm.PermissionType {
+		case constants.PermissionTypeMenu:
+			menuPermissions = append(menuPermissions, perm)
+		case constants.PermissionTypeButton:
+			buttonPermissions = append(buttonPermissions, perm)
+		}
+	}
+
+	response.Menus = s.buildFrontendMenuTree(menuPermissions)
+
+	if isSuperAdmin {
+		for _, b := range buttonPermissions {
+			response.Buttons = append(response.Buttons, b.PermissionCode)
+		}
+	} else {
+		originPerms, err := s.GetUserAllPermissions(ctx, userID)
+		if err != nil {
+			return response, err
+		}
+		for _, p := range originPerms {
+			if p.Status == 1 && p.PermissionType == constants.PermissionTypeButton {
+				response.Buttons = append(response.Buttons, p.PermissionCode)
+			}
+		}
+	}
+
+	return response, nil
+}
+
+func (s *AdminRoleService) collectMenuParentRecursive(ctx context.Context, perm *model.AdminPermissions, collectMap map[uint64]*model.AdminPermissions) error {
+	if perm.ParentID == 0 {
+		return nil
+	}
+	if _, ok := collectMap[perm.ParentID]; ok {
+		return nil
+	}
+	parent, err := s.permissionRepo.FindByPermissionID(ctx, perm.ParentID)
+	if err != nil || parent == nil || parent.Status != 1 {
+		return err
+	}
+	collectMap[parent.PermissionID] = parent
+	return s.collectMenuParentRecursive(ctx, parent, collectMap)
+}
+
+func (s *AdminRoleService) buildFrontendMenuTree(menuPermissions []model.AdminPermissions) []*dto.MenuNode {
+	if len(menuPermissions) == 0 {
+		return make([]*dto.MenuNode, 0)
+	}
+
+	treeMap := make(map[uint64]*dto.MenuNode)
+	for _, perm := range menuPermissions {
+		node := &dto.MenuNode{
+			Name:     perm.PermissionName,
+			Code:     perm.PermissionCode,
+			Sort:     perm.SortOrder,
+			Mode:     []string{"tree"},
+			Icon:     perm.Icon,
+			Children: make([]*dto.MenuNode, 0),
+		}
+		if perm.Path != "" {
+			node.Link = perm.Path
+		}
+		treeMap[perm.PermissionID] = node
+	}
+
+	var roots []*dto.MenuNode
+	for _, perm := range menuPermissions {
+		node := treeMap[perm.PermissionID]
+		if perm.ParentID == 0 {
+			roots = append(roots, node)
+		} else if parent, exists := treeMap[perm.ParentID]; exists {
+			parent.Children = append(parent.Children, node)
+		}
+	}
+
+	s.sortFrontendMenuTree(roots)
+	return roots
+}
+
+func (s *AdminRoleService) sortFrontendMenuTree(nodes []*dto.MenuNode) {
+	if len(nodes) == 0 {
+		return
+	}
+	sort.Slice(nodes, func(a, b int) bool { return nodes[a].Sort < nodes[b].Sort })
+	for _, node := range nodes {
+		s.sortFrontendMenuTree(node.Children)
+	}
+}
+
+// ==================== 角色 CRUD ====================
+
+// GetRoleList 获取角色列表（分页，支持名称模糊 + 状态过滤）
+func (s *AdminRoleService) GetRoleList(ctx context.Context, page, pageSize int, roleName string, status int) (*dto.RoleListResponse, error) {
+	roles, total, err := s.roleRepo.ListWithFilter(ctx, page, pageSize, repo.AdminRoleListFilter{
+		RoleName: roleName,
+		Status:   status,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	items := make([]*dto.RoleListResponseItem, 0, len(roles))
+	for i := range roles {
+		r := roles[i]
+		items = append(items, &dto.RoleListResponseItem{
+			RoleID:      r.RoleID,
+			RoleName:    r.RoleName,
+			RoleCode:    r.RoleCode,
+			Description: r.Description,
+			SortOrder:   r.SortOrder,
+			Status:      r.Status,
+			IsSystem:    r.IsSystem,
+			UpdatedAt:   r.UpdatedAt.Format("2006-01-02 15:04:05"),
+			CreatedAt:   r.CreatedAt.Format("2006-01-02 15:04:05"),
+		})
+	}
+
+	return &dto.RoleListResponse{
+		PageNo:      page,
+		PageSize:    pageSize,
+		ResultTotal: total,
+		List:        items,
+	}, nil
+}
+
+// AddRole 新增角色（含权限关联，事务整体提交）
+func (s *AdminRoleService) AddRole(ctx context.Context, req *dto.AddRoleRequest) error {
+	existing, err := s.roleRepo.FindByRoleCode(ctx, req.RoleCode)
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		return errors.New("角色编码已存在")
+	}
+	existing, err = s.roleRepo.FindByRoleName(ctx, req.RoleName)
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		return errors.New("角色名称已存在")
+	}
+
+	// 事务前校验权限 ID（只读，避免事务内校验失败才回滚）
+	for _, permID := range req.PermissionIDs {
+		perm, err := s.permissionRepo.FindByPermissionID(ctx, permID)
+		if err != nil {
+			return err
+		}
+		if perm == nil {
+			return errors.New("权限ID不存在")
+		}
+	}
+
+	// 建角色 + 建权限关联，任一失败整体回滚
+	return s.store.RunInTx(ctx, func(tx *repo.Tx) error {
+		role := &model.AdminRole{
+			RoleName:    req.RoleName,
+			RoleCode:    req.RoleCode,
+			Description: req.Description,
+			SortOrder:   req.SortOrder,
+			Status:      1,
+			IsSystem:    int8(req.IsSystem),
+		}
+		if err := tx.Role().Create(ctx, role); err != nil {
+			return err
+		}
+		for _, permID := range req.PermissionIDs {
+			if err := tx.RolePermission().Create(ctx, &model.AdminRolePermissions{RoleID: role.RoleID, PermissionID: permID}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// UpdateRole 更新角色（名称 + 权限，事务整体提交）
+func (s *AdminRoleService) UpdateRole(ctx context.Context, req *dto.UpdateRoleRequest) error {
+	role, err := s.roleRepo.FindByRoleIDAnyStatus(ctx, req.RoleID)
+	if err != nil {
+		return err
+	}
+	if role == nil {
+		return errors.New("角色不存在")
+	}
+	if role.IsSystem == 1 {
+		return errors.New("系统角色不能修改")
+	}
+
+	// 事务前校验权限 ID（只读）
+	for _, permID := range req.PermissionIDs {
+		perm, err := s.permissionRepo.FindByPermissionID(ctx, permID)
+		if err != nil {
+			return err
+		}
+		if perm == nil {
+			return errors.New("权限ID不存在")
+		}
+	}
+
+	// 改名 + 删旧权限 + 加新权限，任一失败整体回滚
+	return s.store.RunInTx(ctx, func(tx *repo.Tx) error {
+		if req.RoleName != "" {
+			if err := tx.Role().UpdateByID(ctx, req.RoleID, map[string]interface{}{"role_name": req.RoleName}); err != nil {
+				return err
+			}
+		}
+		oldRPs, err := tx.RolePermission().FindByRoleID(ctx, req.RoleID)
+		if err != nil {
+			return err
+		}
+		for _, rp := range oldRPs {
+			if err := tx.RolePermission().Delete(ctx, &rp); err != nil {
+				return err
+			}
+		}
+		for _, permID := range req.PermissionIDs {
+			if err := tx.RolePermission().Create(ctx, &model.AdminRolePermissions{RoleID: req.RoleID, PermissionID: permID}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// DeleteRole 删除角色（系统角色不能删，绑定用户不能删；事务整体提交）
+func (s *AdminRoleService) DeleteRole(ctx context.Context, roleID uint64) error {
+	role, err := s.roleRepo.FindByRoleIDAnyStatus(ctx, roleID)
+	if err != nil {
+		return err
+	}
+	if role == nil {
+		return errors.New("角色不存在")
+	}
+	if role.IsSystem == 1 {
+		return errors.New("系统角色不能删除")
+	}
+	userRoles, err := s.userRoleRepo.FindByRoleID(ctx, roleID)
+	if err != nil {
+		return err
+	}
+	if len(userRoles) > 0 {
+		return errors.New("该角色已绑定用户，无法删除")
+	}
+
+	// 删权限关联 + 删角色，任一失败整体回滚
+	return s.store.RunInTx(ctx, func(tx *repo.Tx) error {
+		rolePermissions, err := tx.RolePermission().FindByRoleID(ctx, roleID)
+		if err != nil {
+			return err
+		}
+		for _, rp := range rolePermissions {
+			if err := tx.RolePermission().Delete(ctx, &rp); err != nil {
+				return err
+			}
+		}
+		return tx.Role().Delete(ctx, role)
+	})
+}
+
+// UpdateRoleStatus 更新角色状态
+func (s *AdminRoleService) UpdateRoleStatus(ctx context.Context, roleID uint64, status int) error {
+	return s.roleRepo.UpdateByID(ctx, roleID, map[string]interface{}{"status": status})
+}
+
+// ==================== 用户角色 ====================
+
+// GetUserRolesAndPermissions 获取用户角色和权限
+func (s *AdminRoleService) GetUserRolesAndPermissions(ctx context.Context, userID uint64) (dto.UserRoleDetailResponse, error) {
+	response := dto.UserRoleDetailResponse{
+		UserID:         userID,
+		Roles:          make([]dto.UserRoleDetail, 0),
+		AllPermissions: make([]model.AdminPermissions, 0),
+	}
+
+	allRoles, err := s.roleRepo.ListActive(ctx)
+	if err != nil {
+		return response, err
+	}
+	userRoles, err := s.userRoleRepo.FindByUserID(ctx, userID)
+	if err != nil {
+		return response, err
+	}
+	userRoleIDMap := make(map[uint64]bool)
+	for _, ur := range userRoles {
+		userRoleIDMap[ur.RoleID] = true
+	}
+
+	permissionMap := make(map[uint64]model.AdminPermissions)
+	for _, role := range allRoles {
+		response.Roles = append(response.Roles, dto.UserRoleDetail{Role: role, Checked: userRoleIDMap[role.RoleID]})
+		if !userRoleIDMap[role.RoleID] {
+			continue
+		}
+		rps, err := s.rolePermissionRepo.FindByRoleID(ctx, role.RoleID)
+		if err != nil {
+			return response, err
+		}
+		for _, rp := range rps {
+			perm, err := s.permissionRepo.FindByPermissionID(ctx, rp.PermissionID)
+			if err != nil {
+				return response, err
+			}
+			if perm == nil {
+				continue
+			}
+			permissionMap[perm.PermissionID] = *perm
+		}
+	}
+
+	response.AllPermissions = make([]model.AdminPermissions, 0, len(permissionMap))
+	for _, p := range permissionMap {
+		response.AllPermissions = append(response.AllPermissions, p)
+	}
+	return response, nil
+}
+
+// UpdateUserRoles 更新用户角色（先删后加，事务整体提交）
+func (s *AdminRoleService) UpdateUserRoles(ctx context.Context, userID uint64, roleIDs []uint64) error {
+	// 事务前校验角色 ID（只读）
+	for _, roleID := range roleIDs {
+		role, err := s.roleRepo.FindByRoleID(ctx, roleID)
+		if err != nil {
+			return err
+		}
+		if role == nil {
+			return errors.New("角色ID不存在")
+		}
+	}
+
+	// 删旧用户角色 + 加新用户角色，任一失败整体回滚
+	return s.store.RunInTx(ctx, func(tx *repo.Tx) error {
+		oldUserRoles, err := tx.UserRole().FindByUserID(ctx, userID)
+		if err != nil {
+			return err
+		}
+		for _, ur := range oldUserRoles {
+			if err := tx.UserRole().Delete(ctx, &ur); err != nil {
+				return err
+			}
+		}
+		for _, roleID := range roleIDs {
+			if err := tx.UserRole().Create(ctx, &model.AdminUserRole{UserID: userID, RoleID: roleID}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// GetEditRoleInfo 获取编辑角色信息（角色字段 + 全量权限树，当前角色拥有的权限标记选中）
+func (s *AdminRoleService) GetEditRoleInfo(ctx context.Context, roleID uint64) (*dto.EditRoleInfoResponse, error) {
+	role, err := s.roleRepo.FindByRoleIDAnyStatus(ctx, roleID)
+	if err != nil {
+		return nil, err
+	}
+	if role == nil {
+		return nil, errors.New("角色不存在")
+	}
+
+	// 全量启用权限
+	allPermissions, err := s.permissionRepo.ListActive(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// 当前角色拥有的权限 ID 集合
+	rolePermissions, err := s.rolePermissionRepo.FindByRoleID(ctx, roleID)
+	if err != nil {
+		return nil, err
+	}
+	checkedMap := make(map[uint64]bool, len(rolePermissions))
+	for _, rp := range rolePermissions {
+		checkedMap[rp.PermissionID] = true
+	}
+
+	return &dto.EditRoleInfoResponse{
+		RoleID:      role.RoleID,
+		RoleName:    role.RoleName,
+		RoleCode:    role.RoleCode,
+		Description: role.Description,
+		SortOrder:   role.SortOrder,
+		Status:      role.Status,
+		IsSystem:    role.IsSystem,
+		AddTime:     role.CreatedAt.Format("2006-01-02 15:04:05"),
+		UpdateTime:  role.UpdatedAt.Format("2006-01-02 15:04:05"),
+		Permissions: buildEditPermissionTree(allPermissions, checkedMap),
+	}, nil
+}
+
+// buildEditPermissionTree 构建编辑权限树（标记选中状态）
+func buildEditPermissionTree(allPermissions []model.AdminPermissions, checkedMap map[uint64]bool) []*dto.EditRolePermissionTree {
+	treeMap := make(map[uint64]*dto.EditRolePermissionTree, len(allPermissions))
+	for i := range allPermissions {
+		p := allPermissions[i]
+		treeMap[p.PermissionID] = &dto.EditRolePermissionTree{
+			PermissionID:   p.PermissionID,
+			ParentID:       p.ParentID,
+			PermissionName: p.PermissionName,
+			PermissionCode: p.PermissionCode,
+			PermissionType: p.PermissionType,
+			Path:           p.Path,
+			Icon:           p.Icon,
+			SortOrder:      p.SortOrder,
+			Status:         p.Status,
+			IsSystem:       p.IsSystem,
+			Checked:        checkedMap[p.PermissionID],
+			Children:       make([]*dto.EditRolePermissionTree, 0),
+		}
+	}
+
+	var roots []*dto.EditRolePermissionTree
+	for _, p := range allPermissions {
+		node := treeMap[p.PermissionID]
+		if p.ParentID == 0 {
+			roots = append(roots, node)
+		} else if parent, ok := treeMap[p.ParentID]; ok {
+			parent.Children = append(parent.Children, node)
+		}
+	}
+	sortEditPermissionTree(roots)
+	return roots
+}
+
+// sortEditPermissionTree 递归按 sort_order 排序权限树
+func sortEditPermissionTree(nodes []*dto.EditRolePermissionTree) {
+	if len(nodes) == 0 {
+		return
+	}
+	sort.Slice(nodes, func(a, b int) bool { return nodes[a].SortOrder < nodes[b].SortOrder })
+	for _, n := range nodes {
+		sortEditPermissionTree(n.Children)
+	}
+}

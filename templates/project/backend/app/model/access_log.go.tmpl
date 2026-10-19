@@ -1,0 +1,22 @@
+package model
+
+import "time"
+
+// AccessLog API 访问日志表（记录每次 API 请求）
+type AccessLog struct {
+	LogID        uint64    `json:"log_id" gorm:"primaryKey;autoIncrement;column:log_id;comment:日志ID"`
+	UserID       uint64    `json:"user_id" gorm:"index:idx_user_id;not null;default:0;column:user_id;comment:用户ID（0=未登录）"`
+	Method       string    `json:"method" gorm:"size:10;not null;column:method;comment:HTTP 方法"`
+	Path         string    `json:"path" gorm:"index:idx_path;size:200;not null;column:path;comment:请求路径"`
+	StatusCode   int       `json:"status_code" gorm:"index:idx_status;not null;default:0;column:status_code;comment:响应状态码"`
+	IP           string    `json:"ip" gorm:"size:45;not null;default:'';column:ip;comment:客户端 IP"`
+	UserAgent    string    `json:"user_agent" gorm:"size:500;not null;default:'';column:user_agent;comment:用户代理"`
+	DurationMs   int64     `json:"duration_ms" gorm:"not null;default:0;column:duration_ms;comment:耗时（毫秒）"`
+	Query        string    `json:"query" gorm:"size:500;not null;default:'';column:query;comment:查询串"`
+	RequestBody  string    `json:"request_body" gorm:"type:text;column:request_body;comment:请求体（截断）"`
+	ResponseBody string    `json:"response_body" gorm:"type:longtext;column:response_body;comment:响应体（截断）"`
+	ErrorMessage string    `json:"error_message" gorm:"size:500;not null;default:'';column:error_message;comment:错误信息（如有）"`
+	CreatedAt    time.Time `json:"created_at" gorm:"index:idx_created;not null;default:CURRENT_TIMESTAMP;column:created_at;comment:访问时间"`
+}
+
+func (AccessLog) TableName() string { return "admin_access_logs" }

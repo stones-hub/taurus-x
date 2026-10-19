@@ -1,0 +1,227 @@
+package app
+
+import (
+	"context"
+{{- if .Has.grpc }}
+	"errors"
+{{- end }}
+	"flag"
+	"fmt"
+	"log"
+	"net/http"
+	_ "net/http/pprof" // 导入 pprof
+	"os"
+	"os/signal"
+	"runtime"
+	"runtime/debug"
+	"syscall"
+	"time"
+
+	"github.com/stones-hub/taurus-pro-common/pkg/recovery"
+{{- if .Has.grpc }}
+	"google.golang.org/grpc"
+{{- end }}
+
+	"{{ .Module }}/app/command"
+	"{{ .Module }}/app/crontab"
+	"{{ .Module }}/app/hooks"
+	"{{ .Module }}/internal/taurus"
+)
+
+// ANSI 颜色
+const (
+	Reset  = "\033[0m"
+	Red    = "\033[31m"
+	Green  = "\033[32m"
+	Yellow = "\033[33m"
+	Cyan   = "\033[36m"
+)
+
+var (
+	env        = ".env.local"
+	configPath = "./config"
+	Core       *Injector
+	cleanups   []func()
+)
+
+// Run 启动 HTTP 服务并阻塞，等待信号后优雅关闭
+func Run() {
+	// 全局 panic 恢复
+	defer recovery.GlobalPanicRecovery.Recover("bootstrap")
+
+	// 启动 pprof 服务
+	runPprofServer()
+
+	// 使用 errChan 接收各服务启动错误
+	errChan := make(chan error, 1)
+	taurus.Container.Http.Start(errChan)
+{{- if .Has.tcp }}
+
+	// TCP 服务（tcp.enable=false 时 Container.TCP 为 nil，跳过）。
+	//
+	// Start() 是**阻塞**的：内部 `go acceptLoop()` 之后还有 `wg.Wait()`，要一直等到
+	// 服务停止才返回，所以必须放协程里跑，否则主流程卡在这里 —— 后面的 gRPC 启动、
+	// 信号注册、优雅关闭全都不会发生。
+	// 监听失败会立刻返回错误；正常关闭（cleanup 调 Stop → acceptLoop 退出 → wg 归零）
+	// 返回 nil。关闭仍由 ProvideTCPComponent 注册的 cleanup 负责。
+	if taurus.Container.TCP != nil {
+		go func() {
+			if err := taurus.Container.TCP.Start(); err != nil {
+				select {
+				case errChan <- fmt.Errorf("tcp server: %w", err):
+				default:
+				}
+			}
+		}()
+		log.Printf("%s🔗 -> TCP server started. %s\n", Green, Reset)
+	}
+{{- end }}
+{{- if .Has.grpc }}
+
+	// gRPC 服务（grpc.enable=false 时 Container.GRPC 为 nil，跳过）。
+	// Start() 同样会阻塞在 Serve 上，所以放协程里跑，启动失败走 errChan 触发整体关闭。
+	// 关闭由 ProvideGRPCComponent 注册的 cleanup 负责（gracefulCleanup 里统一调用）。
+	if taurus.Container.GRPC != nil {
+		go func() {
+			if err := taurus.Container.GRPC.Start(); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+				select {
+				case errChan <- fmt.Errorf("grpc server: %w", err):
+				default:
+				}
+			}
+		}()
+		log.Printf("%s🔗 -> gRPC server started. %s\n", Green, Reset)
+	}
+{{- end }}
+
+	// 阻塞直到收到信号或错误
+	if err := signalWaiter(errChan); err != nil {
+		log.Fatalf("%sServer startup failed: %v %s\n", Red, err, Reset)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := taurus.Container.Http.Shutdown(ctx); err != nil {
+		log.Printf("%sServer forced to shutdown: %v %s\n", Red, err, Reset)
+	}
+
+	log.Printf("%s🔗 -> Server shutdown successfully. %s\n", Green, Reset)
+	gracefulCleanup(ctx)
+}
+
+// signalWaiter 等待信号或错误
+func signalWaiter(errCh chan error) error {
+	signalToNotify := []os.Signal{syscall.SIGINT, syscall.SIGHUP, syscall.SIGTERM}
+	if signal.Ignored(syscall.SIGHUP) {
+		signalToNotify = []os.Signal{syscall.SIGINT, syscall.SIGTERM}
+	}
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, signalToNotify...)
+
+	log.Printf("%s🔗 -> Waiting for signals: %v %s\n", Yellow, signalToNotify, Reset)
+
+	select {
+	case sig := <-signals:
+		log.Printf("%s🔗 -> Received signal: %s, starting graceful shutdown... %s\n", Yellow, sig, Reset)
+		signal.Stop(signals)
+		return nil
+	case err := <-errCh:
+		log.Printf("%s🔗 -> Received error: %v, starting shutdown... %s\n", Red, err, Reset)
+		return err
+	}
+}
+
+// gracefulCleanup 清理回调
+func gracefulCleanup(ctx context.Context) {
+	log.Printf("%s🔗 -> Waiting for all requests to be processed... %s\n", Yellow, Reset)
+	done := make(chan struct{})
+
+	go func() {
+		log.Printf("%s🔗 -> Running cleanup functions... %s\n", Yellow, Reset)
+		for _, cleanup := range cleanups {
+			cleanup()
+		}
+		log.Printf("%s🔗 -> All cleanup functions completed %s\n", Green, Reset)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Printf("%s🔗 -> Cleanup completed successfully. %s\n", Green, Reset)
+	case <-ctx.Done():
+		log.Printf("%s🔗 -> Cleanup timeout reached, forcing stop. %s\n", Red, Reset)
+	}
+}
+
+// init 自动在 main 之前执行
+func init() {
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "\n%s\n", Cyan+"==================== Usage ===================="+Reset)
+		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s-e, --env <file>%s   Specify the environment file (default \".env.local\")\n", Green, Reset)
+		fmt.Fprintf(os.Stderr, "  %s-c, --config <path>%s  Specify the configuration file or directory (default \"config\")\n", Green, Reset)
+		fmt.Fprintf(os.Stderr, "  %s-h, --help%s         Show this help message\n", Green, Reset)
+		fmt.Fprintf(os.Stderr, "%s\n", Cyan+"==============================================="+Reset)
+	}
+
+	flag.StringVar(&env, "env", ".env.local", "Environment file")
+	flag.StringVar(&env, "e", ".env.local", "Environment file (alias)")
+	flag.StringVar(&configPath, "config", "config", "Path to the configuration file or directory")
+	flag.StringVar(&configPath, "c", "config", "Path to the configuration file or directory (alias)")
+	flag.Parse()
+
+	// 初始化框架组件
+	cleanup, err := taurus.BuildComponents(configPath, env)
+	if err != nil {
+		log.Fatal(err)
+	}
+	cleanups = append(cleanups, cleanup)
+
+	// 设置 Go 相关配置
+	setGoConfig()
+
+	// 初始化项目模块（应用组件图）
+	Core, cleanup, err = buildInjector()
+	if err != nil {
+		log.Fatal(err)
+	}
+	cleanups = append(cleanups, cleanup)
+
+	// 启动 hooks
+	if err := hooks.StartHook(); err != nil {
+		log.Printf("%s🔗 -> Hooks start failed: %v %s\n", Red, err, Reset)
+	}
+
+	// 启动定时任务
+	if err := crontab.StartTasks(); err != nil {
+		log.Printf("%s🔗 -> Cron tasks start failed: %v %s\n", Red, err, Reset)
+	}
+
+	// 启动命令行工具
+	command.StartCommand()
+}
+
+func runPprofServer() {
+	if taurus.Container.Config.GetBool("pprof_enabled") {
+		server := &http.Server{Addr: "localhost:6060"}
+		go func() {
+			log.Printf("%s🔗 -> Starting pprof server on :6060 %s\n", Yellow, Reset)
+			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("%s🔗 -> pprof server error: %v %s\n", Red, err, Reset)
+			}
+		}()
+		cleanups = append(cleanups, func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = server.Shutdown(ctx)
+		})
+	}
+}
+
+func setGoConfig() {
+	runtime.GOMAXPROCS(taurus.Container.Config.GetInt("go.max_procs"))
+	debug.SetMemoryLimit(int64(taurus.Container.Config.GetInt("go.memory_limit")) * 1024 * 1024 * 1024)
+	debug.SetGCPercent(taurus.Container.Config.GetInt("go.gc"))
+}

@@ -1,0 +1,444 @@
+package service
+
+import (
+	"context"
+	"errors"
+
+	"github.com/google/wire"
+
+	"{{ .Module }}/app/dto"
+	"{{ .Module }}/app/model"
+	"{{ .Module }}/app/repo"
+)
+
+// AdminDeptService 部门服务
+type AdminDeptService struct {
+	store        *repo.Store
+	deptRepo     *repo.AdminDeptRepository
+	userDeptRepo *repo.AdminUserDeptRepository
+	userRepo     *repo.AdminUserRepository
+}
+
+// AdminDeptServiceSet wire provider set
+var AdminDeptServiceSet = wire.NewSet(NewAdminDeptService)
+
+// NewAdminDeptService 创建部门服务
+func NewAdminDeptService(store *repo.Store) *AdminDeptService {
+	return &AdminDeptService{
+		store:        store,
+		deptRepo:     store.Dept(),
+		userDeptRepo: store.UserDept(),
+		userRepo:     store.User(),
+	}
+}
+
+// GetDeptList 分页查询部门列表（名称模糊 + 状态过滤，回填父部门名和员工数）
+func (s *AdminDeptService) GetDeptList(ctx context.Context, page, pageSize int, deptName string, status int) (*dto.DeptListResponse, error) {
+	depts, total, err := s.deptRepo.ListWithFilter(ctx, page, pageSize, repo.AdminDeptListFilter{
+		DeptName: deptName,
+		Status:   status,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	items := make([]*dto.DeptListResponseItem, 0, len(depts))
+	for i := range depts {
+		dept := depts[i]
+		userCount, _ := s.userDeptRepo.CountActiveByDeptID(ctx, dept.DeptID)
+		parentName := ""
+		if dept.ParentID > 0 {
+			if p, _ := s.deptRepo.FindByDeptID(ctx, dept.ParentID); p != nil {
+				parentName = p.DeptName
+			}
+		}
+		items = append(items, &dto.DeptListResponseItem{
+			DeptID:         dept.DeptID,
+			DeptName:       dept.DeptName,
+			ParentID:       dept.ParentID,
+			ParentDeptName: parentName,
+			DeptCode:       dept.DeptCode,
+			Description:    dept.Description,
+			SortOrder:      dept.SortOrder,
+			DeptSource:     dept.DeptSource,
+			Status:         dept.Status,
+			AddTime:        dept.CreatedAt.Format("2006-01-02 15:04:05"),
+			UpdateTime:     dept.UpdatedAt.Format("2006-01-02 15:04:05"),
+			UserCount:      userCount,
+		})
+	}
+
+	return &dto.DeptListResponse{
+		PageNo:      page,
+		PageSize:    pageSize,
+		ResultTotal: total,
+		List:        items,
+	}, nil
+}
+
+// GetEditDeptInfo 获取编辑部门信息
+func (s *AdminDeptService) GetEditDeptInfo(ctx context.Context, deptID uint64) (*dto.EditDeptInfoResponse, error) {
+	dept, err := s.deptRepo.FindByDeptID(ctx, deptID)
+	if err != nil {
+		return nil, err
+	}
+	if dept == nil {
+		return nil, errors.New("部门不存在")
+	}
+	return &dto.EditDeptInfoResponse{
+		DeptID:      dept.DeptID,
+		DeptName:    dept.DeptName,
+		ParentID:    dept.ParentID,
+		DeptCode:    dept.DeptCode,
+		Description: dept.Description,
+		SortOrder:   dept.SortOrder,
+		DeptSource:  dept.DeptSource,
+		Status:      dept.Status,
+	}, nil
+}
+
+// AddDept 新增部门
+func (s *AdminDeptService) AddDept(ctx context.Context, req *dto.AddDeptRequest) error {
+	if req.DeptName == "" {
+		return errors.New("部门名称不能为空")
+	}
+	if req.DeptCode != "" {
+		exist, err := s.deptRepo.FindByDeptCode(ctx, req.DeptCode)
+		if err != nil {
+			return err
+		}
+		if exist != nil {
+			return errors.New("部门编码已存在")
+		}
+	}
+	if req.ParentID > 0 {
+		parent, err := s.deptRepo.FindByDeptID(ctx, req.ParentID)
+		if err != nil {
+			return err
+		}
+		if parent == nil {
+			return errors.New("父部门不存在")
+		}
+	}
+	deptSource := req.DeptSource
+	if deptSource == 0 {
+		deptSource = 1 // 默认自主创建
+	}
+	return s.deptRepo.Create(ctx, &model.AdminDept{
+		DeptName:    req.DeptName,
+		ParentID:    req.ParentID,
+		DeptCode:    req.DeptCode,
+		Description: req.Description,
+		SortOrder:   req.SortOrder,
+		DeptSource:  deptSource,
+		Status:      1,
+	})
+}
+
+// UpdateDept 更新部门
+func (s *AdminDeptService) UpdateDept(ctx context.Context, req *dto.UpdateDeptRequest) error {
+	dept, err := s.deptRepo.FindByDeptID(ctx, req.DeptID)
+	if err != nil {
+		return err
+	}
+	if dept == nil {
+		return errors.New("部门不存在")
+	}
+	if req.ParentID != 0 && req.ParentID != dept.ParentID {
+		if req.ParentID == req.DeptID {
+			return errors.New("不能将部门设置为自己的父部门")
+		}
+		parent, err := s.deptRepo.FindByDeptID(ctx, req.ParentID)
+		if err != nil {
+			return err
+		}
+		if parent == nil {
+			return errors.New("父部门不存在")
+		}
+	}
+	return s.deptRepo.UpdateByID(ctx, req.DeptID, map[string]interface{}{
+		"dept_name":   req.DeptName,
+		"parent_id":   req.ParentID,
+		"description": req.Description,
+		"sort_order":  req.SortOrder,
+	})
+}
+
+// UpdateDeptStatus 更新部门状态（禁用前检查是否有员工）
+func (s *AdminDeptService) UpdateDeptStatus(ctx context.Context, deptID uint64, status int8) error {
+	dept, err := s.deptRepo.FindByDeptID(ctx, deptID)
+	if err != nil {
+		return err
+	}
+	if dept == nil {
+		return errors.New("部门不存在")
+	}
+	if status == 0 {
+		userCount, err := s.userDeptRepo.CountActiveByDeptID(ctx, deptID)
+		if err != nil {
+			return err
+		}
+		if userCount > 0 {
+			return errors.New("部门内有员工，无法禁用部门")
+		}
+	}
+	return s.deptRepo.UpdateByID(ctx, deptID, map[string]interface{}{"status": status})
+}
+
+// DeleteDept 删除部门（软删：状态置 0，有员工或子部门则拒绝）
+func (s *AdminDeptService) DeleteDept(ctx context.Context, deptID uint64) error {
+	dept, err := s.deptRepo.FindByDeptID(ctx, deptID)
+	if err != nil {
+		return err
+	}
+	if dept == nil {
+		return errors.New("部门不存在")
+	}
+	userCount, err := s.userDeptRepo.CountActiveByDeptID(ctx, deptID)
+	if err != nil {
+		return err
+	}
+	if userCount > 0 {
+		return errors.New("部门内有员工，无法删除部门")
+	}
+	children, err := s.deptRepo.FindByParentID(ctx, deptID)
+	if err != nil {
+		return err
+	}
+	for _, c := range children {
+		if c.Status == 1 {
+			return errors.New("部门下有子部门，无法删除部门")
+		}
+	}
+	return s.deptRepo.UpdateByID(ctx, deptID, map[string]interface{}{"status": 0})
+}
+
+// GetAllDepts 获取所有启用部门（下拉选项，可排除某部门）
+func (s *AdminDeptService) GetAllDepts(ctx context.Context, excludeDeptID uint64) ([]*dto.DeptOptionItem, error) {
+	var depts []model.AdminDept
+	var err error
+	if excludeDeptID > 0 {
+		depts, err = s.deptRepo.ListActiveExceptID(ctx, excludeDeptID)
+	} else {
+		depts, err = s.deptRepo.ListActive(ctx)
+	}
+	if err != nil {
+		return nil, err
+	}
+	items := make([]*dto.DeptOptionItem, 0, len(depts))
+	for i := range depts {
+		items = append(items, &dto.DeptOptionItem{
+			DeptID:   depts[i].DeptID,
+			DeptName: depts[i].DeptName,
+			ParentID: depts[i].ParentID,
+		})
+	}
+	return items, nil
+}
+
+// ==================== 部门员工管理 ====================
+
+// GetDeptUserList 获取部门员工列表（分页）
+func (s *AdminDeptService) GetDeptUserList(ctx context.Context, deptID uint64, page, pageSize int) (*dto.DeptUserListResponse, error) {
+	dept, err := s.deptRepo.FindByDeptID(ctx, deptID)
+	if err != nil {
+		return nil, err
+	}
+	if dept == nil {
+		return nil, errors.New("部门不存在")
+	}
+	userDepts, total, err := s.userDeptRepo.ListByDeptID(ctx, deptID, page, pageSize)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]*dto.DeptUserResponse, 0, len(userDepts))
+	for i := range userDepts {
+		ud := userDepts[i]
+		user, _ := s.userRepo.FindByUserID(ctx, ud.UserID)
+		if user == nil {
+			continue
+		}
+		mobile := ""
+		if user.Mobile != nil {
+			mobile = *user.Mobile
+		}
+		items = append(items, &dto.DeptUserResponse{
+			ID:        ud.ID,
+			UserID:    ud.UserID,
+			Username:  user.Username,
+			Realname:  user.Realname,
+			Mobile:    mobile,
+			IsPrimary: ud.IsPrimary,
+			IsManager: ud.IsManager,
+			Status:    ud.Status,
+			AddTime:   ud.CreatedAt.Format("2006-01-02 15:04:05"),
+		})
+	}
+	return &dto.DeptUserListResponse{
+		PageNo:      page,
+		PageSize:    pageSize,
+		ResultTotal: total,
+		List:        items,
+	}, nil
+}
+
+// AddDeptUser 添加部门员工（一个部门只能有一个 leader）
+func (s *AdminDeptService) AddDeptUser(ctx context.Context, req *dto.AddDeptUserRequest) error {
+	dept, err := s.deptRepo.FindByDeptID(ctx, req.DeptID)
+	if err != nil {
+		return err
+	}
+	if dept == nil {
+		return errors.New("部门不存在")
+	}
+	if dept.Status == 0 {
+		return errors.New("部门已禁用，无法添加员工")
+	}
+	if req.IsManager == 1 {
+		manager, err := s.userDeptRepo.FindManagerByDeptID(ctx, req.DeptID)
+		if err != nil {
+			return err
+		}
+		if manager != nil {
+			return errors.New("该部门已有leader，一个部门只能有一个leader")
+		}
+		if len(req.UserIDs) > 1 {
+			return errors.New("设置部门管理员时，只能选择一个用户")
+		}
+	}
+	// 验证用户存在
+	for _, uid := range req.UserIDs {
+		u, err := s.userRepo.FindByUserID(ctx, uid)
+		if err != nil {
+			return err
+		}
+		if u == nil {
+			return errors.New("用户不存在")
+		}
+	}
+	// 批量创建（跳过已存在关联）
+	var toCreate []model.AdminUserDept
+	for i, uid := range req.UserIDs {
+		exist, err := s.userDeptRepo.FindByUserIDAndDeptID(ctx, uid, req.DeptID)
+		if err != nil {
+			return err
+		}
+		if exist == nil {
+			isManager := int8(0)
+			if req.IsManager == 1 && i == 0 {
+				isManager = 1
+			}
+			toCreate = append(toCreate, model.AdminUserDept{
+				UserID:    uid,
+				DeptID:    req.DeptID,
+				IsPrimary: req.IsPrimary,
+				IsManager: isManager,
+				Status:    1,
+			})
+		}
+	}
+	return s.userDeptRepo.CreateBatch(ctx, toCreate)
+}
+
+// UpdateDeptUser 更新部门员工（主部门/leader 唯一约束）
+func (s *AdminDeptService) UpdateDeptUser(ctx context.Context, req *dto.UpdateDeptUserRequest) error {
+	userDept, err := s.userDeptRepo.FindByID(ctx, uint(req.ID))
+	if err != nil {
+		return err
+	}
+	if userDept == nil {
+		return errors.New("关联记录不存在")
+	}
+	if req.Status == 0 && userDept.IsManager == 1 {
+		return errors.New("不能禁用部门leader，请先取消leader身份")
+	}
+	if req.IsPrimary == 1 && userDept.IsPrimary == 0 {
+		primary, err := s.userDeptRepo.FindPrimaryByUserID(ctx, userDept.UserID)
+		if err != nil {
+			return err
+		}
+		if primary != nil && primary.ID != req.ID {
+			return errors.New("该用户已有主要部门，一个用户只能有一个主要部门")
+		}
+	}
+	if req.IsManager == 1 && userDept.IsManager == 0 {
+		manager, err := s.userDeptRepo.FindManagerByDeptID(ctx, userDept.DeptID)
+		if err != nil {
+			return err
+		}
+		if manager != nil && manager.ID != req.ID {
+			return errors.New("该部门已有leader，一个部门只能有一个leader")
+		}
+	}
+	return s.userDeptRepo.UpdateByID(ctx, req.ID, map[string]interface{}{
+		"is_primary": req.IsPrimary,
+		"is_manager": req.IsManager,
+		"status":     req.Status,
+	})
+}
+
+// RemoveDeptUser 移除部门员工（物理删除关联）
+func (s *AdminDeptService) RemoveDeptUser(ctx context.Context, req *dto.RemoveDeptUserRequest) error {
+	userDept, err := s.userDeptRepo.FindByID(ctx, uint(req.ID))
+	if err != nil {
+		return err
+	}
+	if userDept == nil {
+		return errors.New("关联记录不存在")
+	}
+	return s.userDeptRepo.Delete(ctx, userDept)
+}
+
+// BatchUpdateDeptUser 批量更新部门员工（先求差集：删不在提交列表的，增不在已存在的）
+func (s *AdminDeptService) BatchUpdateDeptUser(ctx context.Context, req *dto.BatchUpdateDeptUserRequest) error {
+	dept, err := s.deptRepo.FindByDeptID(ctx, req.DeptID)
+	if err != nil {
+		return err
+	}
+	if dept == nil {
+		return errors.New("部门不存在")
+	}
+	existing, err := s.userDeptRepo.FindByDeptID(ctx, req.DeptID)
+	if err != nil {
+		return err
+	}
+	existingMap := make(map[uint64]uint64) // user_id -> 关联ID
+	for _, ud := range existing {
+		existingMap[ud.UserID] = ud.ID
+	}
+	target := make(map[uint64]bool, len(req.UserIDs))
+	for _, uid := range req.UserIDs {
+		target[uid] = true
+	}
+	// 删除：已存在但不在提交列表
+	for uid, relID := range existingMap {
+		if !target[uid] {
+			ud, err := s.userDeptRepo.FindByID(ctx, uint(relID))
+			if err != nil {
+				return err
+			}
+			if ud != nil {
+				if err := s.userDeptRepo.Delete(ctx, ud); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	// 新增：在提交列表但不存在
+	var toCreate []model.AdminUserDept
+	for _, uid := range req.UserIDs {
+		if _, ok := existingMap[uid]; !ok {
+			if u, _ := s.userRepo.FindByUserID(ctx, uid); u == nil {
+				return errors.New("用户不存在")
+			}
+			toCreate = append(toCreate, model.AdminUserDept{
+				UserID:    uid,
+				DeptID:    req.DeptID,
+				IsPrimary: 0,
+				IsManager: 0,
+				Status:    1,
+			})
+		}
+	}
+	return s.userDeptRepo.CreateBatch(ctx, toCreate)
+}

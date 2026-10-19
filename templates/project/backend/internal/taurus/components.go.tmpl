@@ -1,0 +1,627 @@
+package taurus
+
+import (
+	"fmt"
+	"log"
+	"strings"
+	"time"
+
+	"github.com/stones-hub/taurus-pro-common/pkg/cron"
+	"github.com/stones-hub/taurus-pro-common/pkg/logx"
+	"github.com/stones-hub/taurus-pro-config/pkg/config"
+	"github.com/stones-hub/taurus-pro-http/pkg/server"
+	"github.com/stones-hub/taurus-pro-storage/pkg/db"
+	"github.com/stones-hub/taurus-pro-storage/pkg/redisx"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+{{- if .Has.consul }}
+
+	"github.com/stones-hub/taurus-pro-consul/pkg/consul"
+{{- end }}
+{{- if .Has.opentelemetry }}
+
+	"github.com/stones-hub/taurus-pro-opentelemetry/pkg/otelemetry"
+{{- end }}
+{{- if .Has.tcp }}
+
+	tcpserver "github.com/stones-hub/taurus-pro-tcp/pkg/tcp"
+	"github.com/stones-hub/taurus-pro-tcp/pkg/tcp/protocol"
+{{- end }}
+{{- if .Has.grpc }}
+
+	"crypto/tls"
+	"crypto/x509"
+	"os"
+
+	grpcserver "github.com/stones-hub/taurus-pro-grpc/pkg/grpc/server"
+	"google.golang.org/grpc/keepalive"
+{{- end }}
+{{- if .Has.milvus }}
+
+	"math"
+
+	"github.com/stones-hub/taurus-pro-milvus/pkg/milvus"
+	mclient "github.com/stones-hub/taurus-pro-milvus/pkg/milvus/client"
+{{- end }}
+)
+
+// ConfigOptions 配置模块的初始化参数
+type ConfigOptions struct {
+	ConfigPath  string
+	Env         string
+	PrintEnable bool
+}
+
+// Components 框架层组件容器。
+//
+// 字段由 taurus-x 生成时选中的组件决定：未选中的可选组件不会出现在这里，
+// 也不会出现在 go.mod、config/autoload 和 docker-compose.yml 中。
+type Components struct {
+	Config *config.Config
+	DbList map[string]*gorm.DB
+	Redis  *redisx.RedisClient
+	Http   *server.Server
+	Cron   *cron.CronManager
+	Logger *logx.Manager
+{{- if .Has.consul }}
+	Consul *consul.Client
+{{- end }}
+{{- if .Has.opentelemetry }}
+	Otel *otelemetry.OTelProvider
+{{- end }}
+{{- if .Has.tcp }}
+	TCP *tcpserver.Server
+{{- end }}
+{{- if .Has.grpc }}
+	GRPC *grpcserver.Server
+{{- end }}
+{{- if .Has.milvus }}
+	Milvus milvus.Pool
+{{- end }}
+}
+
+// ProvideConfigComponent 注入配置模块
+func ProvideConfigComponent(opts *ConfigOptions) (*config.Config, error) {
+	configComponent := config.New(config.WithPrintEnable(opts.PrintEnable))
+	if err := configComponent.Initialize(opts.ConfigPath, opts.Env); err != nil {
+		return nil, fmt.Errorf("failed to initialize config: %v", err)
+	}
+	return configComponent, nil
+}
+
+// ProvideDbComponent 注入数据库模块
+func ProvideDbComponent(cfg *config.Config) (map[string]*gorm.DB, func(), error) {
+	if !cfg.GetBool("databases.enable") {
+		return nil, func() {}, nil
+	}
+
+	rawList, ok := cfg.Get("databases.list").([]interface{})
+	if !ok {
+		return nil, func() {}, fmt.Errorf("databases.list is missing or malformed")
+	}
+
+	for _, raw := range rawList {
+		dbOpts, ok := raw.(map[string]interface{})
+		if !ok {
+			return nil, func() {}, fmt.Errorf("databases.list item is malformed")
+		}
+
+		level := logger.Info
+		switch asString(dbOpts["log_level"]) {
+		case "info":
+			level = logger.Info
+		case "warn":
+			level = logger.Warn
+		case "error":
+			level = logger.Error
+		case "silent":
+			level = logger.Silent
+		}
+
+		// 按天切分的 GORM 日志：logs/db_{{ .ProjectName }}-YYYY-MM-DD.log
+		gormLogger := NewDailyGormLogger("logs", "db_{{ .ProjectName }}", level)
+
+		if err := db.InitDB(
+			db.WithMaxOpenConns(asInt(dbOpts["max_open_conns"])),
+			db.WithMaxIdleConns(asInt(dbOpts["max_idle_conns"])),
+			db.WithConnMaxLifetime(time.Duration(asInt(dbOpts["conn_max_lifetime"]))*time.Second),
+			db.WithMaxRetries(asInt(dbOpts["max_retries"])),
+			db.WithRetryDelay(asInt(dbOpts["retry_delay"])),
+			db.WithDBName(asString(dbOpts["dbname"])),
+			db.WithDBType(asString(dbOpts["dbtype"])),
+			db.WithDSN(asString(dbOpts["dsn"])),
+			db.WithLogger(gormLogger),
+		); err != nil {
+			return nil, func() {}, err
+		}
+	}
+
+	log.Printf("%s🔗 -> Database all initialized successfully. %s\n", colorGreen, colorReset)
+	return db.DbList(), func() {
+		db.CloseDB()
+		log.Printf("%s🔗 -> Clean up database components successfully. %s\n", colorGreen, colorReset)
+	}, nil
+}
+
+// ProvideRedisComponent 注入 Redis 模块
+func ProvideRedisComponent(cfg *config.Config) (*redisx.RedisClient, func(), error) {
+	if !cfg.GetBool("redis.enable") {
+		return nil, func() {}, nil
+	}
+
+	level := redisx.LogLevelInfo
+	switch cfg.GetString("redis.logger_level") {
+	case "debug":
+		level = redisx.LogLevelDebug
+	case "info":
+		level = redisx.LogLevelInfo
+	case "warn":
+		level = redisx.LogLevelWarn
+	case "error":
+		level = redisx.LogLevelError
+	}
+
+	formatter := redisx.DefaultLogFormatter
+	if cfg.GetString("redis.logger_fomatter") == "json" {
+		formatter = redisx.JSONLogFormatter
+	}
+
+	redisLogger, err := redisx.NewRedisLogger(
+		redisx.WithLogFilePath(cfg.GetString("redis.logger_path")),
+		redisx.WithLogLevel(level),
+		redisx.WithLogFormatter(formatter),
+		redisx.WithLogMaxSize(cfg.GetInt("redis.logger_max_size")),
+		redisx.WithLogMaxBackups(cfg.GetInt("redis.logger_max_backups")),
+		redisx.WithLogMaxAge(cfg.GetInt("redis.logger_max_age")),
+	)
+	if err != nil {
+		return nil, func() {}, err
+	}
+
+	if err := redisx.InitRedis(
+		redisx.WithAddrs(cfg.GetStringSlice("redis.address")...),
+		// 占位符默认值用了一个空格（配置库不允许空默认值），这里统一 TrimSpace
+		redisx.WithPassword(strings.TrimSpace(cfg.GetString("redis.password"))),
+		redisx.WithDB(cfg.GetInt("redis.db")),
+		redisx.WithPoolSize(cfg.GetInt("redis.pool_size")),
+		redisx.WithMinIdleConns(cfg.GetInt("redis.min_idle_conns")),
+		redisx.WithTimeout(
+			time.Duration(cfg.GetInt("redis.dial_timeout"))*time.Second,
+			time.Duration(cfg.GetInt("redis.read_timeout"))*time.Second,
+			time.Duration(cfg.GetInt("redis.write_timeout"))*time.Second),
+		redisx.WithMaxRetries(cfg.GetInt("redis.max_retries")),
+		redisx.WithLogging(redisLogger),
+	); err != nil {
+		return nil, func() {}, err
+	}
+
+	log.Printf("%s🔗 -> Redis all initialized successfully. %s\n", colorGreen, colorReset)
+	return redisx.Redis, func() {
+		redisx.Redis.Close()
+		log.Printf("%s🔗 -> Clean up redis components successfully. %s\n", colorGreen, colorReset)
+	}, nil
+}
+
+// ProvideHttpComponent 注入 HTTP 服务模块
+func ProvideHttpComponent(cfg *config.Config) (*server.Server, error) {
+	httpServer := server.NewServer(
+		server.WithAddr(cfg.GetString("http.address")+":"+cfg.GetString("http.port")),
+		server.WithReadTimeout(time.Duration(cfg.GetInt("http.read_timeout"))*time.Second),
+		server.WithWriteTimeout(time.Duration(cfg.GetInt("http.write_timeout"))*time.Second),
+		server.WithIdleTimeout(time.Duration(cfg.GetInt("http.idle_timeout"))*time.Second),
+		server.WithMaxHeaderBytes(1<<20),
+	)
+
+	log.Printf("%s🔗 -> Http all initialized successfully. %s\n", colorGreen, colorReset)
+	return httpServer, nil
+}
+
+// ProvideCronComponent 注入定时任务模块
+func ProvideCronComponent(cfg *config.Config) (*cron.CronManager, func(), error) {
+	if !cfg.GetBool("cron.enable") {
+		return nil, func() {}, nil
+	}
+
+	location, err := time.LoadLocation(cfg.GetString("cron.location"))
+	if err != nil {
+		location, err = time.LoadLocation("Asia/Shanghai")
+		if err != nil {
+			return nil, func() {}, err
+		}
+	}
+
+	cronOptions := []cron.Option{cron.WithLocation(location)}
+	if cfg.GetBool("cron.enable_seconds") {
+		cronOptions = append(cronOptions, cron.WithSeconds())
+	}
+	cronOptions = append(cronOptions, cron.WithConcurrencyMode(cron.ConcurrencyMode(cfg.GetInt("cron.concurrency_mode"))))
+
+	cm := cron.New(cronOptions...)
+	log.Printf("%s🔗 -> Cron all initialized successfully. %s\n", colorGreen, colorReset)
+
+	return cm, func() {
+		cm.GracefulStop(time.Second * 3)
+		log.Printf("%s🔗 -> Clean up cron components successfully. %s\n", colorGreen, colorReset)
+	}, nil
+}
+
+// ProvideLoggerComponent 注入日志模块
+func ProvideLoggerComponent(cfg *config.Config) (*logx.Manager, func(), error) {
+	rawList, ok := cfg.Get("loggers").([]interface{})
+	if !ok {
+		return nil, func() {}, fmt.Errorf("loggers is missing or malformed")
+	}
+
+	options := make([]logx.LoggerOptions, 0, len(rawList))
+	for _, raw := range rawList {
+		opts, ok := raw.(map[string]interface{})
+		if !ok {
+			return nil, func() {}, fmt.Errorf("loggers item is malformed")
+		}
+		options = append(options, logx.LoggerOptions{
+			Name:       asString(opts["name"]),
+			Prefix:     asString(opts["prefix"]),
+			FilePath:   asString(opts["log_file_path"]),
+			MaxSize:    asInt(opts["max_size"]),
+			MaxBackups: asInt(opts["max_backups"]),
+			MaxAge:     asInt(opts["max_age"]),
+			Compress:   asBool(opts["compress"]),
+			Formatter:  asString(opts["formatter"]),
+			Level:      logx.Level(asInt(opts["log_level"])),
+			Output:     logx.OutputType(asString(opts["output_type"])),
+		})
+	}
+
+	manager, cleanup, err := logx.BuildManager(options...)
+	if err != nil {
+		log.Printf("%s🔗 -> Log all initialized failed. %s\n", colorRed, colorReset)
+	} else {
+		log.Printf("%s🔗 -> Log all initialized successfully. %s\n", colorGreen, colorReset)
+	}
+
+	return manager, func() {
+		cleanup()
+		log.Printf("%s🔗 -> Clean up log components successfully. %s\n", colorGreen, colorReset)
+	}, err
+}
+{{- if .Has.consul }}
+
+// ProvideConsulComponent 注入 Consul 模块：建客户端并注册服务；
+// cleanup 时注销服务再关闭客户端。consul.enable=false 时返回 nil，不影响启动。
+func ProvideConsulComponent(cfg *config.Config) (*consul.Client, func(), error) {
+	if !cfg.GetBool("consul.enable") {
+		return nil, func() {}, nil
+	}
+
+	options := []consul.Option{
+		consul.WithAddress(cfg.GetString("consul.client.address")),
+		consul.WithTimeout(time.Duration(cfg.GetInt("consul.client.timeout")) * time.Second),
+		consul.WithScheme(cfg.GetString("consul.client.scheme")),
+		consul.WithDatacenter(cfg.GetString("consul.client.datacenter")),
+		consul.WithWaitTime(time.Duration(cfg.GetInt("consul.client.wait_time")) * time.Second),
+		consul.WithRetryTime(time.Duration(cfg.GetInt("consul.client.retry_time")) * time.Second),
+		consul.WithMaxRetries(cfg.GetInt("consul.client.max_retrys")),
+	}
+	if token := cfg.GetString("consul.client.token"); token != "" {
+		options = append(options, consul.WithToken(token))
+	}
+	if user, pass := cfg.GetString("consul.client.http_basic_auth.username"), cfg.GetString("consul.client.http_basic_auth.password"); user != "" && pass != "" {
+		options = append(options, consul.WithBasicAuth(user, pass))
+	}
+
+	client, err := consul.NewClient(options...)
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("consul.NewClient: %v", err)
+	}
+
+	meta := make(map[string]string)
+	if rawMeta, ok := cfg.Get("consul.service.meta").(map[string]interface{}); ok {
+		for k, v := range rawMeta {
+			meta[k] = asString(v)
+		}
+	}
+
+	serviceConfig := consul.ServiceConfig{
+		Name:    cfg.GetString("consul.service.name"),
+		ID:      cfg.GetString("consul.service.id"),
+		Tags:    cfg.GetStringSlice("consul.service.tags"),
+		Address: cfg.GetString("consul.service.address"),
+		Port:    cfg.GetInt("consul.service.port"),
+		Meta:    meta,
+		Checks:  make([]*consul.CheckConfig, 0),
+	}
+
+	if healths, ok := cfg.Get("consul.service.healths").([]interface{}); ok {
+		for _, raw := range healths {
+			health, ok := raw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			header := make(map[string][]string)
+			if rawHeader, ok := health["http_headers"].(map[string]interface{}); ok {
+				for k, v := range rawHeader {
+					values, ok := v.([]interface{})
+					if !ok {
+						continue
+					}
+					items := make([]string, 0, len(values))
+					for _, item := range values {
+						items = append(items, asString(item))
+					}
+					header[k] = items
+				}
+			}
+
+			serviceConfig.Checks = append(serviceConfig.Checks, &consul.CheckConfig{
+				HTTP:            asString(health["http"]),
+				Method:          asString(health["http_method"]),
+				Header:          header,
+				TCP:             asString(health["tcp"]),
+				Interval:        time.Duration(asInt(health["interval"])) * time.Second,
+				Timeout:         time.Duration(asInt(health["timeout"])) * time.Second,
+				DeregisterAfter: time.Duration(asInt(health["deregister_after"])) * time.Second,
+				TLSSkipVerify:   asBool(health["tls_skip_verify"]),
+			})
+		}
+	}
+
+	if err := client.RegisterService(&serviceConfig); err != nil {
+		client.Close()
+		return nil, func() {}, fmt.Errorf("consul.RegisterService: %v", err)
+	}
+
+	log.Printf("%s🔗 -> Consul all initialized successfully. %s\n", colorGreen, colorReset)
+	return client, func() {
+		if err := client.DeregisterService(serviceConfig.ID); err != nil {
+			log.Printf("%s🔗 -> Consul deregister service failed: %v. %s\n", colorRed, err, colorReset)
+		}
+		client.Close()
+		log.Printf("%s🔗 -> Clean up consul components successfully. %s\n", colorGreen, colorReset)
+	}, nil
+}
+{{- end }}
+{{- if .Has.opentelemetry }}
+
+// ProvideOtelComponent 注入 OpenTelemetry 模块。
+// cleanup 内部会先 flush 未上报的 span 再关闭 exporter。
+// otel.enable=false 时返回 nil，不影响启动。
+func ProvideOtelComponent(cfg *config.Config) (*otelemetry.OTelProvider, func(), error) {
+	if !cfg.GetBool("otel.enable") {
+		return nil, func() {}, nil
+	}
+
+	timeout, err := time.ParseDuration(cfg.GetString("otel.export.timeout"))
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("otel.export.timeout: %v", err)
+	}
+	batchTimeout, err := time.ParseDuration(cfg.GetString("otel.batch.timeout"))
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("otel.batch.timeout: %v", err)
+	}
+	exportTimeout, err := time.ParseDuration(cfg.GetString("otel.batch.export_timeout"))
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("otel.batch.export_timeout: %v", err)
+	}
+
+	provider, cleanup, err := otelemetry.NewOTelProvider(
+		otelemetry.WithServiceName(cfg.GetString("otel.service.name")),
+		otelemetry.WithServiceVersion(cfg.GetString("otel.service.version")),
+		otelemetry.WithEnvironment(cfg.GetString("otel.service.environment")),
+		otelemetry.WithExportProtocol(otelemetry.ExportProtocol(cfg.GetString("otel.export.protocol"))),
+		otelemetry.WithEndpoint(cfg.GetString("otel.export.endpoint")),
+		otelemetry.WithInsecure(cfg.GetBool("otel.export.insecure")),
+		otelemetry.WithTimeout(timeout),
+		otelemetry.WithSamplingRatio(cfg.GetFloat64("otel.sampling.ratio")),
+		otelemetry.WithBatchTimeout(batchTimeout),
+		otelemetry.WithMaxExportBatchSize(cfg.GetInt("otel.batch.max_size")),
+		otelemetry.WithMaxQueueSize(cfg.GetInt("otel.batch.max_queue_size")),
+		otelemetry.WithExportTimeout(exportTimeout),
+	)
+	if err != nil {
+		return nil, func() {}, err
+	}
+
+	for _, name := range cfg.GetStringSlice("otel.tracers") {
+		otelemetry.RegisterTracer(name, provider.Tracer(name))
+	}
+
+	log.Printf("%s🔗 -> Otel all initialized successfully. %s\n", colorGreen, colorReset)
+	return provider, func() {
+		cleanup()
+		log.Printf("%s🔗 -> Clean up otel components successfully. %s\n", colorGreen, colorReset)
+	}, nil
+}
+{{- end }}
+{{- if .Has.tcp }}
+
+// ProvideTCPComponent 注入 TCP 服务模块。
+//
+// 这里只创建实例、不开始监听：TCP 占用独立端口，由 app/bootstrap.go 与
+// HTTP 一起启动、一起优雅关闭。tcp.enable=false 时返回 nil，bootstrap 会跳过启动。
+func ProvideTCPComponent(cfg *config.Config) (*tcpserver.Server, func(), error) {
+	if !cfg.GetBool("tcp.enable") {
+		return nil, func() {}, nil
+	}
+
+	proto, err := protocol.NewProtocol(protocol.WithType(protocol.ProtocolType(cfg.GetString("tcp.protocol"))))
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("tcp protocol: %v", err)
+	}
+
+	// GetHandler 在注册表里找不到名字时会回退到库自带的 defaultHandler（只打日志），
+	// 不会返回 nil。自定义处理器用 tcpserver.RegisterHandler(name, h) 在 init 里注册，
+	// 名字与 config/autoload/tcp/tcp.yaml 的 tcp.handler 对齐。
+	handler := tcpserver.GetHandler(cfg.GetString("tcp.handler"))
+
+	srv, cleanup, err := tcpserver.NewServer(
+		cfg.GetString("tcp.address"),
+		proto,
+		handler,
+		tcpserver.WithMaxConnections(int32(cfg.GetInt("tcp.max_connections"))),
+		tcpserver.WithConnectionMaxMessageSize(uint32(cfg.GetInt("tcp.max_message_size"))),
+		tcpserver.WithConnectionBufferSize(cfg.GetInt("tcp.buffer_size")),
+		tcpserver.WithConnectionIdleTimeout(time.Duration(cfg.GetInt("tcp.idle_timeout"))*time.Second),
+		tcpserver.WithConnectionRateLimiter(cfg.GetInt("tcp.rate_limiter")),
+	)
+	if err != nil {
+		return nil, func() {}, err
+	}
+
+	log.Printf("%s🔗 -> Tcp all initialized successfully. %s\n", colorGreen, colorReset)
+	return srv, func() {
+		cleanup()
+		log.Printf("%s🔗 -> Clean up tcp components successfully. %s\n", colorGreen, colorReset)
+	}, nil
+}
+{{- end }}
+{{- if .Has.grpc }}
+
+// ProvideGRPCComponent 注入 gRPC 服务模块。
+//
+// 这里只创建实例、不开始监听：gRPC 占用独立端口，由 app/bootstrap.go 与
+// HTTP 一起启动、一起优雅关闭。grpc.enable=false 时返回 nil，bootstrap 会跳过启动。
+func ProvideGRPCComponent(cfg *config.Config) (*grpcserver.Server, func(), error) {
+	if !cfg.GetBool("grpc.enable") {
+		return nil, func() {}, nil
+	}
+
+	options := []grpcserver.ServerOption{
+		grpcserver.WithAddress(cfg.GetString("grpc.address")),
+		grpcserver.WithMaxConns(cfg.GetInt("grpc.max_conns")),
+	}
+
+	if cfg.GetBool("grpc.keepalive.enabled") {
+		options = append(options, grpcserver.WithKeepAlive(&keepalive.ServerParameters{
+			MaxConnectionIdle:     time.Duration(cfg.GetInt("grpc.keepalive.max_connection_idle")) * time.Minute,
+			MaxConnectionAge:      time.Duration(cfg.GetInt("grpc.keepalive.max_connection_age")) * time.Minute,
+			MaxConnectionAgeGrace: time.Duration(cfg.GetInt("grpc.keepalive.max_connection_age_grace")) * time.Second,
+			Time:                  time.Duration(cfg.GetInt("grpc.keepalive.time")) * time.Hour,
+			Timeout:               time.Duration(cfg.GetInt("grpc.keepalive.timeout")) * time.Second,
+		}))
+	}
+
+	if cfg.GetBool("grpc.tls.enabled") {
+		// 双向 TLS：服务端证书 + CA 校验客户端证书
+		cert, err := tls.LoadX509KeyPair(cfg.GetString("grpc.tls.crt"), cfg.GetString("grpc.tls.key"))
+		if err != nil {
+			return nil, func() {}, fmt.Errorf("grpc tls: failed to load key pair: %v", err)
+		}
+
+		caCert, err := os.ReadFile(cfg.GetString("grpc.tls.ca"))
+		if err != nil {
+			return nil, func() {}, fmt.Errorf("grpc tls: failed to read CA certificate: %v", err)
+		}
+
+		certPool := x509.NewCertPool()
+		if !certPool.AppendCertsFromPEM(caCert) {
+			return nil, func() {}, fmt.Errorf("grpc tls: failed to append CA certificate")
+		}
+
+		options = append(options, grpcserver.WithTLS(&tls.Config{
+			Certificates: []tls.Certificate{cert},
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+			ClientCAs:    certPool,
+			MinVersion:   tls.VersionTLS12,
+		}))
+	}
+
+	srv, cleanup, err := grpcserver.NewServer(options...)
+	if err != nil {
+		return nil, func() {}, err
+	}
+
+	log.Printf("%s🔗 -> Grpc all initialized successfully. %s\n", colorGreen, colorReset)
+	return srv, func() {
+		cleanup()
+		log.Printf("%s🔗 -> Clean up grpc components successfully. %s\n", colorGreen, colorReset)
+	}, nil
+}
+{{- end }}
+{{- if .Has.milvus }}
+
+// ProvideMilvusComponent 注入 Milvus 客户端池。
+// milvus.enable=false 或 milvus.list 为空时返回 nil，不影响启动。
+func ProvideMilvusComponent(cfg *config.Config) (milvus.Pool, func(), error) {
+	if !cfg.GetBool("milvus.enable") {
+		return nil, func() {}, nil
+	}
+
+	rawList, ok := cfg.Get("milvus.list").([]interface{})
+	if !ok || len(rawList) == 0 {
+		return nil, func() {}, nil
+	}
+
+	pool := milvus.NewPool()
+	for _, raw := range rawList {
+		item, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		name := asString(item["name"])
+		if name == "" {
+			log.Printf("%s🔗 -> Milvus client name is empty, skipped. %s\n", colorRed, colorReset)
+			continue
+		}
+
+		opts := make([]mclient.Option, 0, 8)
+		if address := asString(item["address"]); address != "" {
+			opts = append(opts, mclient.WithAddress(address))
+		}
+		if apiKey := asString(item["api_key"]); apiKey != "" {
+			opts = append(opts, mclient.WithAPIKey(apiKey))
+		} else if username, password := asString(item["username"]), asString(item["password"]); username != "" || password != "" {
+			opts = append(opts, mclient.WithAuth(username, password))
+		}
+		if dbName := asString(item["db_name"]); dbName != "" {
+			opts = append(opts, mclient.WithDatabase(dbName))
+		}
+		if asBool(item["enable_tls_auth"]) {
+			opts = append(opts, mclient.WithTLS())
+		}
+
+		maxRetry := uint(3)
+		if retry := asInt(item["max_retry"]); retry > 0 {
+			maxRetry = uint(retry)
+		}
+		opts = append(opts, mclient.WithRetry(maxRetry, asDuration(item["max_retry_backoff"], 30*time.Second)))
+
+		maxRecvMsgSize := math.MaxInt32
+		if size := asInt(item["max_recv_msg_size"]); size > 0 {
+			maxRecvMsgSize = size
+		}
+
+		permitWithoutStream := true
+		if v, ok := item["permit_without_stream"].(bool); ok {
+			permitWithoutStream = v
+		}
+
+		opts = append(opts, mclient.WithGrpcOpts(
+			asDuration(item["keepalive_time"], 30*time.Second),
+			asDuration(item["keepalive_timeout"], 10*time.Second),
+			permitWithoutStream,
+			asDuration(item["base_delay"], time.Second),
+			asFloat(item["multiplier"], 1.6),
+			asFloat(item["jitter"], 0.2),
+			asDuration(item["max_delay"], 120*time.Second),
+			asDuration(item["min_connect_timeout"], 20*time.Second),
+			maxRecvMsgSize,
+		))
+
+		if asBool(item["disable_conn"]) {
+			opts = append(opts, mclient.WithDisableConn(true))
+		}
+
+		if err := pool.Add(name, opts...); err != nil {
+			log.Printf("%s🔗 -> Milvus add client %q failed: %v. %s\n", colorRed, name, err, colorReset)
+		}
+	}
+
+	log.Printf("%s🔗 -> Milvus all initialized successfully. %s\n", colorGreen, colorReset)
+	return pool, func() {
+		pool.Close()
+		log.Printf("%s🔗 -> Clean up milvus components successfully. %s\n", colorGreen, colorReset)
+	}, nil
+}
+{{- end }}

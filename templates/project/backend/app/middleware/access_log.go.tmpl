@@ -1,0 +1,86 @@
+package middleware
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/stones-hub/taurus-pro-common/pkg/util/tnet"
+
+	"{{ .Module }}/app/helper"
+	"{{ .Module }}/app/model"
+	"{{ .Module }}/app/repo"
+)
+
+// accessLogRepoOnce 惰性初始化访问日志仓储（taurus.Container 装配后才可用）
+var (
+	accessLogRepoOnce sync.Once
+	accessLogRepo     *repo.AccessLogRepository
+)
+
+// getAccessLogRepo 惰性获取访问日志仓储（首次请求时才初始化，避免包级 var 早于容器装配）
+func getAccessLogRepo() *repo.AccessLogRepository {
+	accessLogRepoOnce.Do(func() {
+		accessLogRepo = repo.NewStore().AccessLog()
+	})
+	return accessLogRepo
+}
+
+// accessLogFile 全局访问日志文件（按天分割，logs/access-YYYY-MM-DD.log）
+var accessLogFile = helper.NewDailyLogFile("logs", "access")
+
+// AccessLogMiddleware 访问日志中间件：记录每个 API 请求（method/path/状态码/IP/耗时/请求体/响应体）
+// 异步写入，不阻塞请求；应在 JWT 之后（以便拿到用户 ID）。
+func AccessLogMiddleware() func(next http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// 跳过日志自身接口 + 前端错误上报，避免「日志记录日志」递归嵌套
+			if shouldSkipLogging(r.URL.Path) {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			start := time.Now()
+
+			// 读取请求体（写方法才有 body，GET 无），读取后恢复供后续 handler 使用
+			var reqBody []byte
+			method := r.Method
+			if method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch {
+				reqBody = readBody(r)
+			}
+
+			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+			next.ServeHTTP(rec, r)
+
+			duration := time.Since(start).Milliseconds()
+			userID, _ := CurrentUserIDFromJWT(r)
+			ip := tnet.GetRemoteIP(r)
+
+			// 异步落库 + 落文件，使用独立 context 避免请求结束后被取消
+			go func() {
+				entry := &model.AccessLog{
+					UserID:       userID,
+					Method:       method,
+					Path:         r.URL.Path,
+					StatusCode:   rec.status,
+					IP:           ip,
+					UserAgent:    r.UserAgent(),
+					DurationMs:   duration,
+					Query:        truncate(r.URL.RawQuery, 500),
+					RequestBody:  truncate(string(reqBody), 4096),
+					ResponseBody: truncate(rec.body(), maxBodyLogSize),
+				}
+				_ = getAccessLogRepo().Create(context.Background(), entry)
+				accessLogFile.Write(formatAccessLine(entry))
+			}()
+		})
+	}
+}
+
+// formatAccessLine 格式化访问日志一行（落文件用）
+func formatAccessLine(e *model.AccessLog) string {
+	return fmt.Sprintf("[access] %s user=%d method=%s path=%s status=%d ip=%s dur=%dms",
+		time.Now().Format("2006-01-02 15:04:05"), e.UserID, e.Method, e.Path, e.StatusCode, e.IP, e.DurationMs)
+}

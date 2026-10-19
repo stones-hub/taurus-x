@@ -1,0 +1,163 @@
+package controller
+
+import (
+	"net/http"
+
+	"github.com/google/wire"
+	"{{ .Module }}/app/dto"
+	"{{ .Module }}/app/middleware"
+	"{{ .Module }}/app/service"
+)
+
+// RoleController 角色管理控制器
+type RoleController struct {
+	RoleService *service.AdminRoleService
+}
+
+// RoleControllerSet wire provider set
+var RoleControllerSet = wire.NewSet(wire.Struct(new(RoleController), "*"))
+
+// ---------- 对外：菜单与按钮权限 ----------
+
+// MenusButtons 获取当前用户菜单树与按钮权限（从 JWT 取 userID）
+func (c *RoleController) MenusButtons(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.CurrentUserIDFromJWT(r)
+	if !ok {
+		Fail(w, http.StatusUnauthorized, "未授权访问")
+		return
+	}
+	resp, err := c.RoleService.GetUserMenusAndButtons(r.Context(), userID)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, resp)
+}
+
+// ---------- 角色 CRUD ----------
+
+// GetRoleList 角色列表
+func (c *RoleController) GetRoleList(w http.ResponseWriter, r *http.Request) {
+	var req dto.RoleListRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	req.Normalize()
+	resp, err := c.RoleService.GetRoleList(r.Context(), req.PageNo, req.PageSize, req.RoleName, req.Status)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, resp)
+}
+
+// AddRole 新增角色
+func (c *RoleController) AddRole(w http.ResponseWriter, r *http.Request) {
+	var req dto.AddRoleRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	if req.RoleName == "" || req.RoleCode == "" {
+		Fail(w, http.StatusBadRequest, "角色名称和编码不能为空")
+		return
+	}
+	if err := c.RoleService.AddRole(r.Context(), &req); err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, map[string]string{"status": "success"})
+}
+
+// UpdateRole 更新角色
+func (c *RoleController) UpdateRole(w http.ResponseWriter, r *http.Request) {
+	var req dto.UpdateRoleRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	if req.RoleID == 0 || req.RoleName == "" {
+		Fail(w, http.StatusBadRequest, "角色ID和名称不能为空")
+		return
+	}
+	if err := c.RoleService.UpdateRole(r.Context(), &req); err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, map[string]string{"status": "success"})
+}
+
+// DeleteRole 删除角色
+func (c *RoleController) DeleteRole(w http.ResponseWriter, r *http.Request) {
+	var req dto.RoleIDRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	if req.RoleID == 0 {
+		Fail(w, http.StatusBadRequest, "角色ID不能为空")
+		return
+	}
+	if err := c.RoleService.DeleteRole(r.Context(), req.RoleID); err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, map[string]string{"status": "success"})
+}
+
+// UpdateRoleStatus 更新角色状态
+func (c *RoleController) UpdateRoleStatus(w http.ResponseWriter, r *http.Request) {
+	var req dto.UpdateRoleStatusRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	if err := c.RoleService.UpdateRoleStatus(r.Context(), req.RoleID, req.Status); err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, map[string]string{"status": "success"})
+}
+
+// GetEditRoleInfo 获取编辑角色信息（含全量权限树与选中状态）
+func (c *RoleController) GetEditRoleInfo(w http.ResponseWriter, r *http.Request) {
+	var req dto.RoleIDRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	if req.RoleID == 0 {
+		Fail(w, http.StatusBadRequest, "角色ID不能为空")
+		return
+	}
+	resp, err := c.RoleService.GetEditRoleInfo(r.Context(), req.RoleID)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, resp)
+}
+
+// ---------- 用户角色 ----------
+
+// GetUserRolesAndPermissions 获取用户角色和权限
+func (c *RoleController) GetUserRolesAndPermissions(w http.ResponseWriter, r *http.Request) {
+	var req dto.UserIDRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	resp, err := c.RoleService.GetUserRolesAndPermissions(r.Context(), req.UserID)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, resp)
+}
+
+// UpdateUserRoles 更新用户角色
+func (c *RoleController) UpdateUserRoles(w http.ResponseWriter, r *http.Request) {
+	var req dto.AssignUserRolesRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	if err := c.RoleService.UpdateUserRoles(r.Context(), req.UserID, req.RoleIDs); err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, map[string]string{"status": "success"})
+}

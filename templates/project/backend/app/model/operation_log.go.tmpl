@@ -1,0 +1,22 @@
+package model
+
+import "time"
+
+// OperationLog 操作日志表（记录写操作：增删改等）
+type OperationLog struct {
+	LogID       uint64    `json:"log_id" gorm:"primaryKey;autoIncrement;column:log_id;comment:日志ID"`
+	UserID      uint64    `json:"user_id" gorm:"index:idx_user_id;not null;default:0;column:user_id;comment:操作用户ID"`
+	Method      string    `json:"method" gorm:"size:10;not null;column:method;comment:HTTP 方法"`
+	Path        string    `json:"path" gorm:"index:idx_path;size:200;not null;column:path;comment:接口路径"`
+	Action      string    `json:"action" gorm:"size:50;not null;default:'';column:action;comment:动作类型（add/update/delete 等）"`
+	Resource    string    `json:"resource" gorm:"size:50;not null;default:'';column:resource;comment:资源模块（user/role/dept 等）"`
+	IP          string    `json:"ip" gorm:"size:45;not null;default:'';column:ip;comment:客户端 IP"`
+	StatusCode  int       `json:"status_code" gorm:"index:idx_status;not null;default:0;column:status_code;comment:响应状态码"`
+	RequestBody string    `json:"request_body" gorm:"type:text;column:request_body;comment:请求体（截断）"`
+	ResponseBody string    `json:"response_body" gorm:"type:longtext;column:response_body;comment:响应体（截断）"`
+	Result      string    `json:"result" gorm:"size:255;not null;default:'';column:result;comment:操作结果（成功/失败）"`
+	ErrorMsg    string    `json:"error_msg" gorm:"size:500;not null;default:'';column:error_msg;comment:错误信息"`
+	CreatedAt   time.Time `json:"created_at" gorm:"index:idx_created;not null;default:CURRENT_TIMESTAMP;column:created_at;comment:操作时间"`
+}
+
+func (OperationLog) TableName() string { return "admin_operation_logs" }

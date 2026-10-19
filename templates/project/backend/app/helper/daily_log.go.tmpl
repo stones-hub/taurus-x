@@ -1,0 +1,71 @@
+package helper
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+)
+
+// DailyLogFile 按天分割的日志文件写入器（deep helper）。
+// 供系统日志（访问/操作/前端错误）在落库之外同步写文件，文件名按天分割，
+// 形如 logs/access-2026-09-28.log。跨天时自动切换到新文件（惰性切换）。
+// 是并发安全的（互斥锁 + 单文件句柄）。
+type DailyLogFile struct {
+	mu      sync.Mutex
+	dir     string
+	base    string // 文件名前缀，如 "access"
+	curDate string // 当前已打开文件的日期（YYYY-MM-DD）
+	file    *os.File
+}
+
+// NewDailyLogFile 创建按天日志写入器（目录 + 文件名前缀）。
+// 例如 NewDailyLogFile("logs", "access") → logs/access-2006-01-02.log
+func NewDailyLogFile(dir, base string) *DailyLogFile {
+	return &DailyLogFile{dir: dir, base: base}
+}
+
+// Write 写入一行（自动加换行），跨天时自动切换文件。失败静默（日志落库是主，文件是旁路）。
+func (d *DailyLogFile) Write(content string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	today := time.Now().Format("2006-01-02")
+	if d.curDate != today {
+		d.switchFile(today)
+	}
+	if d.file != nil {
+		_, _ = d.file.WriteString(content + "\n")
+	}
+}
+
+// Close 关闭底层文件句柄
+func (d *DailyLogFile) Close() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.file != nil {
+		_ = d.file.Close()
+		d.file = nil
+	}
+}
+
+// switchFile 切到指定日期的文件（调用方需持锁）
+func (d *DailyLogFile) switchFile(date string) {
+	// 关闭旧文件
+	if d.file != nil {
+		_ = d.file.Close()
+		d.file = nil
+	}
+	d.curDate = date
+
+	if err := os.MkdirAll(d.dir, 0755); err != nil {
+		return
+	}
+	path := filepath.Join(d.dir, fmt.Sprintf("%s-%s.log", d.base, date))
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return
+	}
+	d.file = f
+}

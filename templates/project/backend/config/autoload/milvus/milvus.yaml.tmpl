@@ -1,0 +1,30 @@
+milvus:
+  # 默认关闭：选了 milvus 组件只代表代码和依赖就绪，
+  # 确认 Milvus 可达后把 MILVUS_ENABLE 设为 true。
+  enable: ${MILVUS_ENABLE:false}
+
+  list:
+    - name: "default"                              # 连接标识，代码里用 taurus.Container.Milvus.Get("default")
+
+      address: "${MILVUS_ADDRESS:127.0.0.1:19530}"
+      username: "${MILVUS_USERNAME:root}"
+      password: "${MILVUS_PASSWORD: }"             # 占位符默认值不能为空串，用一个空格占位
+      db_name: "${MILVUS_DB:default}"
+      enable_tls_auth: false
+      api_key: "${MILVUS_API_KEY: }"               # 配了 api_key 就优先用它，忽略用户名密码
+
+      max_retry: 3
+      max_retry_backoff: "30s"
+
+      # 下面是 gRPC 连接参数，一般不用改
+      keepalive_time: "30s"
+      keepalive_timeout: "10s"
+      permit_without_stream: true
+      base_delay: "1s"
+      multiplier: 1.6
+      jitter: 0.2
+      max_delay: "120s"
+      min_connect_timeout: "20s"
+      max_recv_msg_size: 0                         # 0 表示用默认值
+
+      disable_conn: false

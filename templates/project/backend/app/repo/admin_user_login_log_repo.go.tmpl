@@ -1,0 +1,42 @@
+package repo
+
+import (
+	"context"
+
+	"gorm.io/gorm"
+
+	"{{ .Module }}/app/model"
+)
+
+// AdminUserLoginLogRepository 登录日志数据访问层
+type AdminUserLoginLogRepository struct {
+	*baseRepository[model.AdminUserLoginLog]
+}
+
+func NewAdminUserLoginLogRepositoryWithDB(db *gorm.DB) *AdminUserLoginLogRepository {
+	return &AdminUserLoginLogRepository{baseRepository: newBaseRepository[model.AdminUserLoginLog](db)}
+}
+
+// FindByLogID 根据日志 ID 查找日志
+func (r *AdminUserLoginLogRepository) FindByLogID(ctx context.Context, logID uint64) (*model.AdminUserLoginLog, error) {
+	return r.firstBy(ctx, "log_id = ?", logID)
+}
+
+// UserLoginLog 返回用户登录日志仓储
+func (r repoSet) UserLoginLog() *AdminUserLoginLogRepository {
+	return NewAdminUserLoginLogRepositoryWithDB(r.db)
+}
+
+// AdminUserLoginLogListFilter 登录日志列表筛选条件
+type AdminUserLoginLogListFilter struct {
+	LoginStatus int8
+}
+
+// ListWithFilter 分页查询登录日志（结构化筛选）
+func (r *AdminUserLoginLogRepository) ListWithFilter(ctx context.Context, page, pageSize int, f AdminUserLoginLogListFilter) ([]model.AdminUserLoginLog, int64, error) {
+	q := r.db.WithContext(ctx).Model(&model.AdminUserLoginLog{})
+	if f.LoginStatus >= 0 {
+		q = q.Where("login_status = ?", f.LoginStatus)
+	}
+	return r.page(q, page, pageSize, "log_id DESC")
+}

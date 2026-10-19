@@ -1,0 +1,20 @@
+package model
+
+import (
+	"time"
+)
+
+// AdminRole 角色表
+type AdminRole struct {
+	RoleID      uint64    `json:"role_id" gorm:"primaryKey;autoIncrement;column:role_id;comment:角色ID"`
+	RoleName    string    `json:"role_name" gorm:"size:100;not null;column:role_name;comment:角色名称"`
+	RoleCode    string    `json:"role_code" gorm:"uniqueIndex:uk_role_code;size:50;not null;column:role_code;comment:角色编码"`
+	Description string    `json:"description" gorm:"size:255;not null;default:'';column:description;comment:角色描述"`
+	SortOrder   int       `json:"sort_order" gorm:"not null;default:0;column:sort_order;comment:排序"`
+	Status      int8      `json:"status" gorm:"index:idx_status;not null;default:1;column:status;comment:状态：1启用，0禁用"`
+	IsSystem    int8      `json:"is_system" gorm:"not null;default:0;column:is_system;comment:是否系统角色：1是，0否"`
+	CreatedAt   time.Time `json:"created_at" gorm:"not null;default:CURRENT_TIMESTAMP;column:created_at;comment:创建时间"`
+	UpdatedAt   time.Time `json:"updated_at" gorm:"not null;default:CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;column:updated_at;comment:修改时间"`
+}
+
+func (AdminRole) TableName() string { return "admin_roles" }

@@ -1,0 +1,52 @@
+package helper
+
+// pointer 指针安全取/赋值工具：统一 nil → 零值 / 零值 → nil 的语义，
+// 避免业务代码里到处写 `if p == nil` 与 `&v` 样板。
+
+// Uint64PtrValue 安全获取 *uint64 的值（nil 返回 0）
+func Uint64PtrValue(ptr *uint64) uint64 {
+	if ptr == nil {
+		return 0
+	}
+	return *ptr
+}
+
+// Float64PtrValue 安全获取 *float64 的值（nil 返回 0）
+func Float64PtrValue(ptr *float64) float64 {
+	if ptr == nil {
+		return 0
+	}
+	return *ptr
+}
+
+// StringPtrValue 安全获取 *string 的值（nil 返回 ""）
+func StringPtrValue(ptr *string) string {
+	if ptr == nil {
+		return ""
+	}
+	return *ptr
+}
+
+// Uint64ToPtr uint64 → *uint64（0 转为 nil）
+func Uint64ToPtr(v uint64) *uint64 {
+	if v == 0 {
+		return nil
+	}
+	return &v
+}
+
+// StringToPtr string → *string（空字符串转为 nil）
+func StringToPtr(v string) *string {
+	if v == "" {
+		return nil
+	}
+	return &v
+}
+
+// Float64ToPtr float64 → *float64（0 转为 nil）
+func Float64ToPtr(v float64) *float64 {
+	if v == 0 {
+		return nil
+	}
+	return &v
+}

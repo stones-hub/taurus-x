@@ -1,0 +1,69 @@
+package repo
+
+import (
+	"context"
+
+	"gorm.io/gorm"
+
+	"{{ .Module }}/app/model"
+)
+
+// AdminRoleRepository 角色数据访问层
+type AdminRoleRepository struct {
+	*baseRepository[model.AdminRole]
+}
+
+func NewAdminRoleRepositoryWithDB(db *gorm.DB) *AdminRoleRepository {
+	return &AdminRoleRepository{baseRepository: newBaseRepository[model.AdminRole](db)}
+}
+
+// FindByRoleID 根据角色 ID 查找角色（仅启用）
+func (r *AdminRoleRepository) FindByRoleID(ctx context.Context, roleID uint64) (*model.AdminRole, error) {
+	return r.firstBy(ctx, "role_id = ? and status = 1", roleID)
+}
+
+// Role 返回角色仓储
+func (r repoSet) Role() *AdminRoleRepository { return NewAdminRoleRepositoryWithDB(r.db) }
+
+// UpdateByID 按主键更新指定字段
+func (r *AdminRoleRepository) UpdateByID(ctx context.Context, id uint64, updates interface{}) error {
+	return r.db.WithContext(ctx).Model(&model.AdminRole{}).Where("role_id = ?", id).Updates(updates).Error
+}
+
+// FindByRoleCode 根据角色编码查找角色
+func (r *AdminRoleRepository) FindByRoleCode(ctx context.Context, code string) (*model.AdminRole, error) {
+	return r.firstBy(ctx, "role_code = ?", code)
+}
+
+// FindByRoleName 根据角色名称查找角色
+func (r *AdminRoleRepository) FindByRoleName(ctx context.Context, name string) (*model.AdminRole, error) {
+	return r.firstBy(ctx, "role_name = ?", name)
+}
+
+// FindByRoleIDAnyStatus 根据角色 ID 查找角色（不过滤 status）
+func (r *AdminRoleRepository) FindByRoleIDAnyStatus(ctx context.Context, roleID uint64) (*model.AdminRole, error) {
+	return r.firstBy(ctx, "role_id = ?", roleID)
+}
+
+// ListActive 查询所有启用状态的角色
+func (r *AdminRoleRepository) ListActive(ctx context.Context) ([]model.AdminRole, error) {
+	return r.findBy(ctx, "status = 1")
+}
+
+// AdminRoleListFilter 角色列表筛选条件
+type AdminRoleListFilter struct {
+	RoleName string
+	Status   int
+}
+
+// ListWithFilter 分页查询角色（结构化筛选）
+func (r *AdminRoleRepository) ListWithFilter(ctx context.Context, page, pageSize int, f AdminRoleListFilter) ([]model.AdminRole, int64, error) {
+	q := r.db.WithContext(ctx).Model(&model.AdminRole{})
+	if f.RoleName != "" {
+		q = q.Where("role_name LIKE ?", "%"+f.RoleName+"%")
+	}
+	if f.Status >= 0 {
+		q = q.Where("status = ?", f.Status)
+	}
+	return r.page(q, page, pageSize, "role_id DESC")
+}

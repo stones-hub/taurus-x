@@ -1,0 +1,79 @@
+package middleware
+
+import (
+	"bytes"
+	"io"
+	"net/http"
+	"strings"
+)
+
+// maxBodyLogSize 日志记录请求/响应体的最大字节数（超出截断）
+const maxBodyLogSize = 81920
+
+// statusRecorder 包装 http.ResponseWriter 捕获响应状态码 + 响应体（截断）。
+// 供访问日志/操作日志中间件共用。
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	buf    bytes.Buffer
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	// 记录响应体（限制大小，超出截断）
+	if r.buf.Len() < maxBodyLogSize {
+		remaining := maxBodyLogSize - r.buf.Len()
+		if len(b) > remaining {
+			r.buf.Write(b[:remaining])
+		} else {
+			r.buf.Write(b)
+		}
+	}
+	return r.ResponseWriter.Write(b)
+}
+
+// body 返回截断后的响应体字符串
+func (r *statusRecorder) body() string {
+	return r.buf.String()
+}
+
+// readBody 读取并恢复请求体（限制 1MB），供日志记录使用，恢复后不影响后续 handler 读取。
+// multipart/form-data 请求体为二进制流（含文件上传），读取再重建会破坏 multipart 边界，
+// 导致后续 ParseMultipartForm 报 unexpected EOF，故直接跳过、透传原始 body。
+func readBody(r *http.Request) []byte {
+	if r.Body == nil {
+		return nil
+	}
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+		return nil
+	}
+	limit := int64(1 << 20) // 1MB
+	data, err := io.ReadAll(io.LimitReader(r.Body, limit))
+	if err != nil {
+		r.Body = http.NoBody
+		return nil
+	}
+	r.Body = io.NopCloser(strings.NewReader(string(data)))
+	return data
+}
+
+// truncate 截断字符串到 max 长度（按字节）
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max]
+}
+
+// shouldSkipLogging 判断是否跳过日志记录（日志自身接口 + 前端错误上报），
+// 避免「日志记录日志」的递归嵌套导致 response_body 转义膨胀。
+func shouldSkipLogging(path string) bool {
+	return strings.HasPrefix(path, "/admin/log") || path == "/report-front-error"
+}

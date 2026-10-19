@@ -1,0 +1,61 @@
+package helper
+
+import "strings"
+
+// WhereBuilder 动态查询条件构建器：
+// 累积多个 AND 条件，最后一次性拼接为 GORM 的 condition + args。
+// 用于统一各列表查询里的「条件累积 → 拼接 → 分页」样板代码。
+type WhereBuilder struct {
+	conditions []string
+	args       []interface{}
+}
+
+// NewWhereBuilder 创建条件构建器
+func NewWhereBuilder() *WhereBuilder {
+	return &WhereBuilder{}
+}
+
+// Eq 追加「字段 = 值」条件
+func (b *WhereBuilder) Eq(column string, value interface{}) *WhereBuilder {
+	b.conditions = append(b.conditions, column+" = ?")
+	b.args = append(b.args, value)
+	return b
+}
+
+// Neq 追加「字段 != 值」条件
+func (b *WhereBuilder) Neq(column string, value interface{}) *WhereBuilder {
+	b.conditions = append(b.conditions, column+" != ?")
+	b.args = append(b.args, value)
+	return b
+}
+
+// Like 追加「字段 LIKE %值%」条件（模糊匹配）
+func (b *WhereBuilder) Like(column, value string) *WhereBuilder {
+	if value == "" {
+		return b
+	}
+	b.conditions = append(b.conditions, column+" LIKE ?")
+	b.args = append(b.args, "%"+value+"%")
+	return b
+}
+
+// Raw 追加自定义条件（条件里可带 ? 占位，args 对应）
+func (b *WhereBuilder) Raw(condition string, args ...interface{}) *WhereBuilder {
+	b.conditions = append(b.conditions, condition)
+	b.args = append(b.args, args...)
+	return b
+}
+
+// Empty 是否无任何条件
+func (b *WhereBuilder) Empty() bool {
+	return len(b.conditions) == 0
+}
+
+// Build 拼接为 GORM 查询条件。
+// 返回 (condition, args)：无条件时 condition 为 ""。
+func (b *WhereBuilder) Build() (string, []interface{}) {
+	if len(b.conditions) == 0 {
+		return "", nil
+	}
+	return strings.Join(b.conditions, " AND "), b.args
+}

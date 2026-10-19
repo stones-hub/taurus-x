@@ -1,0 +1,47 @@
+// 权限检查器：实现 middleware.PermissionChecker 接口，做真实 RBAC 接口权限校验。
+package permission
+
+import (
+	"context"
+
+	"{{ .Module }}/app/constants"
+)
+
+// Checker 权限检查器
+type Checker struct {
+	roleService RoleServiceIface
+}
+
+// NewChecker 创建权限检查器
+func NewChecker(roleService RoleServiceIface) *Checker {
+	return &Checker{roleService: roleService}
+}
+
+// CheckAPIPermission 检查用户是否有访问指定接口的权限
+// 超级管理员直接放行；否则遍历用户接口权限（permission_type=3 且 path 匹配且启用）。
+func (c *Checker) CheckAPIPermission(ctx context.Context, userID uint64, apiPath string) (bool, error) {
+	if c.roleService == nil {
+		return false, nil
+	}
+
+	isSuperAdmin, err := c.roleService.IsUserSuperAdmin(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	if isSuperAdmin {
+		return true, nil
+	}
+
+	permissions, err := c.roleService.GetUserAllPermissions(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+
+	for _, perm := range permissions {
+		if perm.PermissionType == constants.PermissionTypeAPI && perm.Path == apiPath && perm.Status == 1 {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}

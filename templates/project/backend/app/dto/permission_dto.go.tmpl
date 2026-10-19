@@ -1,0 +1,132 @@
+package dto
+
+// MenuNode 前端菜单树节点
+type MenuNode struct {
+	Name     string      `json:"name"`
+	Code     string      `json:"code"`
+	Sort     int         `json:"sort"`
+	Mode     []string    `json:"mode"`
+	Icon     string      `json:"icon"`
+	Link     string      `json:"link,omitempty"`
+	Children []*MenuNode `json:"children"`
+}
+
+// UserMenuButtonResponse 用户菜单 + 按钮权限
+type UserMenuButtonResponse struct {
+	Menus   []*MenuNode `json:"menus"`
+	Buttons []string    `json:"buttons"`
+}
+
+// PermissionListResponse 权限列表响应
+type PermissionListResponse struct {
+	PageNo      int                           `json:"page_no"`
+	PageSize    int                           `json:"page_size"`
+	ResultTotal int64                         `json:"result_total"`
+	List        []*PermissionListResponseItem `json:"list"`
+}
+
+// PermissionListResponseItem 权限列表项
+type PermissionListResponseItem struct {
+	PermissionID   uint64 `json:"permission_id"`
+	ParentID       uint64 `json:"parent_id"`
+	PermissionName string `json:"permission_name"`
+	PermissionCode string `json:"permission_code"`
+	PermissionType int8   `json:"permission_type"`
+	Path           string `json:"path"`
+	Icon           string `json:"icon"`
+	SortOrder      int    `json:"sort_order"`
+	Status         int8   `json:"status"`
+	IsSystem       int8   `json:"is_system"`
+	CreatedAt      string `json:"add_time"`
+	UpdatedAt      string `json:"update_time"`
+}
+
+// EditPermissionInfoResponse 编辑权限信息响应（含权限树供选择父权限）
+type EditPermissionInfoResponse struct {
+	PermissionID   uint64                `json:"permission_id"`
+	ParentID       uint64                `json:"parent_id"`
+	PermissionName string                `json:"permission_name"`
+	PermissionCode string                `json:"permission_code"`
+	PermissionType int8                  `json:"permission_type"`
+	Path           string                `json:"path"`
+	Icon           string                `json:"icon"`
+	SortOrder      int                   `json:"sort_order"`
+	Status         int8                  `json:"status"`
+	IsSystem       int8                  `json:"is_system"`
+	CreatedAt      string                `json:"add_time"`
+	UpdatedAt      string                `json:"update_time"`
+	PermissionTree []*PermissionTreeNode `json:"permission_tree"`
+}
+
+// PermissionTreeNode 权限树节点（供选择父权限）
+type PermissionTreeNode struct {
+	PermissionID   uint64                `json:"permission_id"`
+	ParentID       uint64                `json:"parent_id"`
+	PermissionName string                `json:"permission_name"`
+	PermissionCode string                `json:"permission_code"`
+	PermissionType int8                  `json:"permission_type"`
+	Path           string                `json:"path"`
+	Icon           string                `json:"icon"`
+	SortOrder      int                   `json:"sort_order"`
+	Status         int8                  `json:"status"`
+	IsSystem       int8                  `json:"is_system"`
+	Children       []*PermissionTreeNode `json:"children"`
+}
+
+// PermissionListRequest 权限列表查询请求
+type PermissionListRequest struct {
+	PageQuery
+	PermissionName string `json:"permission_name"`
+	Status         int    `json:"status"`
+	PermissionType int    `json:"permission_type"`
+}
+
+// PermissionTreeRequest 权限树查询请求
+type PermissionTreeRequest struct {
+	ParentID       uint64 `json:"parent_id"`
+	PermissionType int8   `json:"permission_type"`
+}
+
+// AddPermissionRequest 新增权限请求
+type AddPermissionRequest struct {
+	ParentID       uint64 `json:"parent_id"`
+	PermissionName string `json:"permission_name"`
+	PermissionCode string `json:"permission_code"`
+	PermissionType int8   `json:"permission_type"`
+	Path           string `json:"path"`
+	Icon           string `json:"icon"`
+	SortOrder      int    `json:"sort_order"`
+	Status         int8   `json:"status"`
+	IsSystem       int8   `json:"is_system"`
+}
+
+// UpdatePermissionRequest 更新权限请求
+type UpdatePermissionRequest struct {
+	PermissionID   uint64 `json:"permission_id"`
+	ParentID       uint64 `json:"parent_id"`
+	PermissionName string `json:"permission_name"`
+	PermissionCode string `json:"permission_code"`
+	PermissionType int8   `json:"permission_type"`
+	Path           string `json:"path"`
+	Icon           string `json:"icon"`
+	SortOrder      int    `json:"sort_order"`
+	Status         int8   `json:"status"`
+	IsSystem       int8   `json:"is_system"`
+}
+
+// PermissionIDRequest 仅权限 ID 的请求（删除/查编辑详情）
+type PermissionIDRequest struct {
+	PermissionID uint64 `json:"permission_id"`
+}
+
+// UpdatePermissionStatusRequest 更新权限状态请求
+type UpdatePermissionStatusRequest struct {
+	PermissionID uint64 `json:"permission_id"`
+	Status       int8   `json:"status"`
+}
+
+// UpdatePermissionIsSystemRequest 更新是否系统权限请求
+type UpdatePermissionIsSystemRequest struct {
+	PermissionID uint64 `json:"permission_id"`
+	IsSystem     int8   `json:"is_system"`
+}

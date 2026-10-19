@@ -1,0 +1,282 @@
+# {{ .ProjectName }} 项目规范
+
+> 本项目的**唯一权威规范**。
+> 本文档汇总了全部逐步定稿的规则，覆盖架构分层、路由与 RBAC、Wire、DTO 命名、下拉选项、前端交互等。
+> 开发新模块前先通读本文档；配套流程文档（两个分栈）：[`docs/后端开发流程.md`](后端开发流程.md)（后端 6 步 + checklist + 新模块开发操作卡）、[`docs/前端开发流程.md`](前端开发流程.md)（前端 4 件套 + 风格整改沉淀）。
+
+## 核心硬约束（一切规则的前提）
+
+1. **建表与权限数据只走 SQL 脚本**：schema 变更、菜单/按钮/接口权限的新增一律落盘到 `scripts/sql/` 留痕，**不开 GORM AutoMigrate**（见第 4 条）。
+2. **前端路由 path 必须与 `admin_permissions.path` 完全一致**：RBAC 按 path 精确匹配接口权限。
+
+---
+
+## 一、架构分层（后端）
+
+### 1. 贫血 Model
+- 实体只含「字段 + `TableName()`」，不 import gorm、不写 `DB()`。
+- gorm 约束用普通 struct tag（如 `gorm:"column:xxx;not null;index:idx_status"`），字段 JSON tag 用 snake_case。
+
+### 2. 自建仓储（baseRepository）
+- 自建 `baseRepository[T TableNamer]`，`TableNamer` 只要求 `TableName()`。
+- `baseRepository` **只保留「零条件原子操作」+ 包内私有查询辅助**：
+  - 公开原子操作：`Create / CreateBatch / Delete / DeleteByID / FindByID / Count / Save`。
+  - 私有辅助（仅 repo 包内领域方法复用，service 不可见）：`firstBy`（单条，未找到返回 `(nil, nil)`）/ `findBy`（多条）/ `page`（分页，底层包级 `paginate`）。
+  - **公开条件方法已全部废除**（`FindByCondition/FindOneByCondition/UpdateByCondition/DeleteByCondition/CountByCondition/FindWithPagination` 均已删除）。
+- 仓储命名 `XxxRepository`（复数），**唯一构造 `NewXxxRepositoryWithDB(db)`**（无参 `NewXxxRepository()` 已废除）。
+- 领域方法语义化：简单单条件查询用 `r.firstBy / r.findBy` 一行；复杂查询（LIKE/IN/联表/动态多条件）手写 GORM 链式；分页列表用 `XxxListFilter` struct + `ListWithFilter`（内部 `r.page`）。**service 层禁止直拼 SQL/条件字符串**。
+- 连接经 `defaultDB()` 取 `taurus.Container.DbList["default"]`（全项目**仅 `NewStore()` 一处**调用），不落地到实体。
+- accessor：各仓储的 `Store.Xxx()` / `Tx.Xxx()` 以 `repoSet` 为载体**单份定义**（`func (r repoSet) Xxx()`），`Store` 与 `Tx` 内嵌 `repoSet`，两作用域完全对称（见第 7 节）。
+
+### 3. 密码
+- SHA-256(`password` + `salt`)，用 `helper/crypto.go`；**不是** bcrypt / MD5。散列与 salt 存 `admin_user_logins`。
+- 这是底座沿用的既有算法。如果本项目没有存量账号要兼容，**建议尽早换成 bcrypt / argon2id**（SHA-256 无计算成本因子，离线爆破成本低）；换的时候只改 `helper/crypto.go` 与 `scripts/sql/init.sql` 里初始管理员的散列。
+
+### 4. 不开 AutoMigrate
+- **不使用 GORM 的 `AutoMigrate`**：建表、加字段、加索引一律手写 SQL 落盘 `scripts/sql/`，让 schema 变更可审查、可回放、可按环境执行。
+- model 只描述表结构供查询使用，不是 schema 的权威来源；表结构的权威来源是 `scripts/sql/`。
+
+### 5. controller 统一响应（BindJSON / OK / Fail）
+- controller 层**禁止裸写 `json.NewDecoder(r.Body).Decode` + `httpx.SendResponse` 样板**，统一走 `app/controller/common.go` 的三个深 helper：
+  - `BindJSON(w, r, &req) bool`：解码 JSON body，失败自动回 `400 请求参数格式错误` 并返回 false（调用方 `if !BindJSON(w, r, &req) { return }`）。
+  - `OK(w, data)`：成功响应（`body.code = 200`）。
+  - `Fail(w, code, message)`：错误响应（`body.code = code`，`data = {"message": message}`；code 沿用 HTTP 状态码语义 400 参数错误 / 401 未授权 / 404 不存在 / 500 业务错误）。
+- **响应契约完全不变**：`{code, message, data}`，错误时 `data={"message":"..."}`；前端 `http.ts` 按 `body.code` 是否在 2xx 判成功、`extractError` 优先读 `data.message`。
+- **合法保留例外**（不套用 BindJSON/OK/Fail）：
+  - `Content-Type` 分叉（JSON vs multipart/form）的分支里，JSON 分支可保留 `json.NewDecoder`（如 auth 登录/注册）。
+  - `_ = json.NewDecoder(...)`（忽略解码错误、空 body 不报错）保留。
+  - multipart 的 `parseXxxForm` 解析 helper 保留。
+  - 非 200 成功码（如 `201 Created`）保留 `httpx.SendResponse`（`OK` 固定 200）。
+
+### 6. service 查询三板斧（PageQuery / ListFilter / GenerateCode）
+- **分页归一化用 `dto.PageQuery.Normalize()`**（`app/dto/page.go`）：分页请求 DTO 匿名嵌入 `PageQuery`（`PageNo/PageSize` 字段提升 + JSON 平铺不变），列表方法开头调 `req.Normalize()`；**禁止手写 `if page <= 0 { page = 1 }` 样板**。特殊页大小用 `NormalizePageSize(n)`（如权限列表 50）。
+- **列表查询走 repo 的 `XxxListFilter` + `ListWithFilter`**（filter struct 与分页方法定义在 `app/repo/<实体>_repo.go`）：service 只把 dto 筛选字段映射到 filter struct，再调 `xxxRepo.ListWithFilter(ctx, page, pageSize, filter)`。**禁止在 service 里用 WhereBuilder 拼条件字符串、禁止 `wb.Raw(...)` 手写 SQL 片段**（条件构建全部下沉 repo）；子查询 / NOT EXISTS / IN / OR / 多字段 LIKE 等复杂条件语义化命名后下沉为 repo 领域方法。分页实现统一走 `baseRepository.page`（内部 `paginate`），**禁止手写 `Count + Offset + Limit` 样板**。
+- **编号生成用 `helper.GenerateCode(ctx, prefix, existsFunc)`**（`app/helper/code.go`）：收敛「前缀 + 秒级时间戳 + 查重 + 毫秒兜底」；有特殊编号逻辑（额外重试、调用方传入 code 校验）的模块保留自身实现，勿强行统一（避免行为风险）。编号真正唯一性靠**数据库唯一索引**，本函数只是「尽量唯一」。
+
+### 7. 事务边界（收敛到 Store.RunInTx，禁止 service 碰 *gorm.DB）
+- **事务的唯一 seam 是 `store.RunInTx(ctx, func(tx *repo.Tx) error)`**（`app/repo/store.go`，是 `Store` 的方法；`tx.go` 已并入 `store.go`）：返回 error 回滚，nil 提交。
+- **service 层禁止 import `gorm.io/gorm`**，禁止 `xxxRepo.GetDB()` / `NewXxxRepositoryWithDB(tx)` 直接拿 `*gorm.DB` 开事务或裸查。
+- `Store` 与 `Tx` 都内嵌 `repoSet`，accessor 单份定义、**两作用域完全对称**：连接池作用域 `store.User()`、事务作用域 `tx.User()` 返回同型仓储；`RunInTx` 回调内**任意仓储都可用 `tx.Xxx()` 获取**（`*gorm.DB` 是私有字段，永不出 repo 包）。
+- 跨表的裸 SQL（`tx.Exec` / `tx.Table().Pluck` 等）**下沉为仓储专用方法**（如 `AdminUserRepository.UpdateStatus/UpdateStatusIf`），不要写在 service 里。
+- repo 内部（同包）做复合/联表查询需要 gorm 时，直接访问同包私有字段 `.db`（`baseRepository` 已**不提供** `GetDB()` 公开方法）。
+
+### 8. 常量值 → 名称映射（统一收敛到 constants 包）
+- **「枚举/常量值 → 中文名称」的映射函数一律收敛到 `app/constants` 包，命名统一为 `GetXxxName`**（导出、`Get` 前缀、入参枚举值、返回 `string`，default 返回空字符串 `""`，前端 `|| '-'` 兜底）。
+- **禁止在 service 包内散落 `xxxName`（小写）私有函数**重复实现 switch 映射（如 `xxxLevelName` / `xxxTypeName` / `xxxStatusName`，一律挪到 `constants` 包并改名 `GetXxxName`）。
+- service 里的 DTO 构建直接调用 `constants.GetXxxName(...)`，不再定义同名私有函数。
+- 通用「启用/禁用」用 `GetStatusName`，「是/否」用 `GetYesNoName`。
+- **数据驱动（勿手写 switch 骨架）**：每个枚举的「值 → 中文名」集中在唯一一个 `xxxNames map[K]string`（单一数据源，紧邻 const 块），`GetXxxName` 函数体写 `return lookup(xxxNames, v, def)` 一行委托（`lookup[T comparable]` 是包内泛型 helper）。特殊 default 用 `lookup` 的 `def` 参数表达（如某个支付状态缺省「未支付」）；二元 是/否、启用/禁用保留简单 if。**禁止再手写 `switch { case ...: return ... }` 复制粘贴骨架**。
+
+### 9. 外键 → 显示名富集（收敛到单一 Resolver，禁止 service 互相注入）
+- **「外键 ID → 展示名」的只读富集要收敛到一个专用的只读服务**（约定放 `app/service/name_resolver.go`，类型名 `NameResolver`）。底座自身没有需要跨域富集的外键，所以这个文件默认不存在；业务域一旦出现第二个「要展示别的表的名字」的场景，就新建它，而不是让 service 之间互相调。
+- **禁止 controller / service 为复用一个 `GetXxxName` 而互相注入对方 Service**：`AService` 注入 `BService` 只为拿一个名字，会很快织成依赖网并产生循环依赖。
+- Resolver 只依赖 repo 只读查询，不依赖任何 Service，因此可被任意 controller / service 安全复用。
+- **用户显示名唯一语义**（底座已有用户表，先把规则定死）：
+  - 取 `Realname`，空则 `Username`，再空则 `用户{id}`；`id == 0` 返回 `""`。用于**一切用户外键**（创建人 / 负责人 / 申请人 ...），**统一只用 `Realname`，不要拼接「姓名（账号）」**。
+  - **禁止用 `Nickname` 做列表富集**（`Nickname` 仅出现在用户资料编辑 / 用户管理页）。
+- 语义对齐原则：富集实现位置可改，但同一个外键在所有页面的**取值语义必须一致**。
+
+---
+
+## 二、路由与 RBAC
+
+### 10. 路由 path 对齐 + 中间件链
+- 业务接口 path 必须与 `admin_permissions.path` 完全一致（`CheckAPIPermission` 按 path 精确匹配 `permission_type=3`，`super_admin` 放行）。
+- 标准链：`Recovery → JWT → PasswordChangeValidator → Permission → CSRF`。
+- 两条链（定义于 `app/routes/routes.go`）：
+  - `userBaseChain`：**不含** Permission —— 用于「自己改自己」与下拉选项。
+  - `userProtectedChain`：**含** Permission —— 用于业务 list / CRUD。
+- `set-password`（无需旧密码）与 `change-password`（需旧密码）是**两个独立接口**。
+
+### 11. 响应判定（前端）
+- 前端判成功看 `body.code` 是否在 2xx 区间，**不看 HTTP 状态码**（`httpx.SendResponse` 对 400/401/403/404/500 都返回 HTTP 200 + body.code）。
+- `extractError` 需兼容 `string` 与 `object.message` 两种错误形态。
+
+### 12. CSRF
+- 双提交 cookie：`x-csrf-token`；非 GET 请求回传 header。
+
+---
+
+## 三、Wire 与构建
+
+### 13. Wiring
+- 新增 controller / service 都定义 `var XxxSet = wire.NewSet(...)`（变量名以 `Set` 结尾，auto-scanner 才会扫到）；`*repo.Store` 由 `repo.StoreSet = wire.NewSet(NewStore)`（`app/repo/store.go`）提供。改完执行 `make wire` 重新生成（否则 `app.Core.XxxController` undefined）。
+- **service 构造函数统一注入 `store *repo.Store`**（`NewXxxService(store *repo.Store)`），仓储经 `store.Xxx()` accessor 获取；**禁止无参自装配 + `repo.NewXxxRepository()` 直接构造**（无参构造已废除）。
+- 构建：
+  ```bash
+  cd backend && make wire && go build ./...
+  cd frontend && pnpm build
+  ```
+
+### 14. 前端路由对齐 + 菜单链接
+- 前端路由 path 用 `page/xxx.html` 形式（如 `page/profile/profile.html`、`set-password.html`、`page/account/permission.html`）。
+- 菜单 link 无前导 `/`，由 `normalizeLink` 补 `/`。
+- 表格内 switch 修改成功后调用 `loadTableData()` 刷新。
+
+---
+
+## 四、DTO 与命名规范
+
+### 15. DTO 分层
+- 请求 / 响应结构体**一律放 `backend/app/dto`**，controller 不定义业务结构体（禁止把 `XxxRequest` 塞进 controller）。
+- 文件命名 `xxx_dto.go`。
+
+### 16. DTO 命名
+- `XxxRequest` / `XxxResponse` / `XxxResponseItem`，**禁 `Req/Resp` 缩写、禁匿名 struct、禁 `[]interface{}`**（用 `[]uint64` 等明确类型）。
+- JSON tag 一律 snake_case。
+
+### 17. 前端类型对齐
+- 前端 `src/types/` 按域拆文件，与后端 `app/dto` 一一对应，类型名严格同名。
+- `index.ts` 只 re-export + 通用 `ApiResponse`。
+
+### 18. 枚举 / 常量
+- 枚举与哨兵值用常量（如 `PermissionType`、`QUERY_ALL = -1`）。
+- 列表「不过滤」= `-1`，删除筛选项默认传 `-1`。
+
+### 19. 命名按语义
+- 按本项目的语义命名，不引入无意义的保留词（命名清晰、表意准确）。
+
+---
+
+## 五、下拉选项专项
+
+### 20. 下拉选项一律走 `/admin/option/*`
+- 下拉选项数据源**一律走 `/admin/option/*` 路由**（挂在 `userBaseChain`，无 Permission 接口校验）。
+- **禁止用业务 list 接口**（`userProtectedChain`，含 Permission 校验）当下拉数据源——会因无接口权限拿不到数据。
+- 前端统一 `src/api/option.ts` + `src/composables/useOptions.ts`（`fetcher: () => Promise<{list}>`、`pickValue` / `pickLabel`）。
+
+### 21. 除下拉选项外，不走 `/admin/option`
+- 业务 list / CRUD 走**各自前缀**（`userProtectedChain`），不要挂到 `/admin/option` 下（这会绕过权限校验）。
+- 例：部门列表走 `/admin/dept/list`（带 `userProtectedChain` 接口权限校验），而部门下拉走 `/admin/option/depts`（只登录校验）。
+
+---
+
+## 六、前端交互统一约定
+
+### 22. 公共样式
+- 统一到 `src/styles/index.css`，页面不重复定义 scoped 样式：
+  - 列表页：`.list-page` / `.toolbar` / `.table-pagination`
+  - 编辑页：`.page-title` / `.form-actions` / `.tip`
+  - 勾选容器：`.perm-tree-box`（树 / 多选，边框 + 滚动 + max-height 560px）
+  - 空数据：`.empty-tip`
+
+### 23. 详情链接位置
+- 列表页「详情查看」入口统一放**「编号」列**（如单据编号）；无编号的（如部门、用户）放名称/姓名列。
+- **点击编号列打开详情抽屉（`el-drawer`），不从列表页跳独立详情页**（权威，所有列表页必遵守）。
+
+### 24. 表单统一栅格布局（编辑页 / 操作页通用）
+
+> 一切「表单页面」（新增 / 编辑，以及各种单步操作页）**统一**用 `el-form label-width="120px"` + `el-row :gutter="20"` + `el-col`，**禁止**纯 `el-form-item` 纵向堆叠，也**禁止** `style="max-width"` 限制宽度。
+
+- 字段按内容宽窄选 `el-col` span：
+  - `span="8"`：密集表单（字段多、内容短，如用户、部门），3 列
+  - `span="12"`：适中表单（字段少，如角色），2 列
+  - `span="24"`：整行（textarea 备注/长文本、单选框组）
+- 长文本/备注/附件字段用 `span="24"` 整行；短字段并列用 `span="12"` 或 `span="8"`。
+- 不要用纯 `el-form-item` 纵向堆叠 + `max-width` 限制宽度，一律走栅格。
+
+### 25. 表单页头部返回按钮 + 提交区按钮统一（编辑页/操作页通用）
+
+> 所有「表单页面」（新增/编辑/操作页）的头部与底部提交区统一，减少开发时的决策。
+
+**（一）返回按钮**：`page-title` 前一律加返回按钮，结构如下（`.edit-head` 已在 `src/styles/index.css` 全局定义，页面不用再写 scoped）：
+
+```vue
+<template #header>
+  <div class="edit-head">
+    <el-button link type="primary" :icon="ArrowLeft" @click="goBack">返回</el-button>
+    <span class="page-title">编辑用户 / 新增用户</span>
+  </div>
+</template>
+```
+
+- 返回按钮 `link type="primary" :icon="ArrowLeft"`，文字「返回」，点击调 `goBack()`（返回上一来源页）。
+- 需要 `import { ArrowLeft } from '@element-plus/icons-vue'`。
+
+**（二）提交区按钮顺序**：`提交` 在左、`取消` 在右（**取消紧邻提交右边**）：
+```vue
+<div class="form-actions">
+  <el-button type="primary" :loading="xxx" @click="onSubmit">提交</el-button>
+  <el-button @click="goBack">取消</el-button>
+</div>
+```
+
+**（三）提交按钮文字**：一律叫「**提交**」（`type="primary"`）。**结论型操作由表单字段表达（如审批页的「审批结论」radio 通过/不通过），按钮不重复双动作**——不要同时出现「通过/不通过」双按钮和结论字段。**仅当没有对应表单字段**的明确多动作才保留双按钮，顺序：主动作在左、次动作在右。
+
+### 26. 级联 / 下拉复用
+- 下拉统一用 `useOptions` 组合式（`src/composables/useOptions.ts`）；多级级联按同样思路另写一个 `useXxxCascade`，不要在页面里散落 `watch` + 手工清空。
+- 级联联动统一用 `watch` 驱动（**禁止 `@change` 手动回调**），且**必须加 `{ flush: 'sync' }`**（否则编辑回显时回调排队到函数体结束才执行，会把刚回显的子级 ID 清空）。
+- **例外**：表格内**逐行独立绑定**的级联（每行是独立状态、且是纯新增绑定无编辑回显），可用 `@change` 显式触发——此类不属「编辑回显」场景，`@change` 不会造成回显清空，反而避免为动态行批量建 watcher。**判断依据**：页面无 `isEdit`/`loadEdit` 回显逻辑时，表格逐行级联可用 `@change`；有回显的表单级联必须用 `watch` + `flush:'sync'`。
+- 动态下拉 v-model 初始值统一 `null as number | null`（严禁 `0`，避免 el-select 显示 0/placeholder 失效）；提交时 `xxx_id ?? 0`，回显 `|| null`。
+- 多级级联（四级）布局统一 `el-col :span="6"`（4 个占满一行），不要 `span="8"`。
+- 「添加行/卡片」按钮位置：表格型放表格上方左对齐（`size="small"` + `primary` plain），卡片/列表型放底部左对齐（`dashed`）；空状态显示通栏虚线提示框。
+- 关联筛选项（外键/关联字段）一律做成下拉，走 `/admin/option/*`，**严禁手填 ID**。
+- **列表页筛选栏 / 工具栏统一风格**（以用户管理列表页为基准，所有列表页照此执行，**查询/重置/刷新三按钮 + 筛选栏包裹为每个列表页必备结构**）：
+  - 筛选栏用 `<div class="filter-bar">` 包裹 inline 筛选表单（`.filter-bar` / `.toolbar` 已在 `src/styles/index.css` 全局定义，页面**不再重复写 scoped 样式**）。
+  - **查询按钮**：`type="primary"` + `:icon="Search"`（文字「查询」保留），紧跟其后放**重置按钮**。
+  - **重置按钮**（必备）：普通样式（无 icon、不做 primary），文字「重置」，`@click="reset"`；对应页面须实现把所有筛选字段（含级联子表单 `cascadeForm`）重置为 form 初始值再查一次，分页字段不回退（`reset` 由 `useListPage` 组合式提供，见下「列表页骨架」条；若 `cascadeForm` 独立于 form，页面加薄 wrapper `resetFilters()` 覆盖级联字段）。
+  - 工具栏主操作按钮（新增/添加）：`type="primary"` + `:icon="Plus"`，与筛选栏按钮同尺寸（不额外指定 `size`）。
+  - **刷新按钮**（必备）：普通样式 + `:icon="Refresh"`，`@click="loadTableData"`，放在工具栏为主操作按钮之后。
+  - 图标从 `@element-plus/icons-vue` 导入（`Search` / `Refresh` / `Plus`），按实际使用导入，不导入未用到的。
+  - **刷新按钮权限复用查询权限**：刷新按钮的 `v-permission` 用**各自模块的 `.query` 权限码**（`PERM.refresh` 键值 = query 权限码），**不要再为刷新单独建按钮权限**。
+- **列表页骨架统一走 `useListPage` 组合式**（`src/composables/useListPage.ts`，权威，所有列表页必遵守）：
+  - 分页状态（`page_no/page_size/result_total`）、`loading`/`list`、`loadTableData`/`search`/`reset`/`handlePageChange`/`handleSizeChange`、详情抽屉状态（`detail`/`detailVisible`/`detailLoading`/`openDetail`）**一律由组合式返回，禁止逐页手写**。
+  - 泛型 `<RowType, FilterType, ParamsType=Omit<XxxListRequest,'page_no'|'page_size'>>`；`buildParams(form)` 集中做筛选字段 → 后端参数的映射（**分页哨兵语义在此收敛**，见第 29 条）；`initForm({...})` 记录筛选初始值供 `reset()` 还原。
+  - 模板分页绑 `pagination.page_no/page_size/result_total`（**不是** `form.xxx`）；筛选 `v-model` 绑 `form.xxx`；查询/重置 `@click="search"/"reset"`。
+  - 有详情抽屉才传 `fetchDetail + pickId`；纯 CRUD 列表不传；详情接口返回复合结构（如 `{info, details}`）或需额外二次加载的页面，只迁列表骨架、详情抽屉保留手写。
+  - **例外不强制套用**：情境型列表（多 scope + 多动作 + 双抽屉）和单步操作页。
+
+### 27. 列表操作按钮按状态展示（can_xxx 门控）
+- 所有模块列表页的操作按钮（编辑/删除/审批/完成/付款等）一律按「状态」决定是否展示：**不可用时用 `v-if` 隐藏、完全不展示**，**禁止 `disabled` 置灰**。
+- 标准做法：后端响应暴露 `can_xxx` 布尔标志（如 `can_edit` / `can_delete` / `can_approve`），前端 `v-if="row.can_xxx"` + `v-permission="PERM.xxx"` 双重控制。
+- **后端负责状态判定**：有状态机 / 业务门控的操作，service 在响应里算好 `can_xxx`（如库存 `can_edit = 已分配量 == 0`），前端只读标志，不内联判定逻辑。
+- 软删类资源（无状态门控、任何状态可编辑/删除）不适用本条，无需加门控。
+
+### 28. 前端命名约定（已全量统一，新代码遵守）
+
+> 曾存在命名习惯差异（`data` vs `row`、`addTableData` vs `goAdd`、`viewDetail` vs `openDetail`、`onCancel` vs `goBack`），**已全量统一**，现存代码与新增代码均按下述约定。
+
+- **表格行参数**统一 `row`（**不用 `data`**）：`function openDetail(row: XxxResponse)`、`@click="openDetail(row)"`。
+- **增删改查跳转方法命名**统一 `goXxx` / `openXxx`（**不用 `addTableData`/`delTableData`/`editTableData`**）：
+  - 跳独立页：`goAdd` / `goEdit(row)` / `goDelete(row)`（无页面的删除用 `delXxx(row)`）
+  - 弹抽屉/弹窗：`openDetail(row)` / `openVerify(row)` / `openAccept(row)`
+  - 提交表单：`onSubmit` / `onSave`（详见第 25 条（三））
+- **返回来源页方法**统一 `goBack`（**不用 `onCancel` 命名返回**；`onCancel` 仅用于弹窗/表单的「取消」动作）。
+- **列表数据加载**统一 `loadTableData`；刷新按钮复用 `loadTableData`；查询 `search`、重置 `reset`（`useListPage` 返回名，见第 26 条「列表页骨架」；未用 useListPage 的旧列表页保留 `searchData`/`resetFilters`）。
+- **状态 → el-tag 映射**统一收敛到各域 `types/*.ts` 的 `xxxStatusTagType`（如 `{ 1: 'success', 0: 'danger' }`），页面不内联三元、不重复定义。
+
+### 29. 列表筛选「不过滤」哨兵语义（status 用 -1、枚举类型用 0）
+
+> 前端筛选字段「未选择 = 不过滤」的哨兵值取决于**后端判断模式**，不可盲目统一：
+
+- **「启用/禁用」status 字段**（取值 0/1，后端 `if status >= 0` 判断）：**必须传 `QUERY_ALL(-1)`**——因为 `0` 是「禁用」这个真实状态值，传 0 会被当作「筛选禁用」而非「不过滤」。例如 `status: form.status ?? QUERY_ALL`。
+- **枚举状态/类型字段**（取值从 1 开始，后端 `if xxx > 0` 判断）：**传 `0` 即可表示不过滤**（0 不是任何真实枚举值）。例如 `user_source: form.user_source ?? 0`。也可统一用 `QUERY_ALL`，但 `0` 更直观。
+- **关联外键字段**（`dept_id` / `role_id` 等）：**传 `0`**（0 不是有效 id）表示「未选关联 = 不过滤」。
+- 判断依据：先查后端 list 接口该字段的过滤条件是 `>= 0`（则用 -1）还是 `> 0`（则用 0）。**禁止不看后端就统一哨兵值**（曾差点把 status 的 -1 误改成 0，导致「禁用」筛选失效）。
+
+---
+
+## 七、菜单 / 权限 SQL 规则
+
+### 30. 新建菜单
+- 新功能若无现成菜单，需新建菜单结构：父菜单（如「系统设置」`system.settings`）+ 叶子菜单（`page/system/xxx.html`）+ 按钮 + API。
+
+### 31. permission_id 分配
+- **permission_id 分配前必须核对现有最大值**（增量脚本显式写 ID 时避免主键冲突）。
+
+### 32. API 权限
+- API 权限：`super_admin` 放行；非 super_admin 角色需对业务接口（`userProtectedChain`）配 `permission_type=3` 的 API 权限；`/admin/option/*`（`userBaseChain`，无 Permission 中间件）**无需** API 权限。
+
+### 33. 权限 SQL 增量补丁
+- 已执行过的 SQL 若需修正 path，用 `UPDATE ... WHERE path = '旧值'` 增量补丁，不重新 INSERT 造成主键冲突。
+
+---
+
+## 八、新模块标准流程（速览）
+
+完整步骤见 [`docs/后端开发流程.md`](后端开发流程.md) 与 [`docs/前端开发流程.md`](前端开发流程.md)：
+
+后端 6 步：1. 建贫血 model → 2. 建 repo（baseRepository）→ 3. 建 dto → 4. 建 service（`NewXxxService(store)` 注入 Store）→ 5. 建 controller → 6. 注册路由 + `make wire` + 构建。
+前端 4 步：1. 建 types → 2. 建 api → 3. 建 router → 4. 建 views。
+
+新建下拉选项接口挂 `/admin/option/*`（`userBaseChain`），业务 CRUD/list 挂各自前缀（`userProtectedChain`）。

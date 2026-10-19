@@ -1,0 +1,16 @@
+package model
+
+import (
+	"time"
+)
+
+// AdminRolePermissions 角色权限关联表
+type AdminRolePermissions struct {
+	ID           uint64    `json:"id" gorm:"primaryKey;autoIncrement;column:id;comment:自增ID"`
+	RoleID       uint64    `json:"role_id" gorm:"uniqueIndex:uk_role_permission;index:idx_role_id;not null;column:role_id;comment:角色ID"`
+	PermissionID uint64    `json:"permission_id" gorm:"uniqueIndex:uk_role_permission;index:idx_permission_id;not null;column:permission_id;comment:权限ID"`
+	CreatedAt    time.Time `json:"created_at" gorm:"not null;default:CURRENT_TIMESTAMP;column:created_at;comment:创建时间"`
+	UpdatedAt    time.Time `json:"updated_at" gorm:"not null;default:CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;column:updated_at;comment:修改时间"`
+}
+
+func (AdminRolePermissions) TableName() string { return "admin_role_permissions" }

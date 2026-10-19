@@ -1,0 +1,55 @@
+package constants
+
+// ==================== 通用枚举查询（数据驱动） ====================
+// 「常量值 → 名称」统一用 map 数据 + lookup 查询，不要手写 switch 骨架。
+// 每个枚举的「值 → 中文名」集中在唯一一个 xxxNames map 里（单一数据源），
+// GetXxxName 函数退化为一行 lookup 委托，消除 switch 的浅重复（详见 docs/项目规范.md）。
+//
+// 本文件只放底座自身的枚举（用户 / 登录方式 / 权限类型）。新增业务域时按域
+// 另建文件（同属 package constants，import 路径不变），例如：
+//
+//	// order_constants.go
+//	var orderStatusNames = map[int8]string{1: "待开始", 2: "执行中", 3: "已完成"}
+//
+//	// GetOrderStatusName 订单状态中文名
+//	func GetOrderStatusName(v int8) string { return lookup(orderStatusNames, v, "未知") }
+
+// lookup 从枚举表查名称，未命中返回 def
+func lookup[T comparable](m map[T]string, key T, def string) string {
+	if name, ok := m[key]; ok {
+		return name
+	}
+	return def
+}
+
+// 用户 / 登录方式 / 来源状态
+const (
+	UserStatusEnabled         int8 = 1 // 用户状态：启用
+	UserStatusDisabled        int8 = 0 // 用户状态：禁用
+	LoginMethodStatusEnabled  int8 = 1 // 登录方式状态：启用
+	LoginMethodStatusDisabled int8 = 0 // 登录方式状态：禁用
+	UserSourceSelfRegistered  int8 = 1 // 用户来源：自主注册
+	UserSourceThirdParty      int8 = 2 // 用户来源：第三方登录
+	UserSourceAdminCreated    int8 = 3 // 用户来源：管理员创建
+)
+
+// LoginType 登录类型
+type LoginType string
+
+const (
+	LoginTypeMobile     LoginType = "mobile"      // 手机号验证码登录
+	LoginTypeUsername   LoginType = "username"    // 用户名密码登录
+	LoginTypeWechatWork LoginType = "wechat_work" // 企业微信登录
+	LoginTypeDingTalk   LoginType = "dingtalk"    // 钉钉登录
+	LoginTypeFeishu     LoginType = "feishu"      // 飞书登录
+)
+
+// 超级管理员角色编码
+const SuperAdminRoleCode = "super_admin"
+
+// 权限类型
+const (
+	PermissionTypeMenu   int8 = 1 // 菜单
+	PermissionTypeButton int8 = 2 // 按钮
+	PermissionTypeAPI    int8 = 3 // 接口
+)

@@ -1,0 +1,56 @@
+package repo
+
+import (
+	"context"
+
+	"gorm.io/gorm"
+
+	"{{ .Module }}/app/model"
+)
+
+// AccessLogRepository 访问日志数据访问层
+type AccessLogRepository struct {
+	*baseRepository[model.AccessLog]
+}
+
+func NewAccessLogRepositoryWithDB(db *gorm.DB) *AccessLogRepository {
+	return &AccessLogRepository{baseRepository: newBaseRepository[model.AccessLog](db)}
+}
+
+// FindByID 根据日志 ID 查找
+func (r *AccessLogRepository) FindByID(ctx context.Context, id uint64) (*model.AccessLog, error) {
+	return r.firstBy(ctx, "log_id = ?", id)
+}
+
+// AccessLog 返回访问日志仓储
+func (r repoSet) AccessLog() *AccessLogRepository { return NewAccessLogRepositoryWithDB(r.db) }
+
+// AccessLogListFilter 访问日志列表筛选条件
+type AccessLogListFilter struct {
+	UserID     uint64
+	Method     string
+	Path       string
+	StatusCode int
+	IP         string
+}
+
+// ListWithFilter 分页查询访问日志（结构化筛选）
+func (r *AccessLogRepository) ListWithFilter(ctx context.Context, page, pageSize int, f AccessLogListFilter) ([]model.AccessLog, int64, error) {
+	q := r.db.WithContext(ctx).Model(&model.AccessLog{})
+	if f.UserID > 0 {
+		q = q.Where("user_id = ?", f.UserID)
+	}
+	if f.Method != "" {
+		q = q.Where("method = ?", f.Method)
+	}
+	if f.Path != "" {
+		q = q.Where("path LIKE ?", "%"+f.Path+"%")
+	}
+	if f.StatusCode > 0 {
+		q = q.Where("status_code = ?", f.StatusCode)
+	}
+	if f.IP != "" {
+		q = q.Where("ip LIKE ?", "%"+f.IP+"%")
+	}
+	return r.page(q, page, pageSize, "log_id DESC")
+}

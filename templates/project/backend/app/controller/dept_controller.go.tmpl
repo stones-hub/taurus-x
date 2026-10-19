@@ -1,0 +1,191 @@
+package controller
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/google/wire"
+
+	"{{ .Module }}/app/dto"
+	"{{ .Module }}/app/service"
+)
+
+// DeptController 部门管理控制器
+type DeptController struct {
+	DeptService *service.AdminDeptService
+}
+
+// DeptControllerSet wire provider set
+var DeptControllerSet = wire.NewSet(wire.Struct(new(DeptController), "*"))
+
+// GetDeptList 部门列表（POST /admin/dept/list）
+func (c *DeptController) GetDeptList(w http.ResponseWriter, r *http.Request) {
+	var req dto.DeptListRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	req.Normalize()
+	resp, err := c.DeptService.GetDeptList(r.Context(), req.PageNo, req.PageSize, req.DeptName, req.Status)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, resp)
+}
+
+// GetEditDeptInfo 获取编辑部门信息（POST /admin/dept/edit-info）
+func (c *DeptController) GetEditDeptInfo(w http.ResponseWriter, r *http.Request) {
+	var req dto.DeptIDRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	if req.DeptID == 0 {
+		Fail(w, http.StatusBadRequest, "部门ID不能为空")
+		return
+	}
+	resp, err := c.DeptService.GetEditDeptInfo(r.Context(), req.DeptID)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, resp)
+}
+
+// GetAllDepts 获取所有启用部门（POST /admin/dept/option-depts）
+func (c *DeptController) GetAllDepts(w http.ResponseWriter, r *http.Request) {
+	var req dto.GetAllDeptsRequest
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	resp, err := c.DeptService.GetAllDepts(r.Context(), req.ExcludeDeptID)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, resp)
+}
+
+// AddDept 新增部门（POST /admin/dept/add）
+func (c *DeptController) AddDept(w http.ResponseWriter, r *http.Request) {
+	var req dto.AddDeptRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	if err := c.DeptService.AddDept(r.Context(), &req); err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, map[string]string{"status": "success"})
+}
+
+// UpdateDept 更新部门（POST /admin/dept/update）
+func (c *DeptController) UpdateDept(w http.ResponseWriter, r *http.Request) {
+	var req dto.UpdateDeptRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	if req.DeptID == 0 {
+		Fail(w, http.StatusBadRequest, "部门ID不能为空")
+		return
+	}
+	if err := c.DeptService.UpdateDept(r.Context(), &req); err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, map[string]string{"status": "success"})
+}
+
+// UpdateDeptStatus 更新部门状态（POST /admin/dept/update-status）
+func (c *DeptController) UpdateDeptStatus(w http.ResponseWriter, r *http.Request) {
+	var req dto.UpdateDeptStatusRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	if err := c.DeptService.UpdateDeptStatus(r.Context(), req.DeptID, req.Status); err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, map[string]string{"status": "success"})
+}
+
+// DeleteDept 删除部门（POST /admin/dept/delete）
+func (c *DeptController) DeleteDept(w http.ResponseWriter, r *http.Request) {
+	var req dto.DeptIDRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	if req.DeptID == 0 {
+		Fail(w, http.StatusBadRequest, "部门ID不能为空")
+		return
+	}
+	if err := c.DeptService.DeleteDept(r.Context(), req.DeptID); err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, map[string]string{"status": "success"})
+}
+
+// GetDeptUserList 部门员工列表（POST /admin/option/dept-users）
+func (c *DeptController) GetDeptUserList(w http.ResponseWriter, r *http.Request) {
+	var req dto.DeptUserListRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	req.Normalize()
+	resp, err := c.DeptService.GetDeptUserList(r.Context(), req.DeptID, req.PageNo, req.PageSize)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, resp)
+}
+
+// AddDeptUser 添加部门员工（POST /admin/dept/add-user）
+func (c *DeptController) AddDeptUser(w http.ResponseWriter, r *http.Request) {
+	var req dto.AddDeptUserRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	if err := c.DeptService.AddDeptUser(r.Context(), &req); err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, map[string]string{"status": "success"})
+}
+
+// UpdateDeptUser 更新部门员工（POST /admin/dept/update-user）
+func (c *DeptController) UpdateDeptUser(w http.ResponseWriter, r *http.Request) {
+	var req dto.UpdateDeptUserRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	if err := c.DeptService.UpdateDeptUser(r.Context(), &req); err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, map[string]string{"status": "success"})
+}
+
+// RemoveDeptUser 移除部门员工（POST /admin/dept/remove-user）
+func (c *DeptController) RemoveDeptUser(w http.ResponseWriter, r *http.Request) {
+	var req dto.RemoveDeptUserRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	if err := c.DeptService.RemoveDeptUser(r.Context(), &req); err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, map[string]string{"status": "success"})
+}
+
+// BatchUpdateDeptUser 批量更新部门员工（POST /admin/dept/batch-update-user）
+func (c *DeptController) BatchUpdateDeptUser(w http.ResponseWriter, r *http.Request) {
+	var req dto.BatchUpdateDeptUserRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	if err := c.DeptService.BatchUpdateDeptUser(r.Context(), &req); err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, map[string]string{"status": "success"})
+}

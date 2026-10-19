@@ -1,0 +1,132 @@
+package repo
+
+import (
+	"context"
+
+	"gorm.io/gorm"
+
+	"{{ .Module }}/app/model"
+)
+
+// AdminDeptRepository 部门数据访问层
+type AdminDeptRepository struct {
+	*baseRepository[model.AdminDept]
+}
+
+func NewAdminDeptRepositoryWithDB(db *gorm.DB) *AdminDeptRepository {
+	return &AdminDeptRepository{baseRepository: newBaseRepository[model.AdminDept](db)}
+}
+
+// FindByDeptID 根据部门 ID 查找部门
+func (r *AdminDeptRepository) FindByDeptID(ctx context.Context, deptID uint64) (*model.AdminDept, error) {
+	return r.firstBy(ctx, "dept_id = ?", deptID)
+}
+
+// FindByDeptCode 根据部门编码查找部门
+func (r *AdminDeptRepository) FindByDeptCode(ctx context.Context, deptCode string) (*model.AdminDept, error) {
+	return r.firstBy(ctx, "dept_code = ?", deptCode)
+}
+
+// FindByParentID 根据父部门 ID 查找子部门列表
+func (r *AdminDeptRepository) FindByParentID(ctx context.Context, parentID uint64) ([]model.AdminDept, error) {
+	return r.findBy(ctx, "parent_id = ?", parentID)
+}
+
+// AdminUserDeptRepository 用户部门关联数据访问层
+type AdminUserDeptRepository struct {
+	*baseRepository[model.AdminUserDept]
+}
+
+func NewAdminUserDeptRepositoryWithDB(db *gorm.DB) *AdminUserDeptRepository {
+	return &AdminUserDeptRepository{baseRepository: newBaseRepository[model.AdminUserDept](db)}
+}
+
+// FindByUserID 根据用户 ID 查找用户部门关联
+func (r *AdminUserDeptRepository) FindByUserID(ctx context.Context, userID uint64) ([]model.AdminUserDept, error) {
+	return r.findBy(ctx, "user_id = ?", userID)
+}
+
+// FindByDeptID 根据部门 ID 查找用户部门关联
+func (r *AdminUserDeptRepository) FindByDeptID(ctx context.Context, deptID uint64) ([]model.AdminUserDept, error) {
+	return r.findBy(ctx, "dept_id = ?", deptID)
+}
+
+// FindByUserIDAndDeptID 根据用户 ID 和部门 ID 查找关联
+func (r *AdminUserDeptRepository) FindByUserIDAndDeptID(ctx context.Context, userID, deptID uint64) (*model.AdminUserDept, error) {
+	return r.firstBy(ctx, "user_id = ? AND dept_id = ?", userID, deptID)
+}
+
+// FindManagerByDeptID 查找部门的 leader（is_manager=1 且 status=1）
+func (r *AdminUserDeptRepository) FindManagerByDeptID(ctx context.Context, deptID uint64) (*model.AdminUserDept, error) {
+	return r.firstBy(ctx, "dept_id = ? AND is_manager = 1 AND status = 1", deptID)
+}
+
+// FindPrimaryByUserID 查找用户的主要部门（is_primary=1 且 status=1）
+func (r *AdminUserDeptRepository) FindPrimaryByUserID(ctx context.Context, userID uint64) (*model.AdminUserDept, error) {
+	return r.firstBy(ctx, "user_id = ? AND is_primary = 1 AND status = 1", userID)
+}
+
+// CreateBatch 批量创建用户部门关联
+func (r *AdminUserDeptRepository) CreateBatch(ctx context.Context, entities []model.AdminUserDept) error {
+	if len(entities) == 0 {
+		return nil
+	}
+	return r.db.WithContext(ctx).Create(&entities).Error
+}
+
+// Dept 返回部门仓储
+func (r repoSet) Dept() *AdminDeptRepository { return NewAdminDeptRepositoryWithDB(r.db) }
+
+// UserDept 返回用户-部门关联仓储
+func (r repoSet) UserDept() *AdminUserDeptRepository { return NewAdminUserDeptRepositoryWithDB(r.db) }
+
+// UpdateByID 按主键更新指定字段
+func (r *AdminDeptRepository) UpdateByID(ctx context.Context, id uint64, updates interface{}) error {
+	return r.db.WithContext(ctx).Model(&model.AdminDept{}).Where("dept_id = ?", id).Updates(updates).Error
+}
+
+// UpdateByID 按主键更新指定字段
+func (r *AdminUserDeptRepository) UpdateByID(ctx context.Context, id uint64, updates interface{}) error {
+	return r.db.WithContext(ctx).Model(&model.AdminUserDept{}).Where("id = ?", id).Updates(updates).Error
+}
+
+// CountActiveByDeptID 统计某部门的启用成员数
+func (r *AdminUserDeptRepository) CountActiveByDeptID(ctx context.Context, deptID uint64) (int64, error) {
+	var count int64
+	err := r.db.WithContext(ctx).Model(&model.AdminUserDept{}).Where("dept_id = ? AND status = 1", deptID).Count(&count).Error
+	return count, err
+}
+
+// ListByDeptID 分页查询某部门的员工关联记录
+func (r *AdminUserDeptRepository) ListByDeptID(ctx context.Context, deptID uint64, page, pageSize int) ([]model.AdminUserDept, int64, error) {
+	q := r.db.WithContext(ctx).Model(&model.AdminUserDept{}).Where("dept_id = ?", deptID)
+	return r.page(q, page, pageSize, "id DESC")
+}
+
+// ListActive 查询所有启用状态的部门
+func (r *AdminDeptRepository) ListActive(ctx context.Context) ([]model.AdminDept, error) {
+	return r.findBy(ctx, "status = 1")
+}
+
+// ListActiveExceptID 查询所有启用状态且非指定ID的部门
+func (r *AdminDeptRepository) ListActiveExceptID(ctx context.Context, excludeID uint64) ([]model.AdminDept, error) {
+	return r.findBy(ctx, "dept_id != ? AND status = 1", excludeID)
+}
+
+// AdminDeptListFilter 部门列表筛选条件
+type AdminDeptListFilter struct {
+	DeptName string
+	Status   int
+}
+
+// ListWithFilter 分页查询部门（结构化筛选）
+func (r *AdminDeptRepository) ListWithFilter(ctx context.Context, page, pageSize int, f AdminDeptListFilter) ([]model.AdminDept, int64, error) {
+	q := r.db.WithContext(ctx).Model(&model.AdminDept{})
+	if f.DeptName != "" {
+		q = q.Where("dept_name LIKE ?", "%"+f.DeptName+"%")
+	}
+	if f.Status >= 0 {
+		q = q.Where("status = ?", f.Status)
+	}
+	return r.page(q, page, pageSize, "dept_id DESC")
+}

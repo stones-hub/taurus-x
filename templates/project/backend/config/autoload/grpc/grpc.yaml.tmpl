@@ -1,0 +1,22 @@
+grpc:
+  # 默认关闭：选了 grpc 组件只代表代码和依赖就绪，
+  # 注册完自己的 service 再把 GRPC_ENABLE 设为 true。
+  enable: ${GRPC_ENABLE:false}
+
+  address: "${GRPC_ADDRESS::50051}"     # 独立监听端口，与 HTTP 一起启动、一起优雅关闭
+  max_conns: 50000
+
+  keepalive:
+    enabled: true
+    max_connection_idle: 10             # 空闲连接保持时长（分钟）
+    max_connection_age: 30              # 连接最长存活时长（分钟）
+    max_connection_age_grace: 10        # 超过 age 后的宽限期（秒）
+    time: 1                             # 多久发一次 ping（小时）
+    timeout: 10                         # ping 后等 pong 的超时（秒）
+
+  tls:
+    # 开启后走双向 TLS：服务端证书 + CA 校验客户端证书，三个文件都要存在
+    enabled: ${GRPC_TLS_ENABLED:false}
+    crt: "certs/server.crt"
+    key: "certs/server.key"
+    ca: "certs/ca.crt"

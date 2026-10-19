@@ -1,0 +1,31 @@
+// 密码散列工具：SHA-256(password+salt)，与 admin_user_logins 表的
+// login_credential / salt 两列对应；scripts/sql/init.sql 里的初始管理员密码
+// 也是按同一算法算出来的。
+//
+// 注意 SHA-256 是快速散列，抗离线爆破能力弱，上生产应换 bcrypt / argon2id
+// （见项目 README「已知风险与待办」）。
+package helper
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+)
+
+// GenerateSalt 生成随机盐值（16 字节 → 32 位 hex）
+func GenerateSalt() string {
+	bytes := make([]byte, 16)
+	_, _ = rand.Read(bytes)
+	return hex.EncodeToString(bytes)
+}
+
+// HashPassword 使用盐值哈希密码：SHA-256(password + salt)
+func HashPassword(password, salt string) string {
+	hash := sha256.Sum256([]byte(password + salt))
+	return hex.EncodeToString(hash[:])
+}
+
+// VerifyPassword 验证密码
+func VerifyPassword(password, hashedPassword, salt string) bool {
+	return HashPassword(password, salt) == hashedPassword
+}

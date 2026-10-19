@@ -1,0 +1,36 @@
+package model
+
+import (
+	"time"
+)
+
+// AdminDept 部门表（admin_depts）
+type AdminDept struct {
+	DeptID      uint64    `json:"dept_id" gorm:"primaryKey;autoIncrement;column:dept_id;comment:部门ID"`
+	DeptName    string    `json:"dept_name" gorm:"size:100;not null;column:dept_name;comment:部门名称"`
+	ParentID    uint64    `json:"parent_id" gorm:"index:idx_parent_id;not null;default:0;column:parent_id;comment:父部门ID"`
+	DeptCode    string    `json:"dept_code" gorm:"uniqueIndex:uk_dept_code;size:50;not null;default:'';column:dept_code;comment:部门编码"`
+	Description string    `json:"description" gorm:"size:255;not null;default:'';column:description;comment:部门描述"`
+	SortOrder   int       `json:"sort_order" gorm:"not null;default:0;column:sort_order;comment:排序"`
+	DeptSource  int8      `json:"dept_source" gorm:"index:idx_dept_source;not null;default:1;column:dept_source;comment:部门来源：1自主创建，2企业微信同步，3其他SSO"`
+	ExternalID  string    `json:"external_id" gorm:"index:idx_external_id;size:100;not null;default:'';column:external_id;comment:外部系统ID"`
+	Status      int8      `json:"status" gorm:"index:idx_status;not null;default:1;column:status;comment:状态：1启用，0禁用"`
+	CreatedAt   time.Time `json:"created_at" gorm:"not null;default:CURRENT_TIMESTAMP;column:created_at;comment:创建时间"`
+	UpdatedAt   time.Time `json:"updated_at" gorm:"not null;default:CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;column:updated_at;comment:修改时间"`
+}
+
+func (AdminDept) TableName() string { return "admin_depts" }
+
+// AdminUserDept 用户部门关联表（admin_user_depts）
+type AdminUserDept struct {
+	ID        uint64    `json:"id" gorm:"primaryKey;autoIncrement;column:id;comment:自增ID"`
+	UserID    uint64    `json:"user_id" gorm:"uniqueIndex:uk_user_dept;index:idx_user_id;not null;column:user_id;comment:用户ID"`
+	DeptID    uint64    `json:"dept_id" gorm:"uniqueIndex:uk_user_dept;index:idx_dept_id;not null;column:dept_id;comment:部门ID"`
+	IsPrimary int8      `json:"is_primary" gorm:"not null;default:0;column:is_primary;comment:是否主要部门：1是，0否"`
+	IsManager int8      `json:"is_manager" gorm:"index:idx_dept_manager;not null;default:0;column:is_manager;comment:是否部门管理员：1是，0否"`
+	Status    int8      `json:"status" gorm:"index:idx_dept_manager;not null;default:1;column:status;comment:状态：1启用，0禁用"`
+	CreatedAt time.Time `json:"created_at" gorm:"not null;default:CURRENT_TIMESTAMP;column:created_at;comment:创建时间"`
+	UpdatedAt time.Time `json:"updated_at" gorm:"not null;default:CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;column:updated_at;comment:修改时间"`
+}
+
+func (AdminUserDept) TableName() string { return "admin_user_depts" }

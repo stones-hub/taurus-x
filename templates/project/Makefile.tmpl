@@ -1,0 +1,35 @@
+# 统一脚本：启动后端、前端、打包
+.PHONY: backend-wire backend-run backend-build frontend-install frontend-dev frontend-build dev build
+
+# ---------------------------- 后端 ----------------------------
+# 生成依赖注入代码（在 backend/ 下执行）
+backend-wire:
+	cd backend && make wire
+
+# 运行后端（默认 0.0.0.0:9080）
+backend-run: backend-wire
+	cd backend && go run ./bin/main.go -config ./config -env .env.local
+
+# 构建后端二进制
+backend-build: backend-wire
+	cd backend && go build -o build/{{ .ProjectName }} ./bin/main.go
+
+# ---------------------------- 前端 ----------------------------
+frontend-install:
+	cd frontend && pnpm install
+
+frontend-dev:
+	cd frontend && pnpm dev
+
+frontend-build:
+	cd frontend && pnpm build
+
+# ---------------------------- 组合命令 ----------------------------
+# 并行启动前后端（开发）
+dev:
+	@echo "启动后端(9080) + 前端(5173)..."
+	@(cd backend && make run) & \
+	(cd frontend && pnpm dev)
+
+# 打包（后端二进制 + 前端静态产物）
+build: backend-build frontend-build

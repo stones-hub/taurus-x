@@ -1,0 +1,158 @@
+package controller
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/google/wire"
+
+	"{{ .Module }}/app/dto"
+	"{{ .Module }}/app/service"
+)
+
+// PermissionController 权限管理控制器
+type PermissionController struct {
+	PermissionService *service.AdminPermissionsService
+}
+
+// PermissionControllerSet wire provider set
+var PermissionControllerSet = wire.NewSet(wire.Struct(new(PermissionController), "*"))
+
+// GetPermissionList 权限列表
+func (c *PermissionController) GetPermissionList(w http.ResponseWriter, r *http.Request) {
+	var req dto.PermissionListRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	req.NormalizePageSize(50)
+	resp, err := c.PermissionService.GetPermissionList(r.Context(), req.PageNo, req.PageSize, req.PermissionName, req.Status, req.PermissionType)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, resp)
+}
+
+// GetPermissionTree 权限树
+func (c *PermissionController) GetPermissionTree(w http.ResponseWriter, r *http.Request) {
+	var req dto.PermissionTreeRequest
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	var tree []*service.PermissionTree
+	var err error
+	if req.PermissionType > 0 {
+		tree, err = c.PermissionService.GetPermissionTree(r.Context(), req.ParentID, req.PermissionType)
+	} else {
+		tree, err = c.PermissionService.GetPermissionTree(r.Context(), req.ParentID)
+	}
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, map[string]interface{}{"tree": tree})
+}
+
+// AddPermission 新增权限
+func (c *PermissionController) AddPermission(w http.ResponseWriter, r *http.Request) {
+	var req dto.AddPermissionRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	if req.PermissionName == "" || req.PermissionCode == "" {
+		Fail(w, http.StatusBadRequest, "权限名称和编码不能为空")
+		return
+	}
+	if req.Status == 0 {
+		req.Status = 1
+	}
+	if err := c.PermissionService.AddPermission(r.Context(), req.ParentID, req.PermissionName, req.PermissionCode, req.PermissionType, req.Path, req.Icon, req.SortOrder, req.Status, req.IsSystem); err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, map[string]string{"status": "success"})
+}
+
+// UpdatePermission 更新权限
+func (c *PermissionController) UpdatePermission(w http.ResponseWriter, r *http.Request) {
+	var req dto.UpdatePermissionRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	if req.PermissionID == 0 {
+		Fail(w, http.StatusBadRequest, "权限ID不能为空")
+		return
+	}
+	if err := c.PermissionService.UpdatePermission(r.Context(), req.PermissionID, req.ParentID, req.PermissionName, req.PermissionCode, req.PermissionType, req.Path, req.Icon, req.SortOrder, req.Status, req.IsSystem); err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, map[string]string{"status": "success"})
+}
+
+// DeletePermission 删除权限
+func (c *PermissionController) DeletePermission(w http.ResponseWriter, r *http.Request) {
+	var req dto.PermissionIDRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	if req.PermissionID == 0 {
+		Fail(w, http.StatusBadRequest, "权限ID不能为空")
+		return
+	}
+	if err := c.PermissionService.DeletePermission(r.Context(), req.PermissionID); err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, map[string]string{"status": "success"})
+}
+
+// UpdatePermissionStatus 更新权限状态（开关）
+func (c *PermissionController) UpdatePermissionStatus(w http.ResponseWriter, r *http.Request) {
+	var req dto.UpdatePermissionStatusRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	if req.PermissionID == 0 {
+		Fail(w, http.StatusBadRequest, "权限ID不能为空")
+		return
+	}
+	if err := c.PermissionService.UpdatePermissionStatus(r.Context(), req.PermissionID, req.Status); err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, map[string]string{"status": "success"})
+}
+
+// UpdatePermissionIsSystem 更新是否系统权限（开关）
+func (c *PermissionController) UpdatePermissionIsSystem(w http.ResponseWriter, r *http.Request) {
+	var req dto.UpdatePermissionIsSystemRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	if req.PermissionID == 0 {
+		Fail(w, http.StatusBadRequest, "权限ID不能为空")
+		return
+	}
+	if err := c.PermissionService.UpdatePermissionIsSystem(r.Context(), req.PermissionID, req.IsSystem); err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, map[string]string{"status": "success"})
+}
+
+// GetEditPermissionInfo 获取编辑权限信息（含权限树）
+func (c *PermissionController) GetEditPermissionInfo(w http.ResponseWriter, r *http.Request) {
+	var req dto.PermissionIDRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	if req.PermissionID == 0 {
+		Fail(w, http.StatusBadRequest, "权限ID不能为空")
+		return
+	}
+	resp, err := c.PermissionService.GetEditPermissionInfo(r.Context(), req.PermissionID)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, resp)
+}

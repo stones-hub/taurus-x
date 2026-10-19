@@ -1,0 +1,13 @@
+# Go
+/taurus-x
+*.test
+*.out
+
+# 本机文件
+.DS_Store
+.env
+.env.local
+*.log
+
+# Pi 执行器证据
+.pi/evidence/

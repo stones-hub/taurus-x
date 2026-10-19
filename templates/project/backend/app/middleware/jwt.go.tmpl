@@ -1,0 +1,178 @@
+package middleware
+
+import (
+	"context"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/stones-hub/taurus-pro-common/pkg/util/tcrypt"
+	"github.com/stones-hub/taurus-pro-http/pkg/httpx"
+
+	"{{ .Module }}/internal/taurus"
+)
+
+type contextKey string
+
+const (
+	// JWTTokenKey 从请求中提取 JWT 令牌的键（Cookie 名 / Header 名）
+	JWTTokenKey = "jwt_token"
+	// JWTTokenClaimsKey context 中存放 JWT claims 的键
+	JWTTokenClaimsKey contextKey = "jwt_claims"
+)
+
+// JWTClaims JWT 声明
+type JWTClaims struct {
+	UID      string `json:"uid"`
+	Username string `json:"username"`
+}
+
+// JWTMiddleware JWT 鉴权中间件
+func JWTMiddleware() func(next http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !taurus.Container.Config.GetBool("http.jwt.enabled") {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			token := GetJWTToken(r)
+			if token == "" {
+				httpx.SendResponse(w, http.StatusUnauthorized, "缺少JWT令牌", nil)
+				return
+			}
+
+			claims, _, err := ValidateJWTToken(token)
+			if err != nil {
+				httpx.SendResponse(w, http.StatusUnauthorized, "JWT令牌无效: "+err.Error(), nil)
+				return
+			}
+
+			jwtClaims := JWTClaims{UID: claims.UID, Username: claims.Username}
+			ctx := context.WithValue(r.Context(), JWTTokenClaimsKey, jwtClaims)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// GetJWTToken 从请求中提取 JWT 令牌（优先 Cookie，其次 Header/Auth 头）
+func GetJWTToken(r *http.Request) string {
+	if c, err := r.Cookie(JWTTokenKey); err == nil {
+		return c.Value
+	}
+	if token := r.Header.Get(JWTTokenKey); token != "" {
+		return token
+	}
+	if ah := r.Header.Get("Authorization"); len(ah) > 7 && ah[:7] == "Bearer " {
+		return ah[7:]
+	}
+	return ""
+}
+
+// GenerateJWTToken 生成 JWT 令牌
+func GenerateJWTToken(uid, username string) (string, error) {
+	expireHours := taurus.Container.Config.GetInt("http.jwt.expire_hours")
+	if expireHours <= 0 {
+		expireHours = 24
+	}
+	return tcrypt.GenerateTokenWithExpiration(
+		uid,
+		username,
+		taurus.Container.Config.GetString("http.jwt.issuer"),
+		taurus.Container.Config.GetString("http.jwt.secret"),
+		time.Duration(expireHours)*time.Hour,
+	)
+}
+
+// ValidateJWTToken 验证 JWT 令牌
+func ValidateJWTToken(token string) (*JWTClaims, *tcrypt.Claims, error) {
+	c, err := tcrypt.ParseTokenWithSecret(token, taurus.Container.Config.GetString("http.jwt.secret"))
+	if err != nil {
+		return nil, nil, err
+	}
+	return &JWTClaims{UID: c.Uid, Username: c.Username}, c, nil
+}
+
+// RefreshJWTToken 刷新 JWT 令牌
+func RefreshJWTToken(w http.ResponseWriter, token string) (string, error) {
+	claims, err := tcrypt.ParseTokenWithSecret(token, taurus.Container.Config.GetString("http.jwt.secret"))
+	if err != nil {
+		return "", err
+	}
+	newToken, err := GenerateJWTToken(claims.Uid, claims.Username)
+	if err != nil {
+		return "", err
+	}
+	SetJWTToken(w, newToken)
+	return newToken, nil
+}
+
+// SetJWTToken 设置 JWT 令牌到响应头与 Cookie
+func SetJWTToken(w http.ResponseWriter, token string) {
+	expireHours := taurus.Container.Config.GetInt("http.jwt.expire_hours")
+	if expireHours <= 0 {
+		expireHours = 24
+	}
+	expiresAt := time.Now().Add(time.Duration(expireHours) * time.Hour)
+	w.Header().Set(JWTTokenKey, token)
+	http.SetCookie(w, &http.Cookie{
+		Name:     JWTTokenKey,
+		Value:    token,
+		Expires:  expiresAt,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   taurus.Container.Config.GetBool("http.jwt.secure"),
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+// GetJWTClaims 从请求上下文获取 JWT 声明
+func GetJWTClaims(r *http.Request) *JWTClaims {
+	if claims, ok := r.Context().Value(JWTTokenClaimsKey).(JWTClaims); ok {
+		return &claims
+	}
+	return nil
+}
+
+// GetUserID 从请求上下文获取用户 ID
+func GetUserID(r *http.Request) string {
+	if claims := GetJWTClaims(r); claims != nil {
+		return claims.UID
+	}
+	return ""
+}
+
+// GetUsername 从请求上下文获取用户名
+func GetUsername(r *http.Request) string {
+	if claims := GetJWTClaims(r); claims != nil {
+		return claims.Username
+	}
+	return ""
+}
+
+// CurrentUserIDFromJWT 从请求上下文提取用户 ID（uint64）
+func CurrentUserIDFromJWT(r *http.Request) (uint64, bool) {
+	uidStr := GetUserID(r)
+	if uidStr == "" {
+		return 0, false
+	}
+	uid, err := strconv.ParseUint(uidStr, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return uid, true
+}
+
+// ClearJWTToken 清除 JWT 令牌
+func ClearJWTToken(w http.ResponseWriter) {
+	w.Header().Del(JWTTokenKey)
+	http.SetCookie(w, &http.Cookie{
+		Name:     JWTTokenKey,
+		Value:    "",
+		Expires:  time.Now().Add(-1 * time.Hour),
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   taurus.Container.Config.GetBool("http.jwt.secure"),
+		SameSite: http.SameSiteLaxMode,
+	})
+}

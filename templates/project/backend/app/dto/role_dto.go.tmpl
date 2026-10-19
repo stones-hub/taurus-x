@@ -1,0 +1,115 @@
+package dto
+
+import (
+	"{{ .Module }}/app/model"
+)
+
+// UserRoleDetailResponse 用户角色/权限详情
+type UserRoleDetailResponse struct {
+	UserID         uint64                   `json:"user_id"`
+	Roles          []UserRoleDetail         `json:"roles"`
+	AllPermissions []model.AdminPermissions `json:"all_permissions"`
+}
+
+// UserRoleDetail 单个角色详情（含是否选中）
+type UserRoleDetail struct {
+	Role    model.AdminRole `json:"role"`
+	Checked bool            `json:"checked"`
+}
+
+// RoleListResponse 角色列表响应
+type RoleListResponse struct {
+	PageNo      int                     `json:"page_no"`
+	PageSize    int                     `json:"page_size"`
+	ResultTotal int64                   `json:"result_total"`
+	List        []*RoleListResponseItem `json:"list"`
+}
+
+// RoleListResponseItem 角色列表项
+type RoleListResponseItem struct {
+	RoleID      uint64 `json:"role_id"`
+	RoleName    string `json:"role_name"`
+	RoleCode    string `json:"role_code"`
+	Description string `json:"description"`
+	SortOrder   int    `json:"sort_order"`
+	Status      int8   `json:"status"`
+	IsSystem    int8   `json:"is_system"`
+	UpdatedAt   string `json:"update_time"`
+	CreatedAt   string `json:"add_time"`
+}
+
+// AddRoleRequest 新增角色请求
+type AddRoleRequest struct {
+	RoleName      string   `json:"role_name"`
+	RoleCode      string   `json:"role_code"`
+	Description   string   `json:"description"`
+	SortOrder     int      `json:"sort_order"`
+	IsSystem      int      `json:"is_system"`
+	PermissionIDs []uint64 `json:"permission_ids"`
+}
+
+// UpdateRoleRequest 更新角色请求
+type UpdateRoleRequest struct {
+	RoleID        uint64   `json:"role_id"`
+	RoleName      string   `json:"role_name"`
+	PermissionIDs []uint64 `json:"permission_ids"`
+}
+
+// RoleListRequest 角色列表查询请求
+type RoleListRequest struct {
+	PageQuery
+	RoleName string `json:"role_name"`
+	Status   int    `json:"status"`
+}
+
+// RoleIDRequest 仅角色 ID 的请求
+type RoleIDRequest struct {
+	RoleID uint64 `json:"role_id"`
+}
+
+// UpdateRoleStatusRequest 更新角色状态请求
+type UpdateRoleStatusRequest struct {
+	RoleID uint64 `json:"role_id"`
+	Status int    `json:"status"`
+}
+
+// UserIDRequest 仅用户 ID 的请求
+type UserIDRequest struct {
+	UserID uint64 `json:"user_id"`
+}
+
+// AssignUserRolesRequest 分配用户角色请求
+type AssignUserRolesRequest struct {
+	UserID  uint64   `json:"user_id"`
+	RoleIDs []uint64 `json:"role_ids"`
+}
+
+// EditRoleInfoResponse 编辑角色信息响应（角色字段 + 全量权限树，当前角色拥有的权限标记选中）
+type EditRoleInfoResponse struct {
+	RoleID      uint64                    `json:"role_id"`
+	RoleName    string                    `json:"role_name"`
+	RoleCode    string                    `json:"role_code"`
+	Description string                    `json:"description"`
+	SortOrder   int                       `json:"sort_order"`
+	Status      int8                      `json:"status"`
+	IsSystem    int8                      `json:"is_system"`
+	AddTime     string                    `json:"add_time"`
+	UpdateTime  string                    `json:"update_time"`
+	Permissions []*EditRolePermissionTree `json:"permissions"`
+}
+
+// EditRolePermissionTree 编辑角色权限树节点（含选中状态）
+type EditRolePermissionTree struct {
+	PermissionID   uint64                    `json:"permission_id"`
+	ParentID       uint64                    `json:"parent_id"`
+	PermissionName string                    `json:"permission_name"`
+	PermissionCode string                    `json:"permission_code"`
+	PermissionType int8                      `json:"permission_type"`
+	Path           string                    `json:"path"`
+	Icon           string                    `json:"icon"`
+	SortOrder      int                       `json:"sort_order"`
+	Status         int8                      `json:"status"`
+	IsSystem       int8                      `json:"is_system"`
+	Checked        bool                      `json:"checked"`
+	Children       []*EditRolePermissionTree `json:"children"`
+}

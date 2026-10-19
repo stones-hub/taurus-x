@@ -1,0 +1,53 @@
+# 后端 Makefile（在 backend/ 目录下运行）
+
+# 环境变量文件
+env_file=.env.local
+
+# 颜色
+GREEN := \033[32m
+BLUE := \033[34m
+CYAN := \033[36m
+RESET := \033[0m
+
+# CGO 编译标志：抑制 gnu-folding-constant 警告
+CGO_CFLAGS := -Wno-gnu-folding-constant
+
+# wire 从 go.mod 锁定的版本直接跑，不依赖全局安装的 wire 二进制
+WIRE := go run -mod=mod github.com/google/wire/cmd/wire
+
+.PHONY: wire run build fmt vet test clean
+
+# 生成依赖注入代码（扫描 app/ 下的 provider set + 生成两张图的 wire_gen.go）
+wire:
+	@printf "$(CYAN)Generating wire code...$(RESET)\n"
+	@mkdir -p build/wire
+	@go build -o ./build/wire/gen_wire ./internal/wire/gen_wire.go
+	@./build/wire/gen_wire -project-root $(PWD)
+	@$(WIRE) ./internal/taurus
+	@printf "$(GREEN)Wire code generated.$(RESET)\n"
+
+# 运行应用
+run: wire
+	@printf "$(BLUE)Running the application...$(RESET)\n"
+	@CGO_CFLAGS="$(CGO_CFLAGS)" go run ./bin/main.go -config ./config -env $(env_file)
+
+# 构建二进制
+build: wire
+	@printf "$(BLUE)Building the application...$(RESET)\n"
+	@mkdir -p build
+	@CGO_CFLAGS="$(CGO_CFLAGS)" go build -o build/{{ .ProjectName }} ./bin/main.go
+	@printf "$(GREEN)Build complete: build/{{ .ProjectName }}$(RESET)\n"
+
+fmt:
+	@go fmt ./...
+
+vet:
+	@go vet ./...
+
+test:
+	@go test ./...
+
+# 清理构建产物
+clean:
+	@rm -rf build
+	@printf "$(GREEN)Clean complete.$(RESET)\n"

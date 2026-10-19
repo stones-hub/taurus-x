@@ -1,0 +1,33 @@
+package middleware
+
+import (
+	"net/http"
+
+	"github.com/stones-hub/taurus-pro-common/pkg/util/tnet"
+	"github.com/stones-hub/taurus-pro-http/pkg/httpx"
+
+	"{{ .Module }}/internal/taurus"
+)
+
+// HostMiddleware 主机 IP 白名单校验中间件
+func HostMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ips := tnet.GetAllRemoteIPs(r)
+		if !isAllowedHost(ips) {
+			httpx.SendResponse(w, http.StatusForbidden, "访问被拒绝: 未授权主机.", nil)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isAllowedHost 判断来源 IP 是否在允许列表中
+func isAllowedHost(ips []string) bool {
+	allowedHosts := taurus.Container.Config.GetStringSlice("http.host_white_list")
+	for _, ip := range ips {
+		if tnet.IsIPAllowed(ip, allowedHosts) {
+			return true
+		}
+	}
+	return false
+}

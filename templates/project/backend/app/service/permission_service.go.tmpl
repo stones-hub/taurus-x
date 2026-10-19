@@ -1,0 +1,346 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"sort"
+
+	"github.com/google/wire"
+
+	"{{ .Module }}/app/dto"
+	"{{ .Module }}/app/model"
+	"{{ .Module }}/app/repo"
+)
+
+// PermissionTree 权限树节点
+type PermissionTree struct {
+	model.AdminPermissions
+	Children []*PermissionTree `json:"children"`
+}
+
+// AdminPermissionsService 权限管理服务
+type AdminPermissionsService struct {
+	store              *repo.Store
+	permissionRepo     *repo.AdminPermissionsRepository
+	rolePermissionRepo *repo.AdminRolePermissionsRepository
+}
+
+// AdminPermissionsServiceSet wire provider set
+var AdminPermissionsServiceSet = wire.NewSet(NewAdminPermissionsService)
+
+// NewAdminPermissionsService 创建权限管理服务
+func NewAdminPermissionsService(store *repo.Store) *AdminPermissionsService {
+	return &AdminPermissionsService{
+		store:              store,
+		permissionRepo:     store.Permission(),
+		rolePermissionRepo: store.RolePermission(),
+	}
+}
+
+// GetPermissionList 获取权限列表（分页，名称模糊 + 状态 + 类型过滤）
+func (s *AdminPermissionsService) GetPermissionList(ctx context.Context, page, pageSize int, name string, status, permissionType int) (*dto.PermissionListResponse, error) {
+	filter := repo.AdminPermissionsListFilter{
+		PermissionName: name,
+		Status:         status,
+	}
+	if permissionType >= 1 && permissionType <= 3 {
+		filter.PermissionType = permissionType
+	}
+
+	perms, total, err := s.permissionRepo.ListWithFilter(ctx, page, pageSize, filter)
+	if err != nil {
+		return nil, err
+	}
+
+	items := make([]*dto.PermissionListResponseItem, 0, len(perms))
+	for i := range perms {
+		p := perms[i]
+		items = append(items, &dto.PermissionListResponseItem{
+			PermissionID:   p.PermissionID,
+			ParentID:       p.ParentID,
+			PermissionName: p.PermissionName,
+			PermissionCode: p.PermissionCode,
+			PermissionType: p.PermissionType,
+			Path:           p.Path,
+			Icon:           p.Icon,
+			SortOrder:      p.SortOrder,
+			Status:         p.Status,
+			IsSystem:       p.IsSystem,
+			CreatedAt:      p.CreatedAt.Format("2006-01-02 15:04:05"),
+			UpdatedAt:      p.UpdatedAt.Format("2006-01-02 15:04:05"),
+		})
+	}
+
+	return &dto.PermissionListResponse{
+		PageNo:      page,
+		PageSize:    pageSize,
+		ResultTotal: total,
+		List:        items,
+	}, nil
+}
+
+// GetPermissionTree 获取权限树（嵌套），permissionType 可选：指定类型时过滤可选父权限
+func (s *AdminPermissionsService) GetPermissionTree(ctx context.Context, parentID uint64, permissionType ...int8) ([]*PermissionTree, error) {
+	perms, err := s.permissionRepo.ListByParentID(ctx, parentID)
+	if err != nil {
+		return nil, err
+	}
+	if len(perms) == 0 {
+		return []*PermissionTree{}, nil
+	}
+	tree := make([]*PermissionTree, 0, len(perms))
+	for i := range perms {
+		perm := perms[i]
+		var children []*PermissionTree
+		if len(permissionType) > 0 && permissionType[0] > 0 {
+			children, err = s.GetPermissionTree(ctx, perm.PermissionID, permissionType[0])
+		} else {
+			children, err = s.GetPermissionTree(ctx, perm.PermissionID)
+		}
+		if err != nil {
+			return nil, err
+		}
+		tree = append(tree, &PermissionTree{AdminPermissions: perm, Children: children})
+	}
+	sortPermissionTree(tree)
+	// 指定类型时，过滤掉不能作为该类型父权限的节点
+	if len(permissionType) > 0 && permissionType[0] > 0 {
+		tree = s.filterValidParentPermissions(tree, permissionType[0])
+	}
+	return tree, nil
+}
+
+// AddPermission 新增权限
+func (s *AdminPermissionsService) AddPermission(ctx context.Context, parentID uint64, name, code string, permType int8, path, icon string, sortOrder int, status, isSystem int8) error {
+	existing, err := s.permissionRepo.FindByPermissionCode(ctx, code)
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		return errors.New("权限编码已存在")
+	}
+	if permType < 1 || permType > 3 {
+		return errors.New("权限类型必须为1(菜单)、2(按钮)或3(接口)")
+	}
+	if parentID > 0 {
+		parent, err := s.permissionRepo.FindByPermissionID(ctx, parentID)
+		if err != nil {
+			return err
+		}
+		if parent == nil {
+			return errors.New("父权限不存在")
+		}
+	}
+	perm := &model.AdminPermissions{
+		ParentID:       parentID,
+		PermissionName: name,
+		PermissionCode: code,
+		PermissionType: permType,
+		Path:           path,
+		Icon:           icon,
+		SortOrder:      sortOrder,
+		Status:         status,
+		IsSystem:       isSystem,
+	}
+	return s.permissionRepo.Create(ctx, perm)
+}
+
+// UpdatePermission 更新权限
+func (s *AdminPermissionsService) UpdatePermission(ctx context.Context, permissionID, parentID uint64, name, code string, permType int8, path, icon string, sortOrder int, status, isSystem int8) error {
+	perm, err := s.permissionRepo.FindByPermissionID(ctx, permissionID)
+	if err != nil {
+		return err
+	}
+	if perm == nil {
+		return errors.New("权限不存在")
+	}
+	if perm.IsSystem == 1 {
+		return errors.New("系统权限不能修改")
+	}
+	if code != perm.PermissionCode {
+		existing, err := s.permissionRepo.FindByPermissionCode(ctx, code)
+		if err != nil {
+			return err
+		}
+		if existing != nil && existing.PermissionID != permissionID {
+			return errors.New("权限编码已被其他权限使用")
+		}
+	}
+	updateData := map[string]interface{}{
+		"parent_id":       parentID,
+		"permission_name": name,
+		"permission_code": code,
+		"permission_type": permType,
+		"path":            path,
+		"icon":            icon,
+		"sort_order":      sortOrder,
+		"status":          status,
+		"is_system":       isSystem,
+	}
+	return s.permissionRepo.UpdateByID(ctx, permissionID, updateData)
+}
+
+// DeletePermission 删除权限
+func (s *AdminPermissionsService) DeletePermission(ctx context.Context, permissionID uint64) error {
+	perm, err := s.permissionRepo.FindByPermissionID(ctx, permissionID)
+	if err != nil {
+		return err
+	}
+	if perm == nil {
+		return errors.New("权限不存在")
+	}
+	if perm.IsSystem == 1 {
+		return errors.New("系统权限不能删除")
+	}
+	children, err := s.permissionRepo.ListByParentID(ctx, permissionID)
+	if err != nil {
+		return err
+	}
+	if len(children) > 0 {
+		return errors.New("该权限下存在子权限，无法删除")
+	}
+	rolePerms, err := s.rolePermissionRepo.ListByPermissionID(ctx, permissionID)
+	if err != nil {
+		return err
+	}
+	if len(rolePerms) > 0 {
+		return errors.New("该权限已被角色使用，无法删除")
+	}
+	return s.permissionRepo.Delete(ctx, perm)
+}
+
+// UpdatePermissionStatus 更新权限状态
+func (s *AdminPermissionsService) UpdatePermissionStatus(ctx context.Context, permissionID uint64, status int8) error {
+	perm, err := s.permissionRepo.FindByPermissionID(ctx, permissionID)
+	if err != nil {
+		return err
+	}
+	if perm == nil {
+		return errors.New("权限不存在")
+	}
+	return s.permissionRepo.UpdateByID(ctx, permissionID, map[string]interface{}{"status": status})
+}
+
+// UpdatePermissionIsSystem 更新是否系统权限
+func (s *AdminPermissionsService) UpdatePermissionIsSystem(ctx context.Context, permissionID uint64, isSystem int8) error {
+	perm, err := s.permissionRepo.FindByPermissionID(ctx, permissionID)
+	if err != nil {
+		return err
+	}
+	if perm == nil {
+		return errors.New("权限不存在")
+	}
+	return s.permissionRepo.UpdateByID(ctx, permissionID, map[string]interface{}{"is_system": isSystem})
+}
+
+// GetEditPermissionInfo 获取编辑权限信息（含权限树，用于选择父权限）
+func (s *AdminPermissionsService) GetEditPermissionInfo(ctx context.Context, permissionID uint64) (*dto.EditPermissionInfoResponse, error) {
+	perm, err := s.permissionRepo.FindByPermissionID(ctx, permissionID)
+	if err != nil {
+		return nil, err
+	}
+	if perm == nil {
+		return nil, errors.New("权限不存在")
+	}
+
+	// 按权限类型过滤可选父权限，并排除自身及其子权限（避免循环引用）
+	tree, err := s.GetPermissionTree(ctx, 0, perm.PermissionType)
+	if err != nil {
+		return nil, err
+	}
+	filteredTree := s.filterPermissionTree(tree, permissionID)
+
+	return &dto.EditPermissionInfoResponse{
+		PermissionID:   perm.PermissionID,
+		ParentID:       perm.ParentID,
+		PermissionName: perm.PermissionName,
+		PermissionCode: perm.PermissionCode,
+		PermissionType: perm.PermissionType,
+		Path:           perm.Path,
+		Icon:           perm.Icon,
+		SortOrder:      perm.SortOrder,
+		Status:         perm.Status,
+		IsSystem:       perm.IsSystem,
+		CreatedAt:      perm.CreatedAt.Format("2006-01-02 15:04:05"),
+		UpdatedAt:      perm.UpdatedAt.Format("2006-01-02 15:04:05"),
+		PermissionTree: toDTOPermissionTree(filteredTree),
+	}, nil
+}
+
+// toDTOPermissionTree 将 service 权限树转换为 dto 权限树
+func toDTOPermissionTree(tree []*PermissionTree) []*dto.PermissionTreeNode {
+	if len(tree) == 0 {
+		return []*dto.PermissionTreeNode{}
+	}
+	nodes := make([]*dto.PermissionTreeNode, 0, len(tree))
+	for _, n := range tree {
+		nodes = append(nodes, &dto.PermissionTreeNode{
+			PermissionID:   n.PermissionID,
+			ParentID:       n.ParentID,
+			PermissionName: n.PermissionName,
+			PermissionCode: n.PermissionCode,
+			PermissionType: n.PermissionType,
+			Path:           n.Path,
+			Icon:           n.Icon,
+			SortOrder:      n.SortOrder,
+			Status:         n.Status,
+			IsSystem:       n.IsSystem,
+			Children:       toDTOPermissionTree(n.Children),
+		})
+	}
+	return nodes
+}
+
+// filterPermissionTree 过滤权限树，移除指定权限及其所有子权限（避免循环引用）
+func (s *AdminPermissionsService) filterPermissionTree(tree []*PermissionTree, excludeID uint64) []*PermissionTree {
+	filtered := make([]*PermissionTree, 0)
+	for _, node := range tree {
+		if node.PermissionID == excludeID {
+			continue
+		}
+		filtered = append(filtered, &PermissionTree{
+			AdminPermissions: node.AdminPermissions,
+			Children:         s.filterPermissionTree(node.Children, excludeID),
+		})
+	}
+	return filtered
+}
+
+// filterValidParentPermissions 根据权限类型过滤可选父权限（只保留可作父权限的节点及其有合法子节点的祖先链）
+func (s *AdminPermissionsService) filterValidParentPermissions(tree []*PermissionTree, permissionType int8) []*PermissionTree {
+	filtered := make([]*PermissionTree, 0)
+	for _, node := range tree {
+		filteredChildren := s.filterValidParentPermissions(node.Children, permissionType)
+		if s.canBeParent(node.PermissionType, permissionType) || len(filteredChildren) > 0 {
+			filtered = append(filtered, &PermissionTree{
+				AdminPermissions: node.AdminPermissions,
+				Children:         filteredChildren,
+			})
+		}
+	}
+	return filtered
+}
+
+// canBeParent 判断某权限类型是否可作为目标权限类型的父权限
+func (s *AdminPermissionsService) canBeParent(parentType, childType int8) bool {
+	switch parentType {
+	case 1: // 菜单：可作菜单/按钮/接口的父
+		return true
+	case 2: // 按钮：仅可作接口的父
+		return childType == 3
+	case 3: // 接口：仅可作接口的父
+		return childType == 3
+	default:
+		return false
+	}
+}
+
+func sortPermissionTree(nodes []*PermissionTree) {
+	if len(nodes) == 0 {
+		return
+	}
+	sort.Slice(nodes, func(a, b int) bool { return nodes[a].SortOrder < nodes[b].SortOrder })
+	for _, node := range nodes {
+		sortPermissionTree(node.Children)
+	}
+}

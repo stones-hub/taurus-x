@@ -1,0 +1,59 @@
+package middleware
+
+import (
+	"context"
+	"net/http"
+	"strconv"
+
+	"github.com/stones-hub/taurus-pro-http/pkg/httpx"
+)
+
+// PermissionChecker 权限检查器接口
+// 定义在 middleware 包中，避免依赖项目层（打破循环依赖）
+type PermissionChecker interface {
+	CheckAPIPermission(ctx context.Context, userID uint64, apiPath string) (bool, error)
+}
+
+var permissionChecker PermissionChecker
+
+// SetPermissionChecker 设置权限检查器（由 main 注入，打破循环依赖）
+func SetPermissionChecker(checker PermissionChecker) {
+	permissionChecker = checker
+}
+
+// PermissionMiddleware 权限中间件：检查用户是否有访问指定接口的权限
+// 注意：需在 JWT 中间件之后使用（依赖 JWT 注入的用户 ID）
+func PermissionMiddleware() func(next http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if permissionChecker == nil {
+				httpx.SendResponse(w, http.StatusInternalServerError, "权限检查器未初始化", nil)
+				return
+			}
+
+			userIDStr := GetUserID(r)
+			if userIDStr == "" {
+				httpx.SendResponse(w, http.StatusUnauthorized, "未获取到用户ID，请先通过JWT验证", nil)
+				return
+			}
+
+			userID, err := strconv.ParseUint(userIDStr, 10, 64)
+			if err != nil {
+				httpx.SendResponse(w, http.StatusUnauthorized, "用户ID格式错误", nil)
+				return
+			}
+
+			hasPermission, err := permissionChecker.CheckAPIPermission(r.Context(), userID, r.URL.Path)
+			if err != nil {
+				httpx.SendResponse(w, http.StatusInternalServerError, "权限检查失败: "+err.Error(), nil)
+				return
+			}
+			if !hasPermission {
+				httpx.SendResponse(w, http.StatusForbidden, "无权限访问该接口", nil)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}

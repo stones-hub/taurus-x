@@ -1,0 +1,14 @@
+databases:
+  enable: true
+  list:
+    - dbname: "${DB_NAME:{{ .DBName }}}"              # 数据库名称(标记, 用于创建多个数据库实例)
+      dbtype: "mysql"                         # 数据库类型 (postgres, mysql, sqlite)
+      dsn: "${DB_DSN:root:root@tcp(127.0.0.1:3306)/{{ .DBName }}?charset=utf8mb4&parseTime=True&loc=Local&timeout=10s&readTimeout=30s&writeTimeout=30s}"
+      max_open_conns: 500                     # 最大连接数
+      max_idle_conns: 50                      # 最大空闲连接数
+      conn_max_lifetime: 540                  # 连接最大生命周期 秒
+      max_retries: 10                         # 最大重试次数
+      retry_delay: 15                         # 重试延迟时间 秒
+      log_path: "./logs/db_{{ .ProjectName }}.log"          # 日志路径（按天分割，实际生成 db_{{ .ProjectName }}-YYYY-MM-DD.log；已由 internal/taurus 按天 logger 接管）
+      log_level: "info"                       # 日志级别 info warn error silent
+      log_formatter: "default"                # 日志格式 json/default

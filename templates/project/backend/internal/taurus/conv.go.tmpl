@@ -1,0 +1,77 @@
+package taurus
+
+import "time"
+
+// 终端颜色，仅用于启动/清理日志
+const (
+	colorReset = "\033[0m"
+	colorRed   = "\033[31m"
+	colorGreen = "\033[32m"
+)
+
+// 下面几个 asXxx 用来把配置里的 interface{} 取成具体类型。
+//
+// 配置来自 YAML，同一个字段在不同写法下可能被解析成 int / int64 / float64，
+// 直接用类型断言（v.(int)）会在格式稍有出入时 panic，所以统一走这里兜底。
+
+func asString(v interface{}) string {
+	s, _ := v.(string)
+	return s
+}
+
+func asBool(v interface{}) bool {
+	b, _ := v.(bool)
+	return b
+}
+
+func asInt(v interface{}) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int32:
+		return int(n)
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	case float32:
+		return int(n)
+	default:
+		return 0
+	}
+}
+
+func asFloat(v interface{}, def float64) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case float32:
+		return float64(n)
+	case int:
+		return float64(n)
+	case int64:
+		return float64(n)
+	default:
+		return def
+	}
+}
+
+// asDuration 支持 "30s" 这样的字符串，也支持纯数字（按秒）。
+func asDuration(v interface{}, def time.Duration) time.Duration {
+	switch n := v.(type) {
+	case string:
+		if d, err := time.ParseDuration(n); err == nil {
+			return d
+		}
+		return def
+	case time.Duration:
+		return n
+	case int, int32, int64, float32, float64:
+		if sec := asInt(v); sec > 0 {
+			return time.Duration(sec) * time.Second
+		}
+		return def
+	default:
+		return def
+	}
+}

@@ -1,0 +1,65 @@
+package repo
+
+import (
+	"context"
+
+	"{{ .Module }}/app/constants"
+	"{{ .Module }}/app/helper"
+	"gorm.io/gorm"
+
+	"{{ .Module }}/app/model"
+)
+
+// AdminUserLoginRepository 用户登录方式数据访问层
+type AdminUserLoginRepository struct {
+	*baseRepository[model.AdminUserLogin]
+}
+
+func NewAdminUserLoginRepositoryWithDB(db *gorm.DB) *AdminUserLoginRepository {
+	return &AdminUserLoginRepository{baseRepository: newBaseRepository[model.AdminUserLogin](db)}
+}
+
+// FindByUserIDAndLoginTypeAnyStatus 根据用户 ID 和登录类型查找登录方式（不限状态）
+func (r *AdminUserLoginRepository) FindByUserIDAndLoginTypeAnyStatus(ctx context.Context, userID uint64, loginType string) (*model.AdminUserLogin, error) {
+	return r.firstBy(ctx, "user_id = ? AND login_type = ?", userID, loginType)
+}
+
+// FindByLoginTypeAndValueAnyStatus 根据登录类型和登录标识查找登录方式（不限状态）
+func (r *AdminUserLoginRepository) FindByLoginTypeAndValueAnyStatus(ctx context.Context, loginType, loginValue string) (*model.AdminUserLogin, error) {
+	return r.firstBy(ctx, "login_type = ? AND login_value = ?", loginType, loginValue)
+}
+
+// SyncPassword 设置/更新用户名密码登录方式（内部辅助）
+func (r *AdminUserLoginRepository) SyncPassword(ctx context.Context, userID uint64, username, password string) error {
+	salt := helper.GenerateSalt()
+	hashed := helper.HashPassword(password, salt)
+	login, err := r.FindByUserIDAndLoginTypeAnyStatus(ctx, userID, string(constants.LoginTypeUsername))
+	if err != nil {
+		return err
+	}
+	if login == nil {
+		return r.Create(ctx, &model.AdminUserLogin{
+			UserID:          userID,
+			LoginType:       string(constants.LoginTypeUsername),
+			LoginValue:      username,
+			LoginCredential: hashed,
+			Salt:            salt,
+			Status:          1,
+		})
+	}
+	err = r.db.WithContext(ctx).Model(&model.AdminUserLogin{}).Where("login_id = ?", login.LoginID).Updates(map[string]interface{}{
+		"login_credential": hashed,
+		"salt":             salt,
+	}).Error
+	return err
+}
+
+// UserLogin 返回用户登录态仓储
+func (r repoSet) UserLogin() *AdminUserLoginRepository {
+	return NewAdminUserLoginRepositoryWithDB(r.db)
+}
+
+// UpdateByID 按主键更新指定字段
+func (r *AdminUserLoginRepository) UpdateByID(ctx context.Context, id uint64, updates interface{}) error {
+	return r.db.WithContext(ctx).Model(&model.AdminUserLogin{}).Where("login_id = ?", id).Updates(updates).Error
+}

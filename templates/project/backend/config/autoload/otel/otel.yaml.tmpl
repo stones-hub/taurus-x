@@ -1,0 +1,27 @@
+otel:
+  # 默认关闭：选了 opentelemetry 组件只代表代码和依赖就绪，
+  # 真正上报请把 OTEL_ENABLE 设为 true，并确认 collector 地址可达。
+  enable: ${OTEL_ENABLE:false}
+
+  service:
+    name: "{{ .ProjectName }}"
+    version: "${VERSION:v0.0.1}"
+    environment: "${OTEL_ENVIRONMENT:dev}"
+
+  export:
+    protocol: "${OTEL_PROTOCOL:grpc}"              # grpc / http
+    endpoint: "${OTEL_ENDPOINT:127.0.0.1:4317}"    # grpc 用 4317，http 用 4318
+    insecure: ${OTEL_INSECURE:true}
+    timeout: 10s
+
+  sampling:
+    ratio: ${OTEL_SAMPLING_RATIO:1.0}              # 0.0 ~ 1.0，1.0 为全采样
+
+  batch:
+    timeout: 10s
+    max_size: 512
+    max_queue_size: 2048
+    export_timeout: 30s
+
+  # 进程启动时注册的 tracer 名称，业务里用 otelemetry.GetTracer("http-server") 取
+  tracers: ["http-server"]
