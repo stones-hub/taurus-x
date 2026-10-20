@@ -1,0 +1,240 @@
+package middleware
+
+import (
+	"log"
+	"sync"
+	"time"
+)
+
+// 进程内的「单 IP 桶 + 全局桶」双层令牌桶，带空闲记录自动回收。
+//
+// 为什么不直接用公共库的 tlimit.CompositeRateLimiter：它的 per-IP 桶是一张
+// 只增不减的 map，每个来访 IP 永久占一条记录。对公网入口（登录、验证码、
+// 错误上报）来说这是一条内存增长路径 —— 换 IP 的扫描流量能一直把它撑大，
+// 直到进程被 OOM 杀掉。公共库是多个项目共用的，不在本仓库修改范围内，
+// 所以在项目内重新实现一份带回收的。
+//
+// 限流语义**刻意**与被替换的实现保持一致（见 refill 和 Allow 的注释）：
+// 这是一次内存行为的修复，不是一次限流策略调整，不该顺手把阈值改松或改严。
+//
+// 回收是惰性的（随请求摊还），没有后台 goroutine。这样进程退出时没有东西需要
+// 停止，也就不存在 goroutine 泄漏；代价是没有流量时不回收 —— 而没有流量时
+// 也不会有新记录进来，所以内存是有界的。
+const (
+	// rateLimitMaxEntries 单个限流器最多保留多少条 per-IP 记录。
+	// 10 万条约等于十几 MB，远低于任何正常部署的内存预算，同时足够覆盖
+	// 真实业务的活跃 IP 数（活跃 IP 远少于历史 IP 总数）。
+	rateLimitMaxEntries = 100000
+
+	// rateLimitSweepInterval 两次清扫的最小间隔。清扫是 O(记录数) 的全表扫描，
+	// 且在锁内进行，所以不能每个请求都扫；一分钟一次时，10 万条的扫描开销
+	// 摊到这一分钟的全部请求上可以忽略。
+	rateLimitSweepInterval = time.Minute
+
+	// rateLimitIdleTTL 记录闲置多久之后才允许被回收。
+	// 它不影响限流正确性（只有回满的桶才会被回收，见 sweepLocked），
+	// 只是避免低频 IP 每来一次就被删一次、再建一次。
+	rateLimitIdleTTL = 5 * time.Minute
+
+	// rateLimitOverflowLogInterval 记录数触顶时的日志节流间隔。
+	// 触顶往往伴随大流量，不节流的话日志本身就成了放大器。
+	rateLimitOverflowLogInterval = time.Minute
+)
+
+// 限流原因，用于结果说明（当前只用于内部判断和测试，不返回给客户端 ——
+// 告诉客户端是哪一层拦的，等于告诉它怎么绕）。
+const (
+	reasonIP     = "IP限流"
+	reasonGlobal = "全局限流"
+)
+
+// rateLimitResult 限流判定结果。
+type rateLimitResult struct {
+	Allowed bool
+	Reason  string
+}
+
+// tokenBucket 一个令牌桶。所有字段由所属 ipRateLimiter 的互斥锁保护，
+// 自己不加锁 —— 单 IP 桶和全局桶必须在同一个临界区里判定，分别加锁没有意义。
+type tokenBucket struct {
+	capacity int
+	tokens   int
+	lastFill time.Time // 上次真正补过令牌的时间
+	lastSeen time.Time // 上次被请求命中的时间，仅用于回收判断
+}
+
+// newTokenBucket 新桶初始是满的：允许一次完整的突发。
+func newTokenBucket(capacity int, now time.Time) *tokenBucket {
+	return &tokenBucket{capacity: capacity, tokens: capacity, lastFill: now, lastSeen: now}
+}
+
+// refill 按经过的时间补令牌。
+//
+// 这里刻意保留了被替换实现的两个取整细节，换掉它们会让限流变松：
+//   - tokensToAdd 用整除，不足一个填充间隔的零头不补；
+//   - 只有真的补到了令牌才推进 lastFill，于是那个零头被丢弃而不是攒下来。
+//
+// 合起来，实际速率略严于「每 fillInterval 回一个令牌」的理想模型。
+// 时钟回拨时 elapsed 为负，整除结果 <= 0，不补令牌也不推进 lastFill。
+func (b *tokenBucket) refill(now time.Time, fillInterval time.Duration) {
+	if tokensToAdd := int(now.Sub(b.lastFill) / fillInterval); tokensToAdd > 0 {
+		b.tokens = min(b.capacity, b.tokens+tokensToAdd)
+		b.lastFill = now
+	}
+}
+
+// take 先补令牌再尝试取一个。
+func (b *tokenBucket) take(now time.Time, fillInterval time.Duration) bool {
+	b.refill(now, fillInterval)
+	if b.tokens <= 0 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
+// refillAndIsFull 桶是否已经回满。回满 = 这个 IP 的配额完全恢复。
+//
+// 名字里带 refill 是因为它**有副作用**：判断之前会先按时间补令牌（不先补就会
+// 把「早该回满、只是没人来触发」的桶误判成未满，于是永远不被回收）。
+// 调用方都在锁内，和 take 一样。
+func (b *tokenBucket) refillAndIsFull(now time.Time, fillInterval time.Duration) bool {
+	b.refill(now, fillInterval)
+	return b.tokens >= b.capacity
+}
+
+// ipRateLimiter 单 IP 桶 + 全局桶，两层都要过才放行。
+type ipRateLimiter struct {
+	mu           sync.Mutex
+	buckets      map[string]*tokenBucket
+	global       *tokenBucket
+	ipCapacity   int
+	fillInterval time.Duration
+
+	maxEntries int
+	lastSweep  time.Time
+	lastWarn   time.Time
+
+	// now 时钟来源。生产用 time.Now，测试注入假时钟，
+	// 这样「令牌按时间回补」「记录过期被回收」能被确定性地断言，不靠 sleep。
+	now func() time.Time
+}
+
+// newIPRateLimiter 创建限流器。三个参数都必须为正，否则调用方不该创建限流器
+// （见 newSensitiveLimiter / initLimiters：参数无效时返回 nil 表示不限流）。
+func newIPRateLimiter(ipCapacity, globalCapacity int, fillInterval time.Duration) *ipRateLimiter {
+	now := time.Now()
+	return &ipRateLimiter{
+		buckets:      make(map[string]*tokenBucket),
+		global:       newTokenBucket(globalCapacity, now),
+		ipCapacity:   ipCapacity,
+		fillInterval: fillInterval,
+		maxEntries:   rateLimitMaxEntries,
+		lastSweep:    now,
+		now:          time.Now,
+	}
+}
+
+// Allow 判定某个 IP 的这次请求是否放行。
+//
+// 顺序与被替换实现一致：先判单 IP 桶并扣掉令牌，再判全局桶。
+// 这意味着**全局桶不足时，单 IP 的那个令牌已经被扣掉了**。这是原实现的语义，
+// 这里原样保留：改成「两层都够才扣」需要预留 + 回滚两阶段，属于策略变更，
+// 不在这次内存修复的范围内。后果是全局过载时单 IP 配额消耗偏快，
+// 即限流偏严 —— 方向上是安全的那一侧。
+func (l *ipRateLimiter) Allow(ip string) rateLimitResult {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	now := l.now()
+	l.maybeSweepLocked(now)
+
+	bucket := l.buckets[ip]
+	if bucket == nil {
+		bucket = l.trackLocked(ip, now)
+	}
+
+	if bucket != nil {
+		bucket.lastSeen = now
+		if !bucket.take(now, l.fillInterval) {
+			return rateLimitResult{Reason: reasonIP}
+		}
+	}
+
+	if !l.global.take(now, l.fillInterval) {
+		return rateLimitResult{Reason: reasonGlobal}
+	}
+	return rateLimitResult{Allowed: true}
+}
+
+// trackLocked 给新 IP 建桶；记录数触顶且清扫也腾不出空间时返回 nil。
+//
+// 触顶策略：**降级为只走全局桶**，而不是拒绝新 IP。
+//
+// 理由是这两种失败模式的代价不对称。记录上限是一道内存保护，不是第二条限流规则：
+//   - 触顶即拒绝（fail closed）会把内存保护变成可被利用的可用性武器 ——
+//     攻击者只要用足够多的来源 IP 把表撑满，之后所有新用户都拿到 429，
+//     等于帮他完成了拒绝服务；
+//   - 降级为只走全局桶，总吞吐仍然被全局桶卡住（而全局桶恰恰是应对
+//     多来源洪峰的那一层），损失只是这些新 IP 之间不再互相隔离。
+//
+// 换句话说，触顶时放弃的是「公平性」，保住的是「总量可控」和「可用性」。
+// 真正扛洪峰要靠入口层（WAF / 网关 / 云厂商的 DDoS 防护），应用层限流只是补位。
+func (l *ipRateLimiter) trackLocked(ip string, now time.Time) *tokenBucket {
+	if len(l.buckets) >= l.maxEntries {
+		// 先强制清扫一次：触顶时宁可多花一次 O(n) 扫描，也比直接降级好
+		l.sweepLocked(now)
+	}
+	if len(l.buckets) >= l.maxEntries {
+		l.warnOverflowLocked(now)
+		return nil
+	}
+	bucket := newTokenBucket(l.ipCapacity, now)
+	l.buckets[ip] = bucket
+	return bucket
+}
+
+// maybeSweepLocked 摊还式清扫：距上次清扫不足 rateLimitSweepInterval 就跳过。
+func (l *ipRateLimiter) maybeSweepLocked(now time.Time) {
+	if now.Sub(l.lastSweep) < rateLimitSweepInterval {
+		return
+	}
+	l.sweepLocked(now)
+}
+
+// sweepLocked 丢掉「已经回满、且闲置超过 rateLimitIdleTTL」的记录。
+//
+// 为什么只丢回满的桶：桶回满意味着这个 IP 的配额已经完全恢复，此时删掉它
+// 和留着它对后续任何判定都完全等价 —— 下次这个 IP 再来，新建的桶同样是满的。
+// 所以这种回收对限流语义是**无影响**的。
+//
+// 反过来，丢掉一个还没回满的桶，就是把一个正在被限流的 IP 的欠账一笔勾销：
+// 攻击者只要停够一个清扫周期就能重置配额，口令爆破的速率上限随之失效。
+// 这就是回收条件里必须有 refillAndIsFull 的原因，idleTTL 只是用来避免删了又建的抖动。
+func (l *ipRateLimiter) sweepLocked(now time.Time) {
+	l.lastSweep = now
+	for ip, bucket := range l.buckets {
+		if now.Sub(bucket.lastSeen) < rateLimitIdleTTL {
+			continue
+		}
+		if bucket.refillAndIsFull(now, l.fillInterval) {
+			delete(l.buckets, ip)
+		}
+	}
+}
+
+// warnOverflowLocked 记录数触顶时打一条节流后的日志，让运维看得见降级发生了。
+func (l *ipRateLimiter) warnOverflowLocked(now time.Time) {
+	if now.Sub(l.lastWarn) < rateLimitOverflowLogInterval {
+		return
+	}
+	l.lastWarn = now
+	log.Printf("限流器 per-IP 记录数已达上限 %d，新来源暂时只受全局桶约束\n", l.maxEntries)
+}
+
+// trackedIPs 当前保留的 per-IP 记录数（仅供测试和排障）。
+func (l *ipRateLimiter) trackedIPs() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.buckets)
+}

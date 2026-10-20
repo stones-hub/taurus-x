@@ -103,6 +103,13 @@ func (s *AdminUserService) AddUser(ctx context.Context, req *dto.AddUserRequest)
 	if err := helper.ValidatePasswordStrength(req.Password); err != nil {
 		return 0, err
 	}
+	// 散列先算好再建号：bcrypt 是纯计算，放在任何写入之前，
+	// 「密码超长」这类错误就不会留下一个「用户行已建、登录方式没建」的半成品账号
+	//（这两步不在同一个事务里）。
+	hashed, err := helper.HashPassword(req.Password)
+	if err != nil {
+		return 0, err
+	}
 	if !helper.ValidateMobile(req.Mobile) {
 		return 0, errors.New("手机号格式不正确")
 	}
@@ -160,8 +167,8 @@ func (s *AdminUserService) AddUser(ctx context.Context, req *dto.AddUserRequest)
 		return 0, err
 	}
 
-	// 创建用户名密码登录方式
-	if err := s.loginRepo.SyncPassword(ctx, user.UserID, req.Username, req.Password); err != nil {
+	// 创建用户名密码登录方式（散列在函数开头就算好了）
+	if err := s.loginRepo.SyncPasswordHash(ctx, user.UserID, req.Username, hashed); err != nil {
 		return 0, err
 	}
 	return user.UserID, nil
@@ -207,6 +214,18 @@ func (s *AdminUserService) UpdateUser(ctx context.Context, operatorID uint64, re
 			return err
 		}
 	}
+	// 散列也在进事务之前算：bcrypt 故意慢（cost=10 约 50~100ms），放进事务里
+	// 就等于让操作人和目标用户的行锁多持 100ms；它是纯计算，不依赖事务内的任何事实。
+	// 注意这里只是**算**，没有任何写入 —— 下面 guardUserWrite 拒绝时，
+	// 这个散列会连同请求一起被丢掉，库里仍然一个字节都没动。
+	var hashedPassword string
+	if req.Password != "" {
+		h, err := helper.HashPassword(req.Password)
+		if err != nil {
+			return err
+		}
+		hashedPassword = h
+	}
 
 	return s.store.RunInTx(ctx, func(tx *repo.Tx) error {
 		// 目标账号保护与身份锁始终执行，跟本次改不改角色无关
@@ -235,9 +254,12 @@ func (s *AdminUserService) UpdateUser(ctx context.Context, operatorID uint64, re
 		if req.Password != "" {
 			// 重置他人密码必须连带吊销该用户所有在线会话，否则「密码已被重置」
 			// 而偷到旧 Token 的人还能继续用。两步同事务，不留中间态。
+			//
+			// 「是否要改密」仍然只看 req.Password（与原来一致）：hashedPassword
+			// 是它的派生物，两者要么都有值要么都为空，判据没有变。
 			if err := applyRevocableChange(
 				func() error {
-					return tx.UserLogin().SyncPassword(ctx, req.UserID, g.Target.Username, req.Password)
+					return tx.UserLogin().SyncPasswordHash(ctx, req.UserID, g.Target.Username, hashedPassword)
 				},
 				func() error { return tx.User().BumpAuthVersion(ctx, req.UserID) },
 			); err != nil {

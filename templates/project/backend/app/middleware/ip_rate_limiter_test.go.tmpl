@@ -1,0 +1,374 @@
+// 项目内限流器（ipRateLimiter）的单元测试。
+//
+// 这些测试全部用注入的假时钟推进时间，不 sleep：令牌回补和记录回收都是
+// 时间驱动的，用真实时间测要么很慢，要么在 CI 上偶发失败。
+//
+// 要守住的不变量：
+//  1. 基本放行/拒绝，单 IP 之间互不连坐；
+//  2. 令牌按时间回补，且回补的取整方式与被替换的公共库实现一致（不能变松）；
+//  3. 全局桶是独立的第二道闸；
+//  4. 闲置且已回满的记录会被回收 —— 这是这次改动的目的；
+//  5. **没回满的记录绝不回收** —— 回收它等于给正在被限流的 IP 清零欠账；
+//  6. 记录数触顶时按既定策略降级，不崩、不无限增长；
+//  7. 并发访问不 race（配合 go test -race）。
+package middleware
+
+import (
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+)
+
+// fakeClock 可手动推进的时钟。
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func newFakeClock() *fakeClock {
+	return &fakeClock{t: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)}
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
+
+// newTestLimiter 造一个挂着假时钟的限流器。
+func newTestLimiter(ipCapacity, globalCapacity int, fillInterval time.Duration) (*ipRateLimiter, *fakeClock) {
+	clock := newFakeClock()
+	l := newIPRateLimiter(ipCapacity, globalCapacity, fillInterval)
+	l.now = clock.Now
+	l.lastSweep = clock.Now()
+	// 全局桶和 per-IP 桶的时间基准也要挪到假时钟上，
+	// 否则真实时间与假时间的差值会被当成「已经过了很久」。
+	l.global.lastFill = clock.Now()
+	l.global.lastSeen = clock.Now()
+	return l, clock
+}
+
+func TestIPRateLimiter_AllowsUpToCapacityThenDenies(t *testing.T) {
+	const capacity = 3
+	l, _ := newTestLimiter(capacity, 1000, time.Minute)
+
+	for i := 0; i < capacity; i++ {
+		if res := l.Allow("203.0.113.10"); !res.Allowed {
+			t.Fatalf("第 %d 次请求应放行，实际被拒（原因 %s）", i+1, res.Reason)
+		}
+	}
+	res := l.Allow("203.0.113.10")
+	if res.Allowed {
+		t.Fatal("超出单 IP 容量后应被拒")
+	}
+	if res.Reason != reasonIP {
+		t.Errorf("拒绝原因应为 %q，实际 %q", reasonIP, res.Reason)
+	}
+}
+
+func TestIPRateLimiter_SeparateIPsDoNotShareBudget(t *testing.T) {
+	l, _ := newTestLimiter(1, 1000, time.Minute)
+
+	if !l.Allow("203.0.113.10").Allowed {
+		t.Fatal("第一个 IP 的首次请求应放行")
+	}
+	if l.Allow("203.0.113.10").Allowed {
+		t.Fatal("第一个 IP 超额后应被拒")
+	}
+	if !l.Allow("203.0.113.11").Allowed {
+		t.Error("另一个 IP 不该被连坐")
+	}
+}
+
+// TestIPRateLimiter_RefillsOverTime 令牌按时间回补，且保留原实现的取整语义：
+// 不足一个填充间隔的零头不补，也不攒着。放松这个取整就是放松限流。
+func TestIPRateLimiter_RefillsOverTime(t *testing.T) {
+	const fill = 10 * time.Second
+	l, clock := newTestLimiter(2, 1000, fill)
+
+	l.Allow("203.0.113.10")
+	l.Allow("203.0.113.10")
+	if l.Allow("203.0.113.10").Allowed {
+		t.Fatal("配额用尽后应被拒")
+	}
+
+	// 不足一个填充间隔：不回令牌
+	clock.Advance(fill - time.Second)
+	if l.Allow("203.0.113.10").Allowed {
+		t.Fatal("不足一个填充间隔就回了令牌，限流被放松了")
+	}
+
+	// 跨过一个完整间隔：回一个令牌（从上次真正回补的时间点算起）
+	clock.Advance(fill)
+	if !l.Allow("203.0.113.10").Allowed {
+		t.Fatal("过了一个填充间隔应回一个令牌")
+	}
+	if l.Allow("203.0.113.10").Allowed {
+		t.Fatal("一个间隔只该回一个令牌")
+	}
+
+	// 回补不会超过容量
+	clock.Advance(100 * fill)
+	for i := 0; i < 2; i++ {
+		if !l.Allow("203.0.113.10").Allowed {
+			t.Fatalf("长时间空闲后应恢复到满容量，第 %d 次就被拒了", i+1)
+		}
+	}
+	if l.Allow("203.0.113.10").Allowed {
+		t.Error("回补溢出了容量上限")
+	}
+}
+
+// TestIPRateLimiter_GlobalBucketLimitsAcrossIPs 全局桶是独立的第二道闸：
+// 每个 IP 都没超自己的配额，总量仍然会被卡住。
+func TestIPRateLimiter_GlobalBucketLimitsAcrossIPs(t *testing.T) {
+	const globalCapacity = 5
+	l, _ := newTestLimiter(100, globalCapacity, time.Minute)
+
+	for i := 0; i < globalCapacity; i++ {
+		ip := fmt.Sprintf("203.0.113.%d", i)
+		if res := l.Allow(ip); !res.Allowed {
+			t.Fatalf("第 %d 个 IP 的首次请求应放行（原因 %s）", i+1, res.Reason)
+		}
+	}
+	res := l.Allow("203.0.113.200")
+	if res.Allowed {
+		t.Fatal("全局桶耗尽后应被拒，即使这个 IP 自己的配额还够")
+	}
+	if res.Reason != reasonGlobal {
+		t.Errorf("拒绝原因应为 %q，实际 %q", reasonGlobal, res.Reason)
+	}
+}
+
+// TestIPRateLimiter_GlobalRejectionStillSpendsIPToken 固定住一条继承来的语义：
+// 全局桶不足时，单 IP 的令牌已经被扣掉了。
+//
+// 这不是本次改动引入的行为，是被替换实现（tlimit.CompositeRateLimiter）就有的；
+// 这里用测试把它钉住，是为了让它成为一个**有意识的选择**而不是无人察觉的副作用 ——
+// 将来谁想改成「两层都够才扣」，会先看到这条测试和它的理由。
+// 方向上这偏严（全局过载时单 IP 配额消耗更快），所以保留是安全的。
+func TestIPRateLimiter_GlobalRejectionStillSpendsIPToken(t *testing.T) {
+	// 全局只有 1 个令牌，单 IP 有 5 个
+	l, _ := newTestLimiter(5, 1, time.Hour)
+
+	if !l.Allow("203.0.113.10").Allowed {
+		t.Fatal("首次请求应放行")
+	}
+	// 全局已空：后面两次都会被全局拦下，但单 IP 的令牌照样在扣
+	for i := 0; i < 2; i++ {
+		if res := l.Allow("203.0.113.10"); res.Allowed || res.Reason != reasonGlobal {
+			t.Fatalf("第 %d 次应被全局桶拒绝，实际 %+v", i+2, res)
+		}
+	}
+
+	l.mu.Lock()
+	tokens := l.buckets["203.0.113.10"].tokens
+	l.mu.Unlock()
+	// 5 - 3 = 2：三次请求都扣了单 IP 令牌，哪怕后两次被全局拦下
+	if tokens != 2 {
+		t.Errorf("单 IP 桶应剩 2 个令牌（继承原实现：全局拒绝时 IP 令牌照扣），实际 %d", tokens)
+	}
+}
+
+// TestIPRateLimiter_EvictsIdleFullBuckets 这次改动的目的：闲置且已回满的记录会被丢掉，
+// map 不再只增不减。
+func TestIPRateLimiter_EvictsIdleFullBuckets(t *testing.T) {
+	l, clock := newTestLimiter(2, 100000, time.Second)
+
+	for i := 0; i < 50; i++ {
+		l.Allow(fmt.Sprintf("203.0.113.%d", i))
+	}
+	if got := l.trackedIPs(); got != 50 {
+		t.Fatalf("应保留 50 条记录，实际 %d", got)
+	}
+
+	// 推进到「桶已回满」且「闲置超过 TTL」之后，下一次请求触发清扫
+	clock.Advance(rateLimitIdleTTL + rateLimitSweepInterval)
+	l.Allow("198.51.100.1")
+
+	// 旧的 50 条应被回收，只剩刚访问的这条
+	if got := l.trackedIPs(); got != 1 {
+		t.Errorf("闲置且回满的记录应被回收，期望剩 1 条，实际 %d 条", got)
+	}
+}
+
+// TestIPRateLimiter_KeepsBucketsThatAreStillDepleted 最关键的一条：
+// 没回满的记录绝不能被回收。
+//
+// 回收一个正在被限流的 IP 的记录，等于把它的欠账清零 —— 攻击者只要停够一个
+// 清扫周期就能重置配额，口令爆破的速率上限随之失效。
+func TestIPRateLimiter_KeepsBucketsThatAreStillDepleted(t *testing.T) {
+	// 填充间隔很长：桶耗尽后在测试时间尺度内回不满
+	l, clock := newTestLimiter(2, 100000, 24*time.Hour)
+
+	const attacker = "203.0.113.66"
+	l.Allow(attacker)
+	l.Allow(attacker)
+	if l.Allow(attacker).Allowed {
+		t.Fatal("配额应已耗尽")
+	}
+
+	// 闲置足够久，足以触发清扫，但桶远没回满
+	clock.Advance(rateLimitIdleTTL + rateLimitSweepInterval)
+	// 另一个 IP 的请求触发清扫
+	l.Allow("198.51.100.1")
+
+	l.mu.Lock()
+	_, stillTracked := l.buckets[attacker]
+	l.mu.Unlock()
+	if !stillTracked {
+		t.Fatal("没回满的记录被回收了：被限流的 IP 只要停一会儿就能重置配额")
+	}
+	if l.Allow(attacker).Allowed {
+		t.Error("被限流的 IP 在清扫之后拿回了配额，限流被绕过")
+	}
+}
+
+// TestIPRateLimiter_SweepIsThrottled 清扫是 O(记录数) 的全表扫描，不能每个请求都做。
+// 这里让记录「够格被回收」但让上次清扫时间很近，验证清扫确实被间隔挡住了。
+func TestIPRateLimiter_SweepIsThrottled(t *testing.T) {
+	l, clock := newTestLimiter(2, 100000, time.Second)
+
+	for i := 0; i < 20; i++ {
+		l.Allow(fmt.Sprintf("203.0.113.%d", i))
+	}
+
+	// 时间推过 TTL：这 20 条记录已经「够格」被回收（闲置且会回满）
+	clock.Advance(rateLimitIdleTTL)
+	// 但假设刚刚才清扫过
+	l.mu.Lock()
+	l.lastSweep = clock.Now()
+	l.mu.Unlock()
+
+	before := l.trackedIPs()
+	clock.Advance(rateLimitSweepInterval - time.Second)
+	l.Allow("198.51.100.1")
+	if got := l.trackedIPs(); got != before+1 {
+		t.Errorf("距上次清扫不足 %v 时不该清扫，期望 %d 条，实际 %d 条", rateLimitSweepInterval, before+1, got)
+	}
+
+	// 再越过清扫间隔，这批记录就该被回收了
+	clock.Advance(2 * time.Second)
+	l.Allow("198.51.100.2")
+	if got := l.trackedIPs(); got != 2 {
+		t.Errorf("越过清扫间隔后应回收旧记录，期望剩 2 条（两个新来源），实际 %d 条", got)
+	}
+}
+
+// TestIPRateLimiter_RespectsMaxEntries 记录数触顶时的行为：
+// 不再新增记录（内存有界），新来源降级为只受全局桶约束，不崩也不拒服务。
+func TestIPRateLimiter_RespectsMaxEntries(t *testing.T) {
+	l, _ := newTestLimiter(1, 100000, time.Hour)
+	l.maxEntries = 10 // 调小上限，避免测试里真的灌 10 万条
+
+	for i := 0; i < l.maxEntries; i++ {
+		if !l.Allow(fmt.Sprintf("203.0.113.%d", i)).Allowed {
+			t.Fatalf("第 %d 个 IP 的首次请求应放行", i+1)
+		}
+	}
+	if got := l.trackedIPs(); got != l.maxEntries {
+		t.Fatalf("记录数应为上限 %d，实际 %d", l.maxEntries, got)
+	}
+
+	// 再来 100 个新 IP：记录数不得增长
+	for i := 0; i < 100; i++ {
+		l.Allow(fmt.Sprintf("198.51.100.%d", i))
+	}
+	if got := l.trackedIPs(); got > l.maxEntries {
+		t.Errorf("记录数突破了上限：期望 <= %d，实际 %d", l.maxEntries, got)
+	}
+
+	// 已在表内的 IP 仍然正常受单 IP 配额约束（容量 1，已用过一次）
+	if l.Allow("203.0.113.0").Allowed {
+		t.Error("表内已有的 IP 应继续受单 IP 配额约束")
+	}
+
+	// 新来源降级为只受全局桶约束：全局桶还有令牌，所以放行
+	if !l.Allow("198.51.100.200").Allowed {
+		t.Error("触顶后的新来源应降级为只走全局桶（全局还有令牌时放行），而不是直接拒服务")
+	}
+}
+
+// TestIPRateLimiter_OverflowStillBoundedByGlobalBucket 触顶降级之后，
+// 总吞吐仍然被全局桶卡住 —— 这是降级策略能成立的前提。
+func TestIPRateLimiter_OverflowStillBoundedByGlobalBucket(t *testing.T) {
+	const globalCapacity = 3
+	l, _ := newTestLimiter(1, globalCapacity, time.Hour)
+	l.maxEntries = 1
+
+	// 先把唯一的记录位占掉，并消耗 1 个全局令牌
+	if !l.Allow("203.0.113.1").Allowed {
+		t.Fatal("首个 IP 应放行")
+	}
+
+	allowed := 0
+	for i := 0; i < 50; i++ {
+		if l.Allow(fmt.Sprintf("198.51.100.%d", i)).Allowed {
+			allowed++
+		}
+	}
+	// 全局桶一共 3 个令牌，已用掉 1 个，剩下最多再放 2 个
+	if allowed != globalCapacity-1 {
+		t.Errorf("触顶降级后仍应被全局桶卡住：期望再放行 %d 次，实际 %d 次", globalCapacity-1, allowed)
+	}
+}
+
+// TestIPRateLimiter_ConcurrentAccess 并发安全。
+// 单独跑意义有限，主要价值是在 go test -race 下暴露数据竞争。
+func TestIPRateLimiter_ConcurrentAccess(t *testing.T) {
+	l, _ := newTestLimiter(100, 1000000, time.Millisecond)
+
+	const (
+		goroutines = 32
+		perG       = 200
+	)
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < perG; i++ {
+				// 一半打同一个 IP（争同一个桶），一半打各自的 IP（争 map）
+				if i%2 == 0 {
+					l.Allow("203.0.113.1")
+				} else {
+					l.Allow(fmt.Sprintf("198.51.100.%d", g))
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	if got := l.trackedIPs(); got == 0 {
+		t.Error("并发访问后记录表不该是空的")
+	}
+}
+
+// TestIPRateLimiter_ConcurrentAllowAndSweep 清扫与放行并发时也不能 race。
+func TestIPRateLimiter_ConcurrentAllowAndSweep(t *testing.T) {
+	l, clock := newTestLimiter(5, 1000000, time.Millisecond)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 500; i++ {
+			l.Allow(fmt.Sprintf("203.0.113.%d", i%64))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 500; i++ {
+			// 不断推进时钟，让放行路径里的摊还清扫反复触发
+			clock.Advance(rateLimitSweepInterval)
+		}
+	}()
+	wg.Wait()
+}

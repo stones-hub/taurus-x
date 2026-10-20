@@ -1,31 +1,115 @@
-// 密码散列工具：SHA-256(password+salt)，与 admin_user_logins 表的
-// login_credential / salt 两列对应；scripts/sql/init.sql 里的初始管理员密码
-// 也是按同一算法算出来的。
+// 密码散列工具：新密码一律 bcrypt，写入 admin_user_logins.login_credential；
+// bcrypt 自带盐，salt 列在新算法下不再使用（统一写空串，列保留不动，
+// 老项目无需迁移表结构）。
 //
-// 注意 SHA-256 是快速散列，抗离线爆破能力弱，上生产应换 bcrypt / argon2id
-// （见项目 README「已知风险与待办」）。
+// 为什么还留着旧算法：历史版本用的是 SHA-256(password + salt)，库里已经存着这种
+// 散列。VerifyPassword 按存储值的格式自动分流 —— bcrypt 格式走 bcrypt，否则走旧
+// 算法做常量时间比较；AuthService.PasswordLogin 在旧格式校验通过后会立刻重算
+// bcrypt 写回（见 auth_service.go），所以用户登录一次就自动升级，不需要重置密码。
+//
+// scripts/sql/init.sql 里的初始管理员散列由 taurus-x 生成器用同一套 bcrypt 参数
+// 算出（internal/generator/password.go），salt 列写空串。
 package helper
 
 import (
-	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
+	"errors"
+	"strings"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
-// GenerateSalt 生成随机盐值（16 字节 → 32 位 hex）
-func GenerateSalt() string {
-	bytes := make([]byte, 16)
-	_, _ = rand.Read(bytes)
-	return hex.EncodeToString(bytes)
+// bcryptCost bcrypt 的 cost（2^cost 轮）。
+//
+// 取舍：cost 每 +1，散列耗时翻倍 —— 对离线爆破者和对我们自己的登录接口是同一个
+// 倍数。DefaultCost = 10 在当前主流机器上约 50~100ms，既能让离线爆破的单位成本
+// 比 SHA-256 高出好几个数量级，又不至于让登录接口变成 CPU 瓶颈（配合
+// middleware 里的登录限流，在线撞库本就撞不出几次）。
+// 换机器或提高安全要求时只需调大这个常量：老散列把 cost 编码在自己的字符串里，
+// 校验不受影响，用户下次登录……不会自动重算 cost（只有旧 SHA-256 格式会触发
+// 升级），要全量提升得另写一次性脚本。
+const bcryptCost = bcrypt.DefaultCost
+
+// MaxPasswordBytes bcrypt 的输入上限：超过 72 字节的部分会被算法直接忽略。
+// 这意味着「前 72 字节相同的两个长密码」互相可以登录，所以必须显式拒绝，
+// 不能静默截断。
+const MaxPasswordBytes = 72
+
+// ErrPasswordTooLong 密码超过 bcrypt 的 72 字节上限。
+// 注意是**字节**：一个中文字符在 UTF-8 下占 3 字节，24 个汉字就到顶了。
+var ErrPasswordTooLong = errors.New("密码长度不能超过 72 字节（一个汉字算 3 字节）")
+
+// HashPassword 生成密码的 bcrypt 散列。返回值可直接写入 login_credential，
+// 对应的 salt 列写空串。
+//
+// 密码超过 72 字节时返回 ErrPasswordTooLong —— 调用方必须把错误回给用户，
+// 不允许自己截断后再散列。
+func HashPassword(password string) (string, error) {
+	if len(password) > MaxPasswordBytes {
+		return "", ErrPasswordTooLong
+	}
+	hashed, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
+	if err != nil {
+		return "", err
+	}
+	return string(hashed), nil
 }
 
-// HashPassword 使用盐值哈希密码：SHA-256(password + salt)
-func HashPassword(password, salt string) string {
+// IsBcryptHash 判断存储值是不是 bcrypt 格式。
+// 只认 $2a$ / $2b$ / $2y$ 三个前缀：$2$ / $2x$ 是有已知缺陷的历史变体，
+// Go 的 bcrypt 本来也不生成，不在这里放行。
+//
+// 「不放行」的具体后果要说清楚：这两种前缀会被当成**旧格式**，于是
+// VerifyPassword 走下面那条 SHA-256 分支，拿 `$2$...` 这串字符去和
+// SHA-256 的 hex 比较 —— 长度和字符集都对不上，必然不通过。
+// 也就是说，库里真有这种值的话，那个账号登不进去，只能走管理员重置
+// （bin/hashpw + 直接改库）。这是**刻意选的方向**：
+// 存疑的凭证格式应当拒绝（fail closed），而不是顺手交给 bcrypt 去试 ——
+// $2x$ 本就是为兼容一个有缺陷的实现而存在的，放行等于默认接受那个缺陷。
+// Go 的 bcrypt 只生成 $2a$，所以本项目写出去的散列不会落到这条路上。
+func IsBcryptHash(stored string) bool {
+	return strings.HasPrefix(stored, "$2a$") ||
+		strings.HasPrefix(stored, "$2b$") ||
+		strings.HasPrefix(stored, "$2y$")
+}
+
+// LegacyHashPassword 旧算法：SHA-256(password + salt) 的小写 hex。
+//
+// **只用于校验历史数据和测试构造，不要用它生成新密码**（新密码走 HashPassword）。
+// 保留导出是因为测试需要造出「库里存着旧散列」的现场。
+func LegacyHashPassword(password, salt string) string {
 	hash := sha256.Sum256([]byte(password + salt))
 	return hex.EncodeToString(hash[:])
 }
 
-// VerifyPassword 验证密码
-func VerifyPassword(password, hashedPassword, salt string) bool {
-	return HashPassword(password, salt) == hashedPassword
+// VerifyPassword 校验密码。stored 是库里的 login_credential，salt 是同行的 salt 列。
+//
+// 分流规则：stored 是 bcrypt 格式就走 bcrypt（salt 参数被忽略，bcrypt 的盐在
+// 散列串里），否则按旧算法比较。两条路径都是常量时间比较：bcrypt 的
+// CompareHashAndPassword 内部已经是，旧路径用 subtle.ConstantTimeCompare，
+// 避免按字节提前返回泄漏前缀匹配长度。
+//
+// stored 为空串（没设过密码 / 数据异常）一律不通过：空串既不是 bcrypt 格式，
+// 旧路径也不可能有哪个密码的 SHA-256 等于空串。
+func VerifyPassword(password, stored, salt string) bool {
+	if stored == "" {
+		return false
+	}
+	if IsBcryptHash(stored) {
+		// 超长密码在 HashPassword 处就被拒了，这里也不给它机会：
+		// 否则 bcrypt 会只比较前 72 字节，等于默认接受了截断语义。
+		if len(password) > MaxPasswordBytes {
+			return false
+		}
+		return bcrypt.CompareHashAndPassword([]byte(stored), []byte(password)) == nil
+	}
+	return subtle.ConstantTimeCompare([]byte(LegacyHashPassword(password, salt)), []byte(stored)) == 1
+}
+
+// NeedsRehash 存储值是否需要升级成 bcrypt（即当前是旧格式）。
+// 调用方应在**校验通过之后**才问这个问题，然后重算 bcrypt 写回。
+func NeedsRehash(stored string) bool {
+	return !IsBcryptHash(stored)
 }

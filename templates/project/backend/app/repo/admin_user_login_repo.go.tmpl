@@ -4,7 +4,6 @@ import (
 	"context"
 
 	"{{ .Module }}/app/constants"
-	"{{ .Module }}/app/helper"
 	"gorm.io/gorm"
 
 	"{{ .Module }}/app/model"
@@ -29,10 +28,17 @@ func (r *AdminUserLoginRepository) FindByLoginTypeAndValueAnyStatus(ctx context.
 	return r.firstBy(ctx, "login_type = ? AND login_value = ?", loginType, loginValue)
 }
 
-// SyncPassword 设置/更新用户名密码登录方式（内部辅助）
-func (r *AdminUserLoginRepository) SyncPassword(ctx context.Context, userID uint64, username, password string) error {
-	salt := helper.GenerateSalt()
-	hashed := helper.HashPassword(password, salt)
+// SyncPasswordHash 设置/更新用户名密码登录方式（内部辅助）。
+//
+// 入参是**已经算好的** bcrypt 散列，不是明文。这里刻意不自己调 HashPassword：
+// 这个方法会在事务里被调用，而 bcrypt 是故意慢的（cost=10 约 50~100ms），
+// 在事务内算就等于凭空多持 100ms 的行锁。散列由调用方在进事务之前算好，
+// 顺带也让「密码超长」这类错误在开事务之前就返回。
+//
+// 写入的一律是 bcrypt 散列，salt 列显式写空串 —— bcrypt 的盐在散列串里，
+// 这一列只是历史遗留。更新老账号时也要把 salt 清掉，否则库里会留着
+// 「bcrypt 散列 + 旧盐」这种自相矛盾的行，后面排查起来容易误判算法。
+func (r *AdminUserLoginRepository) SyncPasswordHash(ctx context.Context, userID uint64, username, hashedPassword string) error {
 	login, err := r.FindByUserIDAndLoginTypeAnyStatus(ctx, userID, string(constants.LoginTypeUsername))
 	if err != nil {
 		return err
@@ -42,16 +48,35 @@ func (r *AdminUserLoginRepository) SyncPassword(ctx context.Context, userID uint
 			UserID:          userID,
 			LoginType:       string(constants.LoginTypeUsername),
 			LoginValue:      username,
-			LoginCredential: hashed,
-			Salt:            salt,
+			LoginCredential: hashedPassword,
+			Salt:            "",
 			Status:          1,
 		})
 	}
-	err = r.db.WithContext(ctx).Model(&model.AdminUserLogin{}).Where("login_id = ?", login.LoginID).Updates(map[string]interface{}{
-		"login_credential": hashed,
-		"salt":             salt,
+	return r.db.WithContext(ctx).Model(&model.AdminUserLogin{}).Where("login_id = ?", login.LoginID).Updates(map[string]interface{}{
+		"login_credential": hashedPassword,
+		"salt":             "",
 	}).Error
-	return err
+}
+
+// UpgradeCredentialIfUnchanged 把 login_credential 从旧散列原子升级为 bcrypt，
+// 同时把 salt 置空。返回是否真的更新了。
+//
+// WHERE 里带上 oldCredential 是必须的：登录校验与这次写回之间不持锁，
+// 如果期间本人改密或管理员重置了密码，无条件更新就会用旧密码的 bcrypt 覆盖
+// 新密码 —— 相当于把密码改回去。带旧值的条件更新在这种情况下命中 0 行，
+// 调用方据此放弃升级（见 AuthService.upgradeLegacyCredential）。
+func (r *AdminUserLoginRepository) UpgradeCredentialIfUnchanged(ctx context.Context, loginID uint64, oldCredential, newCredential string) (bool, error) {
+	res := r.db.WithContext(ctx).Model(&model.AdminUserLogin{}).
+		Where("login_id = ? AND login_credential = ?", loginID, oldCredential).
+		Updates(map[string]interface{}{
+			"login_credential": newCredential,
+			"salt":             "",
+		})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected > 0, nil
 }
 
 // UserLogin 返回用户登录态仓储

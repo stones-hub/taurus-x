@@ -13,9 +13,14 @@ import (
 
 // RateLimitMiddleware 组合限流中间件（IP 维度组合限流 + 基础限流），
 // 配置取 http.rate_limit.composite / http.rate_limit.basic。
+//
+// IP 维度那一层用项目内的 ipRateLimiter（见 ip_rate_limiter.go）：限流语义与
+// 公共库的 tlimit.CompositeRateLimiter 一致，但 per-IP 记录会自动回收，
+// 不会随来访 IP 数无上限增长。基础限流是单个全局桶，没有 per-IP map，
+// 继续直接用公共库的实现。
 func RateLimitMiddleware() func(next http.Handler) http.Handler {
 	var (
-		compositeLimiter *tlimit.CompositeRateLimiter
+		compositeLimiter *ipRateLimiter
 		basicLimiter     *tlimit.RateLimiter
 		once             sync.Once
 	)
@@ -58,7 +63,7 @@ var sensitiveRateLimitDefaults = map[string]rateLimitRule{
 // 参数取 http.rate_limit.sensitive.<name>.*，缺失时用 sensitiveRateLimitDefaults。
 func NamedRateLimitMiddleware(name string) func(next http.Handler) http.Handler {
 	var (
-		limiter *tlimit.CompositeRateLimiter
+		limiter *ipRateLimiter
 		once    sync.Once
 	)
 	return func(next http.Handler) http.Handler {
@@ -71,7 +76,7 @@ func NamedRateLimitMiddleware(name string) func(next http.Handler) http.Handler 
 
 // serveRateLimited 限流判定的纯参数版本（限流器由调用方给定），便于测试。
 // limiter 为 nil 表示该接口没配出有效的限流参数，直接放行。
-func serveRateLimited(w http.ResponseWriter, r *http.Request, limiter *tlimit.CompositeRateLimiter, next http.Handler) {
+func serveRateLimited(w http.ResponseWriter, r *http.Request, limiter *ipRateLimiter, next http.Handler) {
 	if limiter != nil && !limiter.Allow(ClientIP(r)).Allowed {
 		httpx.SendResponse(w, http.StatusTooManyRequests, "请求过于频繁，请稍后重试", nil)
 		return
@@ -80,12 +85,12 @@ func serveRateLimited(w http.ResponseWriter, r *http.Request, limiter *tlimit.Co
 }
 
 // newSensitiveLimiter 按名字构造敏感接口限流器。
-func newSensitiveLimiter(name string) *tlimit.CompositeRateLimiter {
+func newSensitiveLimiter(name string) *ipRateLimiter {
 	rule := resolveSensitiveRule(name, taurus.Container.Config.GetInt)
 	if rule.IPCapacity <= 0 || rule.GlobalCapacity <= 0 || rule.FillSeconds <= 0 {
 		return nil
 	}
-	return tlimit.NewCompositeRateLimiter(rule.IPCapacity, rule.GlobalCapacity, time.Duration(rule.FillSeconds)*time.Second)
+	return newIPRateLimiter(rule.IPCapacity, rule.GlobalCapacity, time.Duration(rule.FillSeconds)*time.Second)
 }
 
 // resolveSensitiveRule 合并配置与内置默认值；getInt 返回 0 视为「未配置」。
@@ -105,7 +110,7 @@ func resolveSensitiveRule(name string, getInt func(string) int) rateLimitRule {
 }
 
 // initLimiters 延迟初始化限流器
-func initLimiters(composite **tlimit.CompositeRateLimiter, basic **tlimit.RateLimiter) {
+func initLimiters(composite **ipRateLimiter, basic **tlimit.RateLimiter) {
 	config := taurus.Container.Config
 
 	if config.GetBool("http.rate_limit.composite.enabled") {
@@ -113,7 +118,7 @@ func initLimiters(composite **tlimit.CompositeRateLimiter, basic **tlimit.RateLi
 		globalCapacity := config.GetInt("http.rate_limit.composite.global_capacity")
 		fillInterval := time.Duration(config.GetInt("http.rate_limit.composite.fill_interval")) * time.Second
 		if ipCapacity > 0 && globalCapacity > 0 && fillInterval > 0 {
-			*composite = tlimit.NewCompositeRateLimiter(ipCapacity, globalCapacity, fillInterval)
+			*composite = newIPRateLimiter(ipCapacity, globalCapacity, fillInterval)
 		}
 	}
 
@@ -128,7 +133,7 @@ func initLimiters(composite **tlimit.CompositeRateLimiter, basic **tlimit.RateLi
 
 // checkRateLimit 执行限流检查。
 // 限流键用 ClientIP（只在可信代理后面才采信转发头），客户端伪造 X-Real-IP 换不到新配额。
-func checkRateLimit(r *http.Request, composite *tlimit.CompositeRateLimiter, basic *tlimit.RateLimiter) bool {
+func checkRateLimit(r *http.Request, composite *ipRateLimiter, basic *tlimit.RateLimiter) bool {
 	clientID := ClientIP(r)
 
 	if composite != nil {

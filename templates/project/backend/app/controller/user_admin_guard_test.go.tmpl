@@ -926,8 +926,12 @@ func TestUpdateUserRoles_NonSuperAdminCannotRevokeSuperAdmin(t *testing.T) {
 // （先 admin_users 再 admin_user_logins），避免与管理员重置密码互为相反顺序而死锁。
 func TestChangePassword_SuperAdminSelfServiceStillWorks(t *testing.T) {
 	const oldPwd = "Old1pass"
-	salt := helper.GenerateSalt()
-	credential := helper.HashPassword(oldPwd, salt)
+	// 库里存的是 bcrypt 散列，salt 列恒为空串（见 app/helper/crypto.go）
+	credential, err := helper.HashPassword(oldPwd)
+	if err != nil {
+		t.Fatalf("构造测试散列失败: %v", err)
+	}
+	const salt = ""
 
 	t.Run("旧密码正确则改密并吊销会话", func(t *testing.T) {
 		c, mock := newUserController(t)
@@ -987,6 +991,34 @@ func TestChangePassword_SuperAdminSelfServiceStillWorks(t *testing.T) {
 
 		if got := respCode(t, rec); got == http.StatusOK {
 			t.Error("账号已不存在时不能改密成功")
+		}
+		assertNoUnexpectedSQL(t, mock)
+	})
+
+	// 历史账号：库里存的还是 SHA-256(password + salt)。自助改密必须认这种旧凭证，
+	// 否则「老用户改密码」会卡在旧密码校验上 —— 而这正是他们摆脱旧算法的入口。
+	t.Run("旧 SHA-256 凭证也能改密", func(t *testing.T) {
+		c, mock := newUserController(t)
+
+		const legacySalt = "0123456789abcdef0123456789abcdef"
+		legacyCredential := helper.LegacyHashPassword(oldPwd, legacySalt)
+
+		mock.ExpectBegin()
+		expectLockUserRow(mock, operatorSuperID, "super")
+		mock.ExpectQuery(sel("admin_user_logins")).WillReturnRows(
+			sqlmock.NewRows([]string{"login_id", "user_id", "login_type", "login_credential", "salt"}).
+				AddRow(3, operatorSuperID, string(constants.LoginTypeUsername), legacyCredential, legacySalt))
+		mock.ExpectExec(upd("admin_user_logins")).WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec(upd("admin_users")).WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectCommit()
+
+		rec := httptest.NewRecorder()
+		c.ChangePassword(rec, jwtRequest(t, operatorSuperID, dto.ChangePasswordRequest{
+			OldPassword: oldPwd, NewPassword: "New1pass",
+		}))
+
+		if got := respCode(t, rec); got != http.StatusOK {
+			t.Errorf("旧散列账号应能改密，实际 body.code = %d，body = %s", got, rec.Body.String())
 		}
 		assertNoUnexpectedSQL(t, mock)
 	})

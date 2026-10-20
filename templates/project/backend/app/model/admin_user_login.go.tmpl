@@ -4,14 +4,18 @@ import (
 	"time"
 )
 
-// AdminUserLogin 用户登录方式表（admin_user_logins，密码 hash + 盐存于此）
+// AdminUserLogin 用户登录方式表（admin_user_logins，密码 bcrypt 散列存于此）。
+//
+// Salt 是历史遗留列：bcrypt 的盐编码在散列串里，新写入一律空串。
+// 只有老项目里残留的 SHA-256 散列才会有非空 salt，登录时会被自动升级
+// （见 app/helper/crypto.go 与 AuthService.PasswordLogin）。
 type AdminUserLogin struct {
 	LoginID         uint64    `json:"login_id" gorm:"primaryKey;autoIncrement;column:login_id;comment:登录方式ID"`
 	UserID          uint64    `json:"user_id" gorm:"uniqueIndex:uk_user_login_type;index:idx_user_id;not null;column:user_id;comment:用户ID"`
 	LoginType       string    `json:"login_type" gorm:"uniqueIndex:uk_login_type_value;uniqueIndex:uk_user_login_type;index:idx_login_type;size:64;not null;column:login_type;comment:登录类型"`
 	LoginValue      string    `json:"login_value" gorm:"uniqueIndex:uk_login_type_value;size:100;not null;column:login_value;comment:登录标识"`
-	LoginCredential string    `json:"login_credential" gorm:"size:255;not null;default:'';column:login_credential;comment:登录凭证（密码hash）"`
-	Salt            string    `json:"salt" gorm:"size:32;not null;default:'';column:salt;comment:密码盐值"`
+	LoginCredential string    `json:"login_credential" gorm:"size:255;not null;default:'';column:login_credential;comment:登录凭证（bcrypt 散列）"`
+	Salt            string    `json:"salt" gorm:"size:32;not null;default:'';column:salt;comment:历史遗留盐值；bcrypt 下不使用，恒为空串"`
 	Status          int8      `json:"status" gorm:"index:idx_status;not null;default:1;column:status;comment:状态：1启用，0禁用"`
 	CreatedAt       time.Time `json:"created_at" gorm:"not null;default:CURRENT_TIMESTAMP;column:created_at;comment:创建时间"`
 	UpdatedAt       time.Time `json:"updated_at" gorm:"not null;default:CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;column:updated_at;comment:修改时间"`

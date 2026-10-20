@@ -1,0 +1,130 @@
+package repo
+
+import (
+	"context"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+
+	"gorm.io/gorm"
+)
+
+// 日志清理语句的形状回归。
+//
+// 这条 DELETE 有两处写错了就会出事，而且都不会报错：
+//   - WHERE 丢了或条件写反 → 把保留期内的日志（甚至整张表）删掉；
+//   - LIMIT 丢了 → 第一次清理变成一条删几百万行的巨型事务，
+//     undo log 暴涨、从库延迟、行锁长时间不放，业务查询被拖住。
+//
+// 所以这里用 DryRun 把 GORM 真正构建出的语句抓出来断言，而不是读代码确认。
+// 用真实的 MySQL dialector，和生产同一套 SQL 构建逻辑；DryRun 让语句只构建不执行，
+// 既不连数据库，也不引入 SQLite 这种语义不同的替身。
+
+// captureDelete 走真实仓储的删除路径，返回 GORM 实际构建出的语句。
+func captureDelete(t *testing.T, run func(r *LogRetentionRepository)) *gorm.Statement {
+	t.Helper()
+	db := newDryRunDB(t)
+
+	var captured *gorm.Statement
+	if err := db.Callback().Delete().After("gorm:delete").Register("test:capture_delete", func(tx *gorm.DB) {
+		captured = tx.Statement
+	}); err != nil {
+		t.Fatalf("注册 delete 回调失败: %v", err)
+	}
+
+	run(NewLogRetentionRepositoryWithDB(db))
+	if captured == nil {
+		t.Fatal("没有捕获到 DELETE 语句")
+	}
+	return captured
+}
+
+// TestLogRetentionDeleteSQL_HasTimeConditionAndLimit 四张日志表逐一验证：
+// 语句必须是「按各自的时间列做范围条件 + LIMIT 分批」。
+func TestLogRetentionDeleteSQL_HasTimeConditionAndLimit(t *testing.T) {
+	cutoff := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	const limit = 5000
+
+	if len(LogRetentionTargets) != 4 {
+		t.Fatalf("待清理的日志表应有 4 张（访问/操作/前端错误/登录），实际 %d 张", len(LogRetentionTargets))
+	}
+
+	for _, target := range LogRetentionTargets {
+		t.Run(target.Table, func(t *testing.T) {
+			stmt := captureDelete(t, func(r *LogRetentionRepository) {
+				if _, err := r.DeleteOlderThan(context.Background(), target, cutoff, limit); err != nil {
+					t.Fatalf("构建删除语句失败: %v", err)
+				}
+			})
+			sql := stmt.SQL.String()
+
+			// 表名必须是这张表：清单里写错表就会删错数据
+			if !strings.Contains(sql, "`"+target.Table+"`") {
+				t.Errorf("语句删的不是 %s\nSQL: %s", target.Table, sql)
+			}
+			// 时间条件：必须是「早于 cutoff」，不能是 > 也不能没有
+			wantWhere := regexp.MustCompile("WHERE " + regexp.QuoteMeta(target.TimeColumn) + " < \\?")
+			if !wantWhere.MatchString(sql) {
+				t.Errorf("缺少按 %s 的时间下界条件（写错会删到保留期内的数据）\nSQL: %s", target.TimeColumn, sql)
+			}
+			// 分批上限：没有 LIMIT 就会变成一条删光全表的巨型事务
+			if !strings.Contains(sql, "LIMIT") {
+				t.Errorf("缺少 LIMIT，批量删除会变成长事务并锁表\nSQL: %s", sql)
+			}
+			// 绑定变量就是 cutoff 本身，没有被改写
+			if len(stmt.Vars) == 0 || stmt.Vars[0] != cutoff {
+				t.Errorf("时间条件的绑定变量应为 cutoff %v，实际 %v", cutoff, stmt.Vars)
+			}
+			// LIMIT 也是占位符，它的值必须是传进来的批大小
+			if len(stmt.Vars) != 2 || stmt.Vars[1] != limit {
+				t.Errorf("绑定变量应为 [cutoff, limit]，实际 %v", stmt.Vars)
+			}
+			// WHERE 子句里不该出现任何别的过滤条件：删除只由时间决定，便于审计。
+			// （LIMIT 的占位符不算，所以只数 WHERE 到 LIMIT 之间这一段。）
+			where := sql[strings.Index(sql, "WHERE"):strings.Index(sql, "LIMIT")]
+			if strings.Count(where, "?") != 1 {
+				t.Errorf("删除条件只应有「时间」一个占位符，实际 %d 个\nSQL: %s", strings.Count(where, "?"), sql)
+			}
+		})
+	}
+}
+
+// TestLogRetentionTargets_CoverAllLogTables 清单漏一张表，那张表就永远不会被清理。
+func TestLogRetentionTargets_CoverAllLogTables(t *testing.T) {
+	want := map[string]string{
+		"admin_access_logs":      "created_at",
+		"admin_operation_logs":   "created_at",
+		"admin_front_error_logs": "created_at",
+		// 登录日志的时间列不是 created_at，照搬会生成一条无效 SQL
+		"admin_user_login_logs": "login_time",
+	}
+	got := make(map[string]string, len(LogRetentionTargets))
+	for _, target := range LogRetentionTargets {
+		got[target.Table] = target.TimeColumn
+	}
+	for table, column := range want {
+		if got[table] != column {
+			t.Errorf("表 %s 的时间列应为 %q，实际 %q", table, column, got[table])
+		}
+	}
+}
+
+// TestLogRetentionDeleteOlderThan_RejectsBadInput 防御性检查：
+// 没有数据库时报错而不是 panic；limit 非正会退化成「不带 LIMIT 删全表」，必须拒掉。
+func TestLogRetentionDeleteOlderThan_RejectsBadInput(t *testing.T) {
+	target := LogRetentionTargets[0]
+	cutoff := time.Now()
+
+	nilDB := NewLogRetentionRepositoryWithDB(nil)
+	if _, err := nilDB.DeleteOlderThan(context.Background(), target, cutoff, 100); err == nil {
+		t.Error("数据库未初始化时应返回错误")
+	}
+
+	r := NewLogRetentionRepositoryWithDB(newDryRunDB(t))
+	for _, limit := range []int{0, -1} {
+		if _, err := r.DeleteOlderThan(context.Background(), target, cutoff, limit); err == nil {
+			t.Errorf("limit=%d 应被拒绝（否则会退化成不分批的全表删除）", limit)
+		}
+	}
+}

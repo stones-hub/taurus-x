@@ -2,14 +2,20 @@ package generator
 
 import (
 	"bytes"
+	"io/fs"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
 
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/stones-hub/taurus-x/internal/components"
+	"github.com/stones-hub/taurus-x/templates"
 )
 
 // tmpRoot 测试产物统一放到 /tmp/taurusx-test-*，不落在仓库里。
@@ -74,6 +80,10 @@ func TestGenerate_Combinations(t *testing.T) {
 			assertSessionRevocationWiring(t, outDir)
 			assertUserManageGuardWiring(t, outDir)
 			assertStartupSelfCheckWiring(t, outDir)
+			assertPasswordHashing(t, outDir)
+			assertSystemPermissionOnlyPromotable(t, outDir)
+			assertRateLimiterBounded(t, outDir)
+			assertLogRetentionWiring(t, outDir)
 			assertEnvFileFailFast(t, outDir)
 			assertSQLLogNoLeak(t, outDir)
 			assertLoginAuditStatus(t, outDir)
@@ -91,12 +101,15 @@ func TestGenerate_Combinations(t *testing.T) {
 	}
 }
 
-// adminLoginInsertPattern 从生成的 init.sql 里取出初始管理员的散列与 salt。
-var adminLoginInsertPattern = regexp.MustCompile(`\(1, 'username', '[^']*', '([0-9a-f]{64})', '([0-9a-f]{32})', 1\)`)
+// adminLoginInsertPattern 从生成的 init.sql 里取出初始管理员的 bcrypt 散列。
+//
+// 同时把 salt 列必须是空串钉进正则：bcrypt 的盐在散列串里，salt 列只是历史遗留，
+// 写了值就说明生成侧还在按旧算法走。
+var adminLoginInsertPattern = regexp.MustCompile(`\(1, 'username', '[^']*', '(\$2[aby]\$[^']{50,})', '', 1\)`)
 
 // assertInitialSecrets 初始凭证相关的硬要求：
 //
-//  1. init.sql 里的散列确实是 CLI 打印的那个随机密码算出来的（否则用户照提示登不进去）；
+//  1. init.sql 里的散列确实能校验出 CLI 打印的那个随机密码（否则用户照提示登不进去）；
 //  2. 明文初始密码不出现在任何生成文件里（只在终端打印一次）；
 //  3. .env.example 不带可直接用的 JWT 密钥，且留空（该文件会进使用者的版本库）。
 func assertInitialSecrets(t *testing.T, outDir string, result *Result) {
@@ -106,15 +119,19 @@ func assertInitialSecrets(t *testing.T, outDir string, result *Result) {
 		t.Fatal("生成结果未返回初始管理员密码")
 	}
 
-	// 1. init.sql 的散列 / salt 与随机密码一致
+	// 1. init.sql 的散列能校验出返回的随机密码。
+	//
+	//    这里**不能**再用「重算一遍散列比字符串」的办法：bcrypt 自带随机盐，
+	//    同一密码每次散列都不同。唯一有意义的断言是拿散列去校验密码 ——
+	//    这也正是生成项目登录时做的事。
 	sql := readFile(t, filepath.Join(outDir, "scripts", "sql", "init.sql"))
 	m := adminLoginInsertPattern.FindStringSubmatch(sql)
 	if m == nil {
-		t.Fatal("init.sql 里找不到形如 (1, 'username', ..., <64位散列>, <32位salt>, 1) 的初始管理员登录记录")
+		t.Fatal("init.sql 里找不到形如 (1, 'username', ..., '<bcrypt 散列>', '', 1) 的初始管理员登录记录")
 	}
-	gotHash, gotSalt := m[1], m[2]
-	if want := passwordHash(result.AdminPassword, gotSalt); gotHash != want {
-		t.Error("init.sql 里的散列与返回的初始密码不一致：按提示登录会失败")
+	gotHash := m[1]
+	if err := bcrypt.CompareHashAndPassword([]byte(gotHash), []byte(result.AdminPassword)); err != nil {
+		t.Errorf("init.sql 里的 bcrypt 散列校验不过返回的初始密码：按提示登录会失败（%v）", err)
 	}
 
 	// 2. 明文密码不能出现在生成产物里（含 README / SQL / .env.example）
@@ -441,7 +458,7 @@ func assertUserManageGuardWiring(t *testing.T, outDir string) {
 		{
 			file:   filepath.Join("app", "service", "user_service.go"),
 			fn:     "func (s *AdminUserService) UpdateUser(",
-			writes: []string{"UpdateByID(", "SyncPassword(", "replaceUserRolesTx("},
+			writes: []string{"UpdateByID(", "SyncPasswordHash(", "replaceUserRolesTx("},
 		},
 		{
 			file:   filepath.Join("app", "service", "user_service.go"),
@@ -850,6 +867,435 @@ func assertStartupSelfCheckWiring(t *testing.T, outDir string) {
 	startup := readFile(t, filepath.Join(backend, "app", "helper", "startup_check.go"))
 	if !strings.Contains(startup, "func ValidateStartupSecurity(getString func(key string) string) error") {
 		t.Error("helper 缺少可测的 ValidateStartupSecurity(getString) 契约入口")
+	}
+}
+
+// assertPasswordHashing 密码散列算法的落地契约（T5 第 1 项）。
+//
+// 这几条断言钉的是「新密码一律 bcrypt、老散列登录即升级」这条链路在生成项目里
+// 真实存在。退化的后果是静默的：散列算法退回 SHA-256 不会有任何报错，
+// 功能照常，只是库被拖走之后口令能被离线批量爆破。
+func assertPasswordHashing(t *testing.T, outDir string) {
+	t.Helper()
+
+	backend := filepath.Join(outDir, "backend")
+	crypto := readFile(t, filepath.Join(backend, "app", "helper", "crypto.go"))
+
+	// 1. 生成新散列只能走 bcrypt，且 cost 不低于 10
+	if !strings.Contains(crypto, "bcrypt.GenerateFromPassword") {
+		t.Error("helper.HashPassword 必须用 bcrypt.GenerateFromPassword 生成新散列")
+	}
+	if !strings.Contains(crypto, "const bcryptCost = bcrypt.DefaultCost") {
+		t.Error("bcryptCost 应取 bcrypt.DefaultCost（=10）：cost 低于 10 的 bcrypt 已经不足以抵御离线爆破")
+	}
+	// 旧算法只允许出现在「校验历史数据」的路径上，不能用来生成新密码
+	hash := funcBody(crypto, "func HashPassword(password string) (string, error) {")
+	if hash == "" {
+		t.Fatal("crypto.go 找不到 HashPassword")
+	}
+	if strings.Contains(hash, "sha256") || strings.Contains(hash, "LegacyHashPassword") {
+		t.Error("HashPassword 里出现了旧算法：新密码必须一律 bcrypt")
+	}
+
+	// 2. 超过 72 字节必须显式拒绝，不能静默截断（否则「前 72 字节相同」的两个密码互通）
+	if !strings.Contains(crypto, "MaxPasswordBytes = 72") || !strings.Contains(crypto, "ErrPasswordTooLong") {
+		t.Error("crypto.go 缺少 72 字节上限与 ErrPasswordTooLong：bcrypt 会忽略超出部分，必须拒绝而不是截断")
+	}
+	if !strings.Contains(hash, "return \"\", ErrPasswordTooLong") {
+		t.Error("HashPassword 必须对超长密码返回 ErrPasswordTooLong")
+	}
+
+	// 3. 校验按存储格式分流，旧路径用常量时间比较
+	verify := funcBody(crypto, "func VerifyPassword(password, stored, salt string) bool {")
+	if verify == "" {
+		t.Fatal("crypto.go 找不到 VerifyPassword")
+	}
+	for _, want := range []string{"IsBcryptHash(stored)", "bcrypt.CompareHashAndPassword", "subtle.ConstantTimeCompare"} {
+		if !strings.Contains(verify, want) {
+			t.Errorf("VerifyPassword 缺少 %q", want)
+		}
+	}
+	// 只认 Go 会生成的三个前缀：$2$ / $2x$ 是有缺陷的历史变体
+	isBcrypt := funcBody(crypto, "func IsBcryptHash(stored string) bool {")
+	for _, want := range []string{`"$2a$"`, `"$2b$"`, `"$2y$"`} {
+		if !strings.Contains(isBcrypt, want) {
+			t.Errorf("IsBcryptHash 缺少前缀 %s", want)
+		}
+	}
+
+	// 4. 旧散列登录成功后立刻升级，且必须在事务提交之后 ——
+	//    放在事务里的话，写回失败会把「校验已通过」一起回滚掉，用户登不进去。
+	authSrc := readFile(t, filepath.Join(backend, "app", "service", "auth_service.go"))
+	login := funcBody(authSrc, "func (s *AuthService) PasswordLogin(")
+	if login == "" {
+		t.Fatal("auth_service.go 找不到 PasswordLogin")
+	}
+	if !strings.Contains(login, "helper.NeedsRehash(") {
+		t.Error("PasswordLogin 必须用 helper.NeedsRehash 识别旧格式散列并触发升级")
+	}
+	if !strings.Contains(login, "s.upgradeLegacyCredential(") {
+		t.Error("PasswordLogin 未调用 upgradeLegacyCredential：旧散列永远不会被升级")
+	}
+	// 事务闭包的范围就是「提交之前」，升级调用不能落在里面
+	txBody := blockAfter(login, "s.store.RunInTx(ctx, func(tx *repo.Tx) error {")
+	if txBody == "" {
+		t.Fatal("PasswordLogin 找不到事务闭包")
+	}
+	if strings.Contains(txBody, "upgradeLegacyCredential(") {
+		t.Error("散列升级必须在事务提交之后：写回失败不能回滚掉已经成功的登录")
+	}
+	// 写回要带上刚校验过的旧值做条件，否则会覆盖掉并发改密的结果
+	upgrade := funcBody(authSrc, "func (s *AuthService) upgradeLegacyCredential(")
+	if !strings.Contains(upgrade, "UpgradeCredentialIfUnchanged(") {
+		t.Error("散列写回必须走 UpgradeCredentialIfUnchanged（WHERE 带旧值），否则可能覆盖并发改密")
+	}
+	if strings.Contains(upgrade, "AuthVersion") || strings.Contains(upgrade, "auth_version") {
+		t.Error("散列升级不得动 auth_version：那会把用户自己刚建立的会话踢掉")
+	}
+
+	// 5. 旧的「生成盐」入口不得残留：留着就会有人继续用它建新密码
+	if strings.Contains(crypto, "func GenerateSalt(") {
+		t.Error("crypto.go 仍保留 GenerateSalt：bcrypt 自带盐，这个入口只会把人引回旧算法")
+	}
+
+	// 6. 自带「忘记管理员密码」的离线工具：只从 stdin 读、只输出散列
+	hashpw := readFile(t, filepath.Join(backend, "bin", "hashpw", "main.go"))
+	if !strings.Contains(hashpw, "helper.HashPassword(") {
+		t.Error("bin/hashpw 必须复用 helper.HashPassword，不能自己实现一套散列")
+	}
+	if !strings.Contains(hashpw, "os.Stdin") {
+		t.Error("bin/hashpw 必须从标准输入读密码")
+	}
+	// 命令行参数会进 shell history 和 ps 输出，必须直接拒绝
+	if !strings.Contains(hashpw, "if len(os.Args) > 1 {") {
+		t.Error("bin/hashpw 必须拒绝命令行参数形式的密码：参数会进 shell history 和 ps 输出")
+	}
+
+	// 7. 任何路径都不得在事务内计算 bcrypt。
+	//
+	//    bcrypt 是**故意**慢的（cost=10 约 50~100ms）。放进事务就等于让这一百毫秒
+	//    全程压在已经 FOR UPDATE 锁住的用户行上：并发改密 / 管理员批量重置时，
+	//    锁等待会直接叠成接口超时。散列是纯计算，不依赖事务内的任何事实，
+	//    所以必须在 RunInTx 之前算好 —— 顺带也让「密码超长」这类错误在开事务前返回。
+	for _, tc := range []struct {
+		file string
+		fn   string
+	}{
+		{filepath.Join("app", "service", "auth_service.go"), "func (s *AuthService) ChangePassword("},
+		{filepath.Join("app", "service", "user_service.go"), "func (s *AdminUserService) UpdateUser("},
+	} {
+		body := funcBody(readFile(t, filepath.Join(backend, tc.file)), tc.fn)
+		if body == "" {
+			t.Errorf("%s 找不到 %s", tc.file, tc.fn)
+			continue
+		}
+		hashAt := strings.Index(body, "helper.HashPassword(")
+		if hashAt < 0 {
+			t.Errorf("%s%s 没有调用 helper.HashPassword", tc.file, tc.fn)
+			continue
+		}
+		txAt := strings.Index(body, "s.store.RunInTx(")
+		if txAt < 0 {
+			t.Errorf("%s%s 找不到 RunInTx", tc.file, tc.fn)
+			continue
+		}
+		if hashAt > txAt {
+			t.Errorf("%s%s 在事务内计算 bcrypt：cost=10 的散列会让行锁多持约 100ms", tc.file, tc.fn)
+		}
+	}
+	// 仓储方法全都可能在事务里被调用，所以 repo 包整体不该碰明文散列
+	repoDir := filepath.Join(backend, "app", "repo")
+	entries, err := os.ReadDir(repoDir)
+	if err != nil {
+		t.Fatalf("读取 repo 目录失败: %v", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
+			continue
+		}
+		if strings.Contains(readFile(t, filepath.Join(repoDir, e.Name())), "HashPassword(") {
+			t.Errorf("repo/%s 里出现了 HashPassword：仓储方法会在事务内被调用，散列必须由调用方在事务外算好", e.Name())
+		}
+	}
+}
+
+// assertSystemPermissionOnlyPromotable 系统权限只能升不能降（T5 第 2 项）。
+//
+// is_system=1 是一道保护：UpdatePermission / DeletePermission 都靠它拦住
+// 「改掉或删掉系统内置权限」。一旦这个位能被接口改回 0，攻击者就有了一条
+// 两步走的前门 —— 先降级，再随便改编码或删掉，权限校验随之失效。
+func assertSystemPermissionOnlyPromotable(t *testing.T, outDir string) {
+	t.Helper()
+
+	backend := filepath.Join(outDir, "backend")
+	svc := readFile(t, filepath.Join(backend, "app", "service", "permission_service.go"))
+	repoSrc := readFile(t, filepath.Join(backend, "app", "repo", "admin_permission_repo.go"))
+
+	// 1. 专门的 is_system 写入入口必须拒绝 1 → 0
+	toggle := funcBody(svc, "func (s *AdminPermissionsService) UpdatePermissionIsSystem(")
+	if toggle == "" {
+		t.Fatal("permission_service.go 找不到 UpdatePermissionIsSystem")
+	}
+	if !strings.Contains(toggle, "perm.IsSystem == 1 && isSystem == 0") {
+		t.Error("UpdatePermissionIsSystem 必须显式拒绝「系统权限改为普通权限」")
+	}
+	if !strings.Contains(toggle, "系统权限不能改为普通权限") {
+		t.Error("拒绝降级时要给出明确错误信息，不能静默忽略（调用方会以为改成功了）")
+	}
+	// 入参只能是 0/1。放过 2 这类值等于变相降级：全代码库判定系统权限用的都是 == 1
+	if !strings.Contains(toggle, "isSystem != 0 && isSystem != 1") {
+		t.Error("UpdatePermissionIsSystem 必须校验入参只能是 0 或 1：is_system=2 等于已经被降级")
+	}
+	if !strings.Contains(toggle, "PromoteToSystemByID(") {
+		t.Error("0 → 1 的升级应走 PromoteToSystemByID（SQL 层带只升不降的条件）")
+	}
+
+	// 2. 升级语句在 SQL 层就不可能反向写
+	promote := funcBody(repoSrc, "func (r *AdminPermissionsRepository) PromoteToSystemByID(")
+	if promote == "" {
+		t.Fatal("admin_permission_repo.go 找不到 PromoteToSystemByID")
+	}
+	if !strings.Contains(promote, `"permission_id = ? AND is_system = 0"`) {
+		t.Error("PromoteToSystemByID 的 WHERE 必须带 is_system = 0：这样任何时序下都只能 0→1，不依赖上层先读后判")
+	}
+
+	// 3. 通用更新入口不得再写 is_system
+	//    它是「先读后判再写」的形状，读完到写之间这行可能已被升级，
+	//    updateData 里带着 is_system=0 就会把它降回去。
+	update := funcBody(svc, "func (s *AdminPermissionsService) UpdatePermission(")
+	if update == "" {
+		t.Fatal("permission_service.go 找不到 UpdatePermission")
+	}
+	if strings.Contains(update, `"is_system"`) {
+		t.Error("UpdatePermission 不得把 is_system 写进 updateData：先读后判存在时序窗口，会把并发升级的权限降级")
+	}
+
+	// 4. 除了「新建时定性」和「只升不降的升级语句」，不应再有别的 is_system 写入路径
+	for _, forbidden := range []string{`Update("is_system", 0)`, `"is_system": 0`, `IsSystem: 0,`} {
+		if strings.Contains(svc, forbidden) || strings.Contains(repoSrc, forbidden) {
+			t.Errorf("出现把 is_system 写成 0 的代码（%s）：系统权限降级只应通过直接改库完成", forbidden)
+		}
+	}
+
+	// 5. 生成项目自带这项不变量的单元测试
+	if _, err := os.Stat(filepath.Join(backend, "app", "service", "permission_is_system_test.go")); err != nil {
+		t.Errorf("生成项目缺少 app/service/permission_is_system_test.go: %v", err)
+	}
+}
+
+// assertRateLimiterBounded per-IP 限流记录必须有界（T5 第 3 项）。
+//
+// 公共库的 tlimit.CompositeRateLimiter 用一张只增不减的 map 存 per-IP 桶，
+// 公网入口（登录 / 验证码 / 前端错误上报）每来一个新 IP 就永久多一条记录，
+// 换 IP 的扫描流量能一直把它撑到 OOM。这里断言两件事：这些入口确实换成了
+// 项目内带回收的实现；回收条件没有被放松成「可以把正在被限流的 IP 一笔勾销」。
+func assertRateLimiterBounded(t *testing.T, outDir string) {
+	t.Helper()
+
+	backend := filepath.Join(outDir, "backend")
+	mwDir := filepath.Join(backend, "app", "middleware")
+	rateLimit := readFile(t, filepath.Join(mwDir, "rate_limit.go"))
+	limiter := readFile(t, filepath.Join(mwDir, "ip_rate_limiter.go"))
+
+	// 1. 两处 per-IP 限流都用项目内的实现，不再用无界的那个
+	if strings.Contains(rateLimit, "tlimit.NewCompositeRateLimiter") {
+		t.Error("rate_limit.go 仍在用 tlimit.NewCompositeRateLimiter：它的 per-IP map 只增不减")
+	}
+	if strings.Contains(rateLimit, "*tlimit.CompositeRateLimiter") {
+		t.Error("rate_limit.go 仍在用 tlimit.CompositeRateLimiter 类型")
+	}
+	if n := strings.Count(rateLimit, "newIPRateLimiter("); n != 2 {
+		t.Errorf("rate_limit.go 里构造 ipRateLimiter 的地方应有 2 处（敏感接口 + 全局限流），实际 %d 处", n)
+	}
+
+	// 2. 记录数有上限，且有摊还式回收
+	for _, want := range []string{"rateLimitMaxEntries", "rateLimitSweepInterval", "rateLimitIdleTTL"} {
+		if !strings.Contains(limiter, want) {
+			t.Errorf("ip_rate_limiter.go 缺少 %s", want)
+		}
+	}
+	if !strings.Contains(limiter, "rateLimitMaxEntries = 100000") {
+		t.Error("per-IP 记录数上限应显式写成 100000：没有上限时内存保护形同虚设")
+	}
+	track := funcBody(limiter, "func (l *ipRateLimiter) trackLocked(ip string, now time.Time) *tokenBucket {")
+	if !strings.Contains(track, "len(l.buckets) >= l.maxEntries") {
+		t.Error("新建 per-IP 记录前必须检查记录数上限")
+	}
+
+	// 3. 回收只能丢「已经回满」的桶。
+	//    丢掉没回满的桶，等于把一个正在被限流的 IP 的欠账勾销 ——
+	//    攻击者停够一个清扫周期就能重置配额，口令爆破的速率上限随之失效。
+	sweep := funcBody(limiter, "func (l *ipRateLimiter) sweepLocked(now time.Time) {")
+	if sweep == "" {
+		t.Fatal("ip_rate_limiter.go 找不到 sweepLocked")
+	}
+	if !strings.Contains(sweep, "bucket.refillAndIsFull(") {
+		t.Error("回收条件必须含 refillAndIsFull：回收没回满的桶等于给被限流的 IP 重置配额")
+	}
+	if !strings.Contains(sweep, "rateLimitIdleTTL") {
+		t.Error("回收条件应含闲置时长，避免低频 IP 删了又建")
+	}
+
+	// 4. 限流语义不变：双层都要过，顺序和被替换的实现一致
+	allow := funcBody(limiter, "func (l *ipRateLimiter) Allow(ip string) rateLimitResult {")
+	if allow == "" {
+		t.Fatal("ip_rate_limiter.go 找不到 Allow")
+	}
+	ipTake := strings.Index(allow, "bucket.take(")
+	globalTake := strings.Index(allow, "l.global.take(")
+	switch {
+	case ipTake < 0 || globalTake < 0:
+		t.Error("Allow 必须同时判定单 IP 桶和全局桶")
+	case ipTake > globalTake:
+		t.Error("判定顺序应与被替换实现一致：先单 IP 桶再全局桶（改顺序就是改限流语义）")
+	}
+
+	// 5. 配置键名不变：改了名字等于线上配置静默失效
+	for _, key := range []string{
+		"http.rate_limit.composite.enabled",
+		"http.rate_limit.composite.ip_capacity",
+		"http.rate_limit.composite.global_capacity",
+		"http.rate_limit.composite.fill_interval",
+		"http.rate_limit.basic.enabled",
+		"http.rate_limit.sensitive.",
+	} {
+		if !strings.Contains(rateLimit, key) {
+			t.Errorf("rate_limit.go 缺少配置键 %q：键名变动会让既有部署的限流配置静默失效", key)
+		}
+	}
+
+	// 6. 生成项目自带回收与并发的单元测试
+	if _, err := os.Stat(filepath.Join(mwDir, "ip_rate_limiter_test.go")); err != nil {
+		t.Errorf("生成项目缺少 app/middleware/ip_rate_limiter_test.go: %v", err)
+	}
+}
+
+// assertLogRetentionWiring 日志表定期清理（T5 第 4 项）。
+//
+// 四张流水表（访问 / 操作 / 登录 / 前端错误）只写不删，撑满磁盘后数据库整体不可写，
+// 等于整个服务挂掉。这里断言清理任务确实被接到启动流程上、保留期默认 180 天、
+// 删除语句带时间条件和分批上限、退出时能停。
+func assertLogRetentionWiring(t *testing.T, outDir string) {
+	t.Helper()
+
+	backend := filepath.Join(outDir, "backend")
+
+	// 1. 启动时挂上，退出时停掉；不依赖默认关闭的 cron 组件
+	bootstrap := readFile(t, filepath.Join(backend, "app", "bootstrap.go"))
+	start := funcBody(bootstrap, "func startLogCleanup() {")
+	if start == "" {
+		t.Fatal("bootstrap.go 找不到 startLogCleanup")
+	}
+	if !strings.Contains(bootstrap, "startLogCleanup()\n") {
+		t.Error("startLogCleanup 没有在 init 里被调用：清理任务不会启动")
+	}
+	if !strings.Contains(start, "service.ResolveLogRetentionDays(") {
+		t.Error("startLogCleanup 应通过 service.ResolveLogRetentionDays 解析保留期")
+	}
+	// 停止函数必须注册进 cleanups，而且必须**头插**：cleanups 是顺序执行的，
+	// BuildComponents 的 cleanup（关 DB / Redis / 日志）已经在队首。
+	// 直接 append 的话会先关数据库，再去停这个还在发 DELETE 的后台任务，
+	// 退出日志里全是 `sql: database is closed`。
+	if !strings.Contains(start, "cleanups = append([]func(){stop}, cleanups...)") {
+		t.Error("清理任务的停止函数必须头插进 cleanups：append 会让数据库先于后台任务关闭")
+	}
+	if strings.Contains(start, "cleanups = append(cleanups, stop)") {
+		t.Error("清理任务的停止函数不能尾插：cleanups 的顺序就是关闭顺序")
+	}
+	gcleanup := funcBody(bootstrap, "func gracefulCleanup(")
+	if !strings.Contains(gcleanup, "for _, cleanup := range cleanups {") {
+		t.Error("gracefulCleanup 应顺序遍历 cleanups：头插的前提是它按切片顺序执行")
+	}
+	// 配置非法时拒绝启动：这个值控制不可逆的删除，不能按一个猜出来的保留期去删
+	if !strings.Contains(start, "log.Fatalf") {
+		t.Error("保留期配置非法时必须让启动失败，不能回退到某个默认值继续删数据")
+	}
+	cleanupSrc := readFile(t, filepath.Join(backend, "app", "service", "log_cleanup.go"))
+	if strings.Contains(cleanupSrc, "crontab") || strings.Contains(cleanupSrc, "cron.") {
+		t.Error("日志清理不得挂在 cron 组件上：cron 默认关闭，等于默认不清理")
+	}
+
+	// 2. 默认 180 天，0 关闭，负数/非整数报错
+	if !strings.Contains(cleanupSrc, "DefaultLogRetentionDays = 180") {
+		t.Error("默认保留期应为 180 天（已确认的方案）")
+	}
+	resolve := funcBody(cleanupSrc, "func ResolveLogRetentionDays(getString func(string) string) (int, error) {")
+	if resolve == "" {
+		t.Fatal("log_cleanup.go 找不到 ResolveLogRetentionDays")
+	}
+	// 必须 GetString + 显式解析：GetInt 对 `abc` 返回 0，而 0 在这里是「永久保留」的合法值，
+	// 一个拼错的配置会被静默解读成「不清理」
+	if !strings.Contains(resolve, "strconv.Atoi(") {
+		t.Error("保留期应取字符串后显式解析：GetInt 会把非法值变成 0，而 0 是「不清理」的合法值")
+	}
+	if !strings.Contains(resolve, "days < 0") {
+		t.Error("负数保留期必须报错（大概率是想表达「不要删」）")
+	}
+
+	// 3. 配置项在 config.yaml 和 .env.example 里都给到位
+	cfg := readFile(t, filepath.Join(backend, "config", "config.yaml"))
+	if !strings.Contains(cfg, `log_retention_days: "${LOG_RETENTION_DAYS:180}"`) {
+		t.Error("config.yaml 缺少 log_retention_days（默认 180）")
+	}
+	envExample := readFile(t, filepath.Join(backend, ".env.example"))
+	if !strings.Contains(envExample, "LOG_RETENTION_DAYS=180") {
+		t.Error(".env.example 缺少 LOG_RETENTION_DAYS=180")
+	}
+
+	// 4. 四张表都在清理清单里，且登录日志用的是自己的时间列
+	retentionRepo := readFile(t, filepath.Join(backend, "app", "repo", "log_retention_repo.go"))
+	for _, want := range []string{
+		`Table: "admin_access_logs", TimeColumn: "created_at"`,
+		`Table: "admin_operation_logs", TimeColumn: "created_at"`,
+		`Table: "admin_front_error_logs", TimeColumn: "created_at"`,
+		// 登录日志没有 created_at，照抄会生成一条无效 SQL
+		`Table: "admin_user_login_logs", TimeColumn: "login_time"`,
+	} {
+		if !strings.Contains(retentionRepo, want) {
+			t.Errorf("日志清理清单缺少 %s：漏掉的表永远不会被清理", want)
+		}
+	}
+
+	// 5. 删除语句：只按时间条件 + 必须分批
+	del := funcBody(retentionRepo, "func (r *LogRetentionRepository) DeleteOlderThan(")
+	if del == "" {
+		t.Fatal("log_retention_repo.go 找不到 DeleteOlderThan")
+	}
+	if !strings.Contains(del, `target.TimeColumn+" < ?"`) {
+		t.Error("删除条件必须是「时间列 < cutoff」：条件写错或丢失会删到保留期内的数据")
+	}
+	if !strings.Contains(del, "Limit(limit)") {
+		t.Error("删除必须带 LIMIT：否则第一次清理就是一条删几百万行的巨型事务")
+	}
+	if !strings.Contains(cleanupSrc, "logCleanupBatchSize = 5000") {
+		t.Error("单批删除行数应为 5000（毫秒级小事务，锁持有时间短）")
+	}
+	if !strings.Contains(cleanupSrc, "logCleanupBatchPause") {
+		t.Error("批次之间需要停顿，给业务查询让出 IO 和行锁")
+	}
+	// 首次执行延迟要带随机抖动：多实例同时启动时，四张表的 DELETE 会在同一秒
+	// 撞到同一个库上互相争行锁。抖动把它们摊开，不需要分布式锁。
+	if !strings.Contains(cleanupSrc, "logCleanupStartJitter") {
+		t.Error("首次清理延迟缺少随机抖动：多实例同时启动会让各进程的 DELETE 撞在一起")
+	}
+	if !strings.Contains(cleanupSrc, "rand.Int64N(") {
+		t.Error("抖动应由 rand 生成（这里只要「别撞在一起」，不需要密码学随机）")
+	}
+
+	// 6. 日志里只报行数，不报日志内容（访问日志带 IP/UA/路径，操作日志带操作参数）
+	if strings.Contains(cleanupSrc, "%+v") || strings.Contains(cleanupSrc, "deleted, rows") {
+		t.Error("清理日志不得打印被删记录的内容，只报表名和行数")
+	}
+
+	// 7. 生成项目自带单元测试
+	for _, rel := range [][]string{
+		{"app", "service", "log_cleanup_test.go"},
+		{"app", "repo", "log_retention_sql_test.go"},
+	} {
+		p := filepath.Join(append([]string{backend}, rel...)...)
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("生成项目缺少 %s: %v", filepath.Join(rel...), err)
+		}
 	}
 }
 
@@ -1275,25 +1721,88 @@ func TestGenerate_RequiredComponentsAlwaysPresent(t *testing.T) {
 	}
 }
 
+// readTemplateFile 从 embed 的模板树里读一个模板的原文（未渲染）。
+// 相对 templateRoot 给路径，例如 "backend/app/helper/crypto.go.tmpl"。
+//
+// 用来断言「模板里确实写着某个约定」，比渲染一整个项目再去 grep 便宜得多。
+func readTemplateFile(t *testing.T, rel string) string {
+	t.Helper()
+	data, err := fs.ReadFile(templates.FS, path.Join(templateRoot, rel))
+	if err != nil {
+		t.Fatalf("读取模板 %s 失败: %v", rel, err)
+	}
+	return string(data)
+}
+
 // TestPasswordHash 初始密码散列必须与生成项目 app/helper/crypto.go 的算法一致：
-// hex(sha256(password + salt))。
+// bcrypt，cost 与两边共同约定的常量相同。
+//
+// 这里没有「已知答案」可比：bcrypt 自带随机盐，同一密码每次输出都不同。
+// 所以断言换成三条等价强度的性质 —— 格式对、cost 对、能校验回原密码。
+// 哪天有人把实现悄悄改回 SHA-256，第一条就会失败。
 func TestPasswordHash(t *testing.T) {
-	// 合成口令 + 固定 salt 的已知答案（由同一算法独立算出），
-	// 算法被悄悄改掉时这里会直接失败。
-	const (
-		password = "SyntheticPw123"
-		salt     = "0123456789abcdef0123456789abcdef"
-		want     = "b51e612a3004a92f3910efa546772ac442efcf073cf78dc14d9599216dd1d916"
-	)
-	got := passwordHash(password, salt)
-	if got != want {
-		t.Fatalf("散列与已知答案不一致\n期望: %s\n实际: %s", want, got)
+	const password = "SyntheticPw123" // 合成口令，只用于本测试
+
+	got, err := passwordHash(password)
+	if err != nil {
+		t.Fatalf("passwordHash 不该失败: %v", err)
 	}
-	if len(got) != 64 {
-		t.Fatalf("散列长度应为 64 位 hex，实际 %d", len(got))
+
+	if !strings.HasPrefix(got, "$2a$") && !strings.HasPrefix(got, "$2b$") && !strings.HasPrefix(got, "$2y$") {
+		t.Fatalf("散列不是 bcrypt 格式: %q", got)
 	}
-	if got == passwordHash(password, "ffffffffffffffffffffffffffffffff") {
-		t.Fatal("不同 salt 应产生不同散列")
+	if len(got) != 60 {
+		t.Fatalf("bcrypt 散列应为 60 字符，实际 %d: %q", len(got), got)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(got), []byte(password)); err != nil {
+		t.Fatalf("散列校验不过原密码: %v", err)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(got), []byte(password+"x")); err == nil {
+		t.Fatal("错误密码不该通过校验")
+	}
+
+	// cost 必须就是约定的那个常量：cost 写错（比如被当成 4）散列照样能用，
+	// 但抗离线爆破的强度会掉几个数量级，而且从外部完全看不出来。
+	cost, err := bcrypt.Cost([]byte(got))
+	if err != nil {
+		t.Fatalf("读取 bcrypt cost 失败: %v", err)
+	}
+	if cost != bcryptCost {
+		t.Errorf("bcrypt cost = %d，期望 %d", cost, bcryptCost)
+	}
+	if cost < 10 {
+		t.Errorf("bcrypt cost 不得低于 10，实际 %d", cost)
+	}
+
+	// 自带随机盐：同一密码两次散列必须不同
+	again, err := passwordHash(password)
+	if err != nil {
+		t.Fatalf("passwordHash 不该失败: %v", err)
+	}
+	if again == got {
+		t.Fatal("两次散列结果相同，bcrypt 的随机盐没生效")
+	}
+
+	// 超过 72 字节必须报错而不是被静默截断
+	if _, err := passwordHash(strings.Repeat("a", 73)); err == nil {
+		t.Fatal("超过 72 字节的密码应当报错")
+	}
+}
+
+// TestPasswordHashCostMatchesTemplate 生成器与生成项目必须用同一个 cost。
+//
+// 两边各写一个常量、靠注释约定「保持一致」是会漂的：init.sql 的初始散列
+// 由生成器算，之后所有密码由后端算，cost 不一致不会报错，只会让强度悄悄分叉。
+// 所以这里直接去模板文件里把那个常量读出来比。
+func TestPasswordHashCostMatchesTemplate(t *testing.T) {
+	src := readTemplateFile(t, "backend/app/helper/crypto.go.tmpl")
+	if !strings.Contains(src, "const bcryptCost = bcrypt.DefaultCost") {
+		t.Fatalf("生成项目 crypto.go 里找不到 `const bcryptCost = bcrypt.DefaultCost`：" +
+			"两边 cost 的一致性无法再被这条测试保证，改动时请同步更新本断言")
+	}
+	if bcryptCost != bcrypt.DefaultCost {
+		t.Errorf("生成器的 bcryptCost = %d，与模板里的 bcrypt.DefaultCost = %d 不一致",
+			bcryptCost, bcrypt.DefaultCost)
 	}
 }
 
@@ -1709,4 +2218,37 @@ func contains(list []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestBuildTemplateData_CarriesNoPlaintextPassword 渲染上下文里不能有明文密码。
+//
+// 这是一道比「检查生成产物」更靠前的防线。assertInitialSecrets 已经在断言
+// 明文不出现在任何生成文件里，但那是**事后**检查：只要 templateData 上挂着
+// 明文字段，以后任何人往某个 .tmpl 里引用它都会立刻把明文写进生成产物
+// （而生成产物通常会被提交进使用者的版本库）。所以明文由 buildTemplateData
+// 单独返回，不进渲染上下文 —— 这里用反射把「上下文里一个字段都不等于明文」钉住。
+func TestBuildTemplateData_CarriesNoPlaintextPassword(t *testing.T) {
+	opts := Options{ProjectName: "demo-ctx", Module: "example.com/demo-ctx"}
+	data, plaintext, err := buildTemplateData(opts, normalizeComponents(nil))
+	if err != nil {
+		t.Fatalf("buildTemplateData 失败: %v", err)
+	}
+	if plaintext == "" {
+		t.Fatal("buildTemplateData 没有返回初始管理员明文密码：CLI 无从提示用户")
+	}
+	// 散列必须真能校验出这个明文，否则按提示登录会失败
+	if err := bcrypt.CompareHashAndPassword([]byte(data.AdminPasswordHash), []byte(plaintext)); err != nil {
+		t.Errorf("AdminPasswordHash 校验不过返回的明文: %v", err)
+	}
+
+	v := reflect.ValueOf(*data)
+	ty := v.Type()
+	for i := 0; i < ty.NumField(); i++ {
+		if v.Field(i).Kind() != reflect.String {
+			continue
+		}
+		if v.Field(i).String() == plaintext {
+			t.Errorf("templateData.%s 带着明文初始密码：模板一旦引用它，明文就进生成文件了", ty.Field(i).Name)
+		}
+	}
 }

@@ -1,0 +1,169 @@
+// 密码散列的单元测试。
+//
+// 这里要守住的不变量有五条，每条对应一种真实的事故：
+//  1. 新密码用 bcrypt 存，能校验回来；
+//  2. 历史 SHA-256 散列仍然能登录（否则升级版本一上线，全部用户都登不进去）；
+//  3. 错误密码不通过，且**不会**被判定为需要升级（错密码触发写回等于把密码改掉）；
+//  4. 超过 72 字节的密码明确报错，不被 bcrypt 静默截断；
+//  5. 空存储值一律不通过（没设过密码的账号不能靠空串登录）。
+package helper
+
+import (
+	"errors"
+	"strings"
+	"testing"
+)
+
+// testPassword 合成口令，只用于本测试。
+const testPassword = "Taurus-x-9fK2"
+
+func TestHashPassword_ProducesVerifiableBcrypt(t *testing.T) {
+	hashed, err := HashPassword(testPassword)
+	if err != nil {
+		t.Fatalf("HashPassword 不该失败: %v", err)
+	}
+	if !IsBcryptHash(hashed) {
+		t.Fatalf("散列不是 bcrypt 格式: %q", hashed)
+	}
+	// bcrypt 散列固定 60 字符；长度变了说明换了算法或被截断过
+	if len(hashed) != 60 {
+		t.Errorf("bcrypt 散列应为 60 字符，实际 %d", len(hashed))
+	}
+	// salt 参数在 bcrypt 路径上必须被忽略：库里的 salt 列是空串，
+	// 要是实现偷偷把它拼进密码，升级后的账号就再也登不上了。
+	if !VerifyPassword(testPassword, hashed, "") {
+		t.Error("新散列应能校验通过（salt 为空串）")
+	}
+	if !VerifyPassword(testPassword, hashed, "无关的旧盐值") {
+		t.Error("bcrypt 路径必须忽略 salt 参数")
+	}
+	if VerifyPassword(testPassword+"x", hashed, "") {
+		t.Error("错误密码不该通过")
+	}
+	// 自带随机盐：同一个密码两次散列结果必须不同，否则相同密码的账号
+	// 在库里会长得一样，拖库后能直接按散列分组
+	again, err := HashPassword(testPassword)
+	if err != nil {
+		t.Fatalf("HashPassword 不该失败: %v", err)
+	}
+	if again == hashed {
+		t.Error("两次散列结果相同，bcrypt 的随机盐没生效")
+	}
+}
+
+func TestHashPassword_NewHashNeedsNoRehash(t *testing.T) {
+	hashed, err := HashPassword(testPassword)
+	if err != nil {
+		t.Fatalf("HashPassword 不该失败: %v", err)
+	}
+	if NeedsRehash(hashed) {
+		t.Error("刚生成的 bcrypt 散列不该被判定为需要升级（会导致每次登录都多一次写库）")
+	}
+}
+
+func TestVerifyPassword_LegacyHashStillWorksAndWantsUpgrade(t *testing.T) {
+	const salt = "0123456789abcdef0123456789abcdef"
+	legacy := LegacyHashPassword(testPassword, salt)
+
+	if IsBcryptHash(legacy) {
+		t.Fatalf("旧散列被误判成 bcrypt 格式: %q", legacy)
+	}
+	if !VerifyPassword(testPassword, legacy, salt) {
+		t.Error("历史 SHA-256 散列必须仍能校验通过，否则老用户全部登不进来")
+	}
+	if !NeedsRehash(legacy) {
+		t.Error("旧格式必须被判定为需要升级，否则平滑升级永远不会发生")
+	}
+	// 盐错了就不该通过：说明比较真的把 salt 算进去了
+	if VerifyPassword(testPassword, legacy, "ffffffffffffffffffffffffffffffff") {
+		t.Error("换了 salt 还能通过，说明旧路径没有真的用 salt")
+	}
+}
+
+// TestVerifyPassword_WrongPasswordNeverTriggersUpgrade 是这次改动里最关键的一条：
+// 升级写回必须**只**发生在校验通过之后。只要「校验失败」和「需要升级」被分别判定，
+// 调用方就不可能拿一个错密码的 bcrypt 覆盖掉真密码。
+func TestVerifyPassword_WrongPasswordNeverTriggersUpgrade(t *testing.T) {
+	const salt = "0123456789abcdef0123456789abcdef"
+	legacy := LegacyHashPassword(testPassword, salt)
+
+	if VerifyPassword("wrong-pass-1", legacy, salt) {
+		t.Fatal("错误密码通过了旧格式校验")
+	}
+	bcryptHash, err := HashPassword(testPassword)
+	if err != nil {
+		t.Fatalf("HashPassword 不该失败: %v", err)
+	}
+	if VerifyPassword("wrong-pass-1", bcryptHash, "") {
+		t.Fatal("错误密码通过了 bcrypt 校验")
+	}
+}
+
+func TestHashPassword_RejectsOverLongPassword(t *testing.T) {
+	long := strings.Repeat("a", MaxPasswordBytes+1)
+	if _, err := HashPassword(long); !errors.Is(err, ErrPasswordTooLong) {
+		t.Fatalf("超过 %d 字节的密码必须返回 ErrPasswordTooLong，实际 %v", MaxPasswordBytes, err)
+	}
+	// 正好 72 字节是允许的（上限是「超过才拒」）
+	if _, err := HashPassword(strings.Repeat("a", MaxPasswordBytes)); err != nil {
+		t.Fatalf("正好 %d 字节应当允许: %v", MaxPasswordBytes, err)
+	}
+
+	// 截断语义必须被彻底堵死：前 72 字节相同的两个长密码，
+	// 既不能互相登录，也不能各自算出散列。
+	a := strings.Repeat("a", MaxPasswordBytes) + "X"
+	b := strings.Repeat("a", MaxPasswordBytes) + "Y"
+	hashed, err := HashPassword(strings.Repeat("a", MaxPasswordBytes))
+	if err != nil {
+		t.Fatalf("HashPassword 不该失败: %v", err)
+	}
+	if VerifyPassword(a, hashed, "") || VerifyPassword(b, hashed, "") {
+		t.Error("超长密码在校验侧也必须被拒，否则等于默认接受了 72 字节截断")
+	}
+
+	// 中文密码按字节算：24 个汉字 = 72 字节（允许），25 个 = 75 字节（拒绝）
+	if _, err := HashPassword(strings.Repeat("密", 24)); err != nil {
+		t.Errorf("24 个汉字（72 字节）应当允许: %v", err)
+	}
+	if _, err := HashPassword(strings.Repeat("密", 25)); !errors.Is(err, ErrPasswordTooLong) {
+		t.Errorf("25 个汉字（75 字节）应当被拒，实际 %v", err)
+	}
+}
+
+func TestVerifyPassword_EmptyStoredAlwaysFails(t *testing.T) {
+	for _, password := range []string{"", testPassword, "任意密码"} {
+		if VerifyPassword(password, "", "") {
+			t.Errorf("存储值为空串时 %q 不该通过", password)
+		}
+		if VerifyPassword(password, "", "somesalt") {
+			t.Errorf("存储值为空串时 %q 不该通过（带 salt）", password)
+		}
+	}
+}
+
+// TestIsBcryptHash_OnlyAcceptsKnownPrefixes $2$ / $2x$ 是有已知缺陷的历史变体，
+// Go 的 bcrypt 不生成它们；放行它们只会让判定变松，没有任何好处。
+func TestIsBcryptHash_OnlyAcceptsKnownPrefixes(t *testing.T) {
+	for _, c := range []struct {
+		stored string
+		want   bool
+	}{
+		{"$2a$10$abcdefghijklmnopqrstuv", true},
+		{"$2b$10$abcdefghijklmnopqrstuv", true},
+		{"$2y$10$abcdefghijklmnopqrstuv", true},
+		{"$2$10$abcdefghijklmnopqrstuv", false},
+		{"$2x$10$abcdefghijklmnopqrstuv", false},
+		{"$1$abc", false},
+		{"", false},
+		// 64 位 hex：历史 SHA-256 散列的样子，必须走旧路径
+		{strings.Repeat("a", 64), false},
+	} {
+		if got := IsBcryptHash(c.stored); got != c.want {
+			t.Errorf("IsBcryptHash(%q) = %v，期望 %v", c.stored, got, c.want)
+		}
+		// NeedsRehash 必须恒等于 !IsBcryptHash，两者不能各自演化
+		if NeedsRehash(c.stored) == c.want {
+			t.Errorf("NeedsRehash(%q) 与 IsBcryptHash 不互补", c.stored)
+		}
+	}
+}

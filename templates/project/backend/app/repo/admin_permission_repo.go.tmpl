@@ -28,8 +28,30 @@ func (r repoSet) Permission() *AdminPermissionsRepository {
 }
 
 // UpdateByID 按主键更新指定字段
+//
+// 注意：调用方不要把 is_system 放进 updates。系统权限（is_system=1）一旦被降级，
+// 就绕过了 UpdatePermission / DeletePermission 的保护，所以这张表的 is_system
+// 只有两条合法写入路径：Create（新建时定性）和 PromoteToSystemByID（只升不降）。
+// 这里不在 WHERE 上加 is_system 限制，是因为 UpdatePermissionStatus 需要能改
+// 系统权限的 status；真正的约束放在 is_system 这一列的写入路径上。
 func (r *AdminPermissionsRepository) UpdateByID(ctx context.Context, id uint64, updates interface{}) error {
 	return r.db.WithContext(ctx).Model(&model.AdminPermissions{}).Where("permission_id = ?", id).Updates(updates).Error
+}
+
+// PromoteToSystemByID 把普通权限标记为系统权限。
+//
+// WHERE 里带 is_system = 0 有两个作用：
+//   - 这条语句在任何时序下都只能把 0 写成 1，不可能反向，所以「系统权限被降级」
+//     在 SQL 层就不可能发生，不依赖上层先读后判（读完到写之间别人可能已经改了）；
+//   - 天然幂等：已经是 1 的行匹配不到，命中 0 行，不是错误。
+//
+// 因此这里不检查 RowsAffected —— 命中 0 行只说明「已经是系统权限」或「行不存在」，
+// 两种都没必要报错；MySQL 默认还会把「匹配到但值没变」也算成 0 行，
+// 拿它当失败判据会误报。
+func (r *AdminPermissionsRepository) PromoteToSystemByID(ctx context.Context, id uint64) error {
+	return r.db.WithContext(ctx).Model(&model.AdminPermissions{}).
+		Where("permission_id = ? AND is_system = 0", id).
+		Update("is_system", 1).Error
 }
 
 // FindByPermissionCode 根据权限编码查找权限

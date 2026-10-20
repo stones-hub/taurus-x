@@ -8,7 +8,14 @@ import (
 	"github.com/stones-hub/taurus-pro-common/pkg/util/tvalid"
 )
 
-// ValidatePasswordStrength 验证密码强度（6-20 位，含字母和数字）
+// ValidatePasswordStrength 验证密码强度（6-20 字节，含字母和数字）。
+//
+// 这里的 20 字节上限同时是 bcrypt 72 字节输入上限（helper.MaxPasswordBytes）的
+// 第一道闸：20 < 72，所以走本函数的写入路径（新建用户、管理员重置、自助改密）
+// 永远不可能把超长密码送到 bcrypt 那里被静默截断。
+// 如果以后放宽这个上限，必须同时保证不超过 MaxPasswordBytes —— HashPassword
+// 在超限时返回 ErrPasswordTooLong 兜底，但那时用户看到的就是兜底文案而不是
+// 这里的提示了。注意单位是字节：一个汉字在 UTF-8 下算 3 字节。
 func ValidatePasswordStrength(password string) error {
 	if len(password) < 6 {
 		return fmt.Errorf("密码长度不能少于6位")

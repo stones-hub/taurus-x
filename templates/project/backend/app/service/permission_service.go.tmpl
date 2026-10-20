@@ -111,6 +111,9 @@ func (s *AdminPermissionsService) GetPermissionTree(ctx context.Context, parentI
 }
 
 // AddPermission 新增权限
+//
+// 新建时可以直接定性为系统权限（is_system=1）；定性之后就只能升不能降，
+// 见 UpdatePermissionIsSystem。
 func (s *AdminPermissionsService) AddPermission(ctx context.Context, parentID uint64, name, code string, permType int8, path, icon string, sortOrder int, status, isSystem int8) error {
 	existing, err := s.permissionRepo.FindByPermissionCode(ctx, code)
 	if err != nil {
@@ -121,6 +124,11 @@ func (s *AdminPermissionsService) AddPermission(ctx context.Context, parentID ui
 	}
 	if permType < 1 || permType > 3 {
 		return errors.New("权限类型必须为1(菜单)、2(按钮)或3(接口)")
+	}
+	// 只收 0/1：全代码库判定系统权限用的都是 `IsSystem == 1`，
+	// 存进一个 2 既不是系统权限也不是普通权限，后续判定会跟着一起含糊。
+	if isSystem != 0 && isSystem != 1 {
+		return errors.New("是否系统权限只能为 1(是) 或 0(否)")
 	}
 	if parentID > 0 {
 		parent, err := s.permissionRepo.FindByPermissionID(ctx, parentID)
@@ -146,6 +154,12 @@ func (s *AdminPermissionsService) AddPermission(ctx context.Context, parentID ui
 }
 
 // UpdatePermission 更新权限
+//
+// 入参里的 isSystem 被**刻意忽略**：这个接口只改普通权限的属性，不负责定性。
+// 原因是先读后判存在时序窗口 —— 读到 is_system=0、判定放行，写之前这行可能已经
+// 被升级成系统权限，而 updateData 里带着 is_system=0 就会把它降级，
+// 等于绕过下面那道「系统权限不能修改」的检查。
+// 需要升级为系统权限请走 UpdatePermissionIsSystem（只升不降）。
 func (s *AdminPermissionsService) UpdatePermission(ctx context.Context, permissionID, parentID uint64, name, code string, permType int8, path, icon string, sortOrder int, status, isSystem int8) error {
 	perm, err := s.permissionRepo.FindByPermissionID(ctx, permissionID)
 	if err != nil {
@@ -175,7 +189,7 @@ func (s *AdminPermissionsService) UpdatePermission(ctx context.Context, permissi
 		"icon":            icon,
 		"sort_order":      sortOrder,
 		"status":          status,
-		"is_system":       isSystem,
+		// 没有 is_system：见函数头注释
 	}
 	return s.permissionRepo.UpdateByID(ctx, permissionID, updateData)
 }
@@ -221,8 +235,22 @@ func (s *AdminPermissionsService) UpdatePermissionStatus(ctx context.Context, pe
 	return s.permissionRepo.UpdateByID(ctx, permissionID, map[string]interface{}{"status": status})
 }
 
-// UpdatePermissionIsSystem 更新是否系统权限
+// UpdatePermissionIsSystem 把权限标记为系统权限。
+//
+// 只升不降：is_system=1 的权限不能通过任何接口改回 0。原因是 is_system 不是
+// 一个普通的展示字段，它是 UpdatePermission（系统权限不能修改）和
+// DeletePermission（系统权限不能删除）唯一的判据。允许降级等于给这两道保护
+// 开了个前门：先把 is_system 改成 0，再随便改编码或删掉。
+//
+// 真要降级，只能直接改数据库 —— 这是故意的：这种操作应该留下 DBA 动作的痕迹，
+// 而不是一个管理员在界面上点一下开关。
+//
+// isSystem 必须是 0 或 1。不能只判 `== 0` 就放行：全代码库判定系统权限用的都是
+// `IsSystem == 1`，写进一个 2 就等于降级，只是绕了一步。
 func (s *AdminPermissionsService) UpdatePermissionIsSystem(ctx context.Context, permissionID uint64, isSystem int8) error {
+	if isSystem != 0 && isSystem != 1 {
+		return errors.New("是否系统权限只能为 1(是) 或 0(否)")
+	}
 	perm, err := s.permissionRepo.FindByPermissionID(ctx, permissionID)
 	if err != nil {
 		return err
@@ -230,7 +258,17 @@ func (s *AdminPermissionsService) UpdatePermissionIsSystem(ctx context.Context, 
 	if perm == nil {
 		return errors.New("权限不存在")
 	}
-	return s.permissionRepo.UpdateByID(ctx, permissionID, map[string]interface{}{"is_system": isSystem})
+	if perm.IsSystem == 1 && isSystem == 0 {
+		return errors.New("系统权限不能改为普通权限")
+	}
+	if isSystem == 0 {
+		// 当前是 0、要写 0：无事可做。走到这里说明不是降级，直接返回成功，
+		// 不发多余的 UPDATE。
+		return nil
+	}
+	// 0 → 1。WHERE 里还带一道 is_system = 0 的条件（见 repo），
+	// 所以即便上面读到的快照过期了，这条语句也只可能升不可能降。
+	return s.permissionRepo.PromoteToSystemByID(ctx, permissionID)
 }
 
 // GetEditPermissionInfo 获取编辑权限信息（含权限树，用于选择父权限）

@@ -2,21 +2,35 @@ package generator
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"math/big"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
+// bcryptCost 必须与生成项目 app/helper/crypto.go 里的 bcryptCost 保持一致。
+// 不一致本身不会让登录失败（cost 编码在散列串里，校验侧照着读），
+// 但 init.sql 的初始散列就不再代表后端此后生成的强度，所以当成契约对齐。
+const bcryptCost = bcrypt.DefaultCost
+
 // passwordHash 与生成项目 app/helper/crypto.go 的 HashPassword 保持一致：
-// SHA-256(password + salt)，hex 编码。init.sql 里的初始管理员散列由此计算，
+// bcrypt(password)，cost 见 bcryptCost。init.sql 里的初始管理员散列由此计算，
 // 保证生成的 SQL 能被生成的后端直接校验通过。
 //
-// 注意：这是 admin 底座遗留的单次 sha256 方案（见 docs/安全审计.md #16），
-// 第一版不改为 bcrypt；换算法时这里和 helper/crypto.go 必须一起改。
-func passwordHash(password, salt string) string {
-	sum := sha256.Sum256([]byte(password + salt))
-	return hex.EncodeToString(sum[:])
+// bcrypt 自带随机盐并编码进散列串，所以这里不再需要 salt 参数，
+// init.sql 的 salt 列写空串（换算法时这里和 helper/crypto.go 必须一起改）。
+//
+// 返回错误而不是 panic：密码超过 bcrypt 的 72 字节上限或熵源故障时，
+// 宁可让生成流程失败，也不能写一个校验不过的散列进 init.sql。
+func passwordHash(password string) (string, error) {
+	if len(password) > 72 {
+		return "", fmt.Errorf("初始密码超过 bcrypt 的 72 字节上限（%d 字节）", len(password))
+	}
+	hashed, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
+	if err != nil {
+		return "", fmt.Errorf("计算初始管理员密码散列失败: %w", err)
+	}
+	return string(hashed), nil
 }
 
 // 随机密码字符集：去掉 0/O、1/l/I 这些人眼容易认错的字符。

@@ -136,20 +136,22 @@ pnpm build    # 生产构建（含 vue-tsc 类型检查），产出 dist/，由�
 | 初始密码 | **随机生成，只在 `taurus-x` 生成本项目时在终端打印过一次**（不写进本文件，也不写进 `scripts/sql/init.sql`） |
 | 角色 | `super_admin`（代码里直接放行全部菜单/按钮/接口权限） |
 
-密码在 `scripts/sql/init.sql` 里只以 `SHA-256(密码 + salt)` 的小写 hex 存入
-`admin_user_logins.login_credential`，`salt` 是 16 字节随机数的 32 位 hex，**每次生成项目都不同**。
-算法与 `backend/app/helper/crypto.go` 的 `HashPassword`/`GenerateSalt` 完全一致。
+密码在 `scripts/sql/init.sql` 里只以 **bcrypt 散列**存入 `admin_user_logins.login_credential`
+（`salt` 列为空，bcrypt 的盐编码在散列串里），每次生成项目都不同。
+算法与 `backend/app/helper/crypto.go` 的 `HashPassword` 一致。
 
-**没记下初始密码怎么办**：明文无法从散列反推。自己选一个新密码，按同样算法算出散列后更新库里那一行即可：
+**没记下初始密码怎么办**：明文无法从散列反推。自己选一个新密码，用项目自带的小工具算出散列，再更新库里那一行：
 
 ```bash
-# 取出当前 salt
-mysql -uroot -p -N -e "SELECT salt FROM {{ .DBName }}.admin_user_logins WHERE login_value='{{ .AdminUsername }}'"
-# 用取到的 salt 算新散列（密码从标准输入读，别写进命令行历史）
-printf '%s%s' "<新密码>" "<上面的 salt>" | shasum -a 256
-# 回写
-mysql -uroot -p -e "UPDATE {{ .DBName }}.admin_user_logins SET login_credential='<新散列>' WHERE login_value='{{ .AdminUsername }}'"
+# 1. 计算新密码的 bcrypt 散列：密码从键盘输入（不回显），不会进命令行历史，只输出散列
+cd backend && go run ./bin/hashpw
+
+# 2. 回写散列，并让该账号已有的登录全部失效
+mysql -uroot -p {{ .DBName }} -e "UPDATE admin_user_logins SET login_credential='<上一步输出的散列>', salt='' WHERE login_type='username' AND login_value='{{ .AdminUsername }}'; UPDATE admin_users SET auth_version = auth_version + 1 WHERE username='{{ .AdminUsername }}';"
 ```
+
+> 散列里含 `$` 符号，上面用双引号包住整条 SQL、散列放在单引号里，shell 不会替换它；
+> 如果你改用其它写法，注意别让 shell 把 `$2a$10$...` 当成变量吃掉。
 
 也可以直接重新生成一个项目，拿新的随机初始密码。
 
@@ -200,26 +202,19 @@ mysql -uroot -p -e "UPDATE {{ .DBName }}.admin_user_logins SET login_credential=
 
 ### 安全
 
-1. **密码散列用 SHA-256 + salt，强度不足**。SHA-256 是快速散列，对离线爆破几乎没有成本门槛。
-   生产前应换成 `bcrypt` 或 `argon2id`（`golang.org/x/crypto`）。改动点集中在
-   `app/helper/crypto.go` 的三个函数；因为 `salt` 与 `login_credential` 都在
-   `admin_user_logins` 里，可以做「登录时发现是旧格式就重算并升级」的平滑迁移。
-2. **`.env.local` / `.env` 必须留在版本库外**（已在 `.gitignore` 里），并设 `chmod 600`。
-3. **`/admin/user/bind-mobile`、`unbind-mobile` 仍挂在接口权限链上**。这两个接口只能改
+1. **`.env.local` / `.env` 必须留在版本库外**（已在 `.gitignore` 里），并设 `chmod 600`。
+2. **`/admin/user/bind-mobile`、`unbind-mobile` 仍挂在接口权限链上**。这两个接口只能改
    JWT 里的自己（和 `change-password` 一样），但权限数据里还登记着 209、210 两条接口权限，
    所以**普通角色不配这两条权限就绑不了自己的手机号**。`change-password` 已移出权限链；
    这两条要一起移的话，同时删掉 `init.sql` 里 209/210 两行并改 `routes.go` 的中间件链。
-4. **限流器的 per-IP 桶是无上限的 map**（`tlimit.CompositeRateLimiter`，来自公共库）。
-   被打散 IP 刷匿名接口时内存会持续增长。入口建议再加一层 Nginx / WAF 限流，
-   或替换成带 TTL 淘汰的实现。
-5. **`/admin/permission/update-is-system` 允许调用者翻转权限行的 `is_system`**。
-   角色侧的系统角色保护已做（见「已落实的加固」），权限侧还没有；配了该接口权限的人
-   可以把系统权限标记成非系统权限再删掉。
-
-### 功能缺陷
-
-6. 日志表没有归档 / 清理机制，`admin_access_logs` 会随流量无上限增长。上生产前加分区、
-   定期归档或定时清理（可用 `app/crontab/`）。
+3. **只有 4 个入口有限流，`/admin/**` 业务接口不限流**。限流只挂在登录、发验证码、校验验证码、
+   前端错误上报上。通用限流中间件 `RateLimitMiddleware`（`app/middleware/rate_limit.go`）代码在库，
+   但**没有挂到任何路由链**，所以 `config/autoload/http/http.yaml` 里 `rate_limit.composite` /
+   `rate_limit.basic` 的 `enabled: true` 目前不起作用。面向公网时，请在入口加一层 Nginx / WAF 限流，
+   或自行把它挂进 `routes.go` 的中间件链。
+4. **限流是单机内存实现**。多实例部署时每个实例各算各的，总额度会按实例数放大。
+5. **访问日志、操作日志是每个请求单独起协程异步写库的**（`app/middleware/access_log.go`、
+   `operation_log.go`），程序退出时不等待它们写完，退出瞬间的少量日志可能丢失。
 
 ### 行为约定（不是缺陷，容易被当成 bug）
 
@@ -232,6 +227,21 @@ mysql -uroot -p -e "UPDATE {{ .DBName }}.admin_user_logins SET login_credential=
 下面这些改动已经进代码并有对应单元测试覆盖；**是否满足你的业务验收仍需你自己在
 本机跑一遍真实流程确认**，这里不代表已通过业务验收。
 
+- **密码散列改为 bcrypt，老账号登录时自动升级**（`app/helper/crypto.go`、`app/service/auth_service.go`）。
+  新密码、改密、管理员重置、新建用户一律 bcrypt；库里还是旧 SHA-256 散列的账号仍能登录，
+  登录成功后立即在后台换成 bcrypt（不影响本次登录、不让已有会话失效；与改密并发时以改密为准）。
+  超过 bcrypt 72 字节上限的密码会被明确拒绝，不会被悄悄截断。
+  忘记管理员密码时用 `go run ./bin/hashpw` 计算新散列，见「四、初始管理员账号」。
+- **系统权限只能升、不能降**（`app/service/permission_service.go`）：`is_system=1` 的权限不能通过
+  任何接口改回普通权限，也就无法先降级再删除；`/admin/permission/update` 不再修改 `is_system`。
+  确需降级只能直接改数据库。
+- **限流的按 IP 记录会自动回收**（`app/middleware/ip_rate_limiter.go`）：替换了公共库里
+  只增不减的实现。闲置超过 5 分钟且额度已回满的 IP 记录会被清掉（没回满的不清，避免被限流的
+  IP 靠等待清理重置额度）；每个限流器最多记录 10 万个 IP（本底座实际生效 4 个：登录、发验证码、校验验证码、前端错误上报各 1 个），满了之后新 IP 只受全局额度约束，不会撑爆内存。
+- **日志表自动清理**（`app/service/log_cleanup.go`）：访问、操作、前端错误、登录四类日志
+  默认保留 180 天，启动 5～15 分钟后（随机错开，避免多实例同时清理）清理一次，之后每 24 小时一次，分批删除避免锁表。
+  分批删除用 `DELETE … LIMIT`，依赖 MySQL 默认的 `binlog_format=ROW`。
+  用环境变量 `LOG_RETENTION_DAYS` 调整天数，`0` 表示关闭；填负数或非数字时程序拒绝启动。
 - JWT 签名密钥**没配置、过短（< 32 字符）或命中弱值时拒绝启动**（`app/helper/startup_check.go`），
   `.env.example` 不再预置密钥。自检**不看 `http.jwt.enabled`**：那个开关只关掉请求侧的
   鉴权中间件，登录签发 / 刷新 / 解析 Token 始终在用 `http.jwt.secret`。

@@ -1,0 +1,348 @@
+// 日志清理的配置解析、时间分界点计算，以及分批删除（purge）的实际语句行为。
+//
+// 前两件事都「不出错也不会有人发现」，但出错的后果是不可逆的删除：
+//   - 保留期算错一位，就是把该留的数据删了；
+//   - 非法配置被静默当成某个默认值，运维以为配好了，其实在按别的策略删。
+//
+// purge 那部分测的是语句本身：分批逻辑写错的两种后果都很糟 ——
+// 少发一条就永远删不完（库继续长），不收手就是一条接一条地刷 DELETE
+// （把 IO 和行锁占死）。这些只能靠「发了几条语句」来证明，读代码看不出来。
+//
+// 所以这里把边界逐个钉死。
+package service
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+
+	"{{ .Module }}/app/repo"
+)
+
+func TestResolveLogRetentionDays(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		want    int
+		wantErr bool
+	}{
+		{name: "未配置时用默认值", raw: "", want: DefaultLogRetentionDays},
+		{name: "默认值就是 180 天", raw: "180", want: 180},
+		{name: "0 表示不清理", raw: "0", want: 0},
+		{name: "正数按天数生效", raw: "30", want: 30},
+		// 负数大概率是想表达「不要删」，静默当成 180 天会真的删掉运维想留的数据
+		{name: "负数报错", raw: "-1", wantErr: true},
+		{name: "大负数报错", raw: "-365", wantErr: true},
+		// GetInt 对这些值会返回 0，而 0 在这里是「永久保留」的合法值 ——
+		// 所以必须走 GetString + 显式解析，拼错的配置要报错而不是变成「不清理」
+		{name: "非整数报错", raw: "abc", wantErr: true},
+		{name: "小数报错", raw: "30.5", wantErr: true},
+		{name: "带单位报错", raw: "180d", wantErr: true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := ResolveLogRetentionDays(func(string) string { return c.raw })
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("输入 %q 应当报错，实际返回 %d", c.raw, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("输入 %q 不该报错: %v", c.raw, err)
+			}
+			if got != c.want {
+				t.Errorf("输入 %q：期望 %d 天，实际 %d 天", c.raw, c.want, got)
+			}
+		})
+	}
+}
+
+// TestResolveLogRetentionDays_ReadsExpectedKey 配置键名写错会让配置静默失效
+// （取到空串 → 回落默认值），这里把键名钉住。
+func TestResolveLogRetentionDays_ReadsExpectedKey(t *testing.T) {
+	var asked []string
+	if _, err := ResolveLogRetentionDays(func(key string) string {
+		asked = append(asked, key)
+		return ""
+	}); err != nil {
+		t.Fatalf("不该报错: %v", err)
+	}
+	if len(asked) != 1 || asked[0] != "log_retention_days" {
+		t.Errorf("应当只读取 log_retention_days，实际读了 %v", asked)
+	}
+}
+
+// TestLogCleanerCutoff 分界点 = 当前时间往前推 N 天。
+// 早于它的删除，不早于它的保留。
+func TestLogCleanerCutoff(t *testing.T) {
+	now := time.Date(2025, 6, 15, 10, 30, 0, 0, time.UTC)
+
+	for _, c := range []struct {
+		days int
+		want time.Time
+	}{
+		{days: 180, want: time.Date(2024, 12, 17, 10, 30, 0, 0, time.UTC)},
+		{days: 1, want: time.Date(2025, 6, 14, 10, 30, 0, 0, time.UTC)},
+		{days: 365, want: time.Date(2024, 6, 15, 10, 30, 0, 0, time.UTC)},
+	} {
+		got := NewLogCleaner(nil, c.days).Cutoff(now)
+		if !got.Equal(c.want) {
+			t.Errorf("保留 %d 天：期望分界点 %v，实际 %v", c.days, c.want, got)
+		}
+	}
+}
+
+// TestLogCleanerCutoff_HandlesMonthBoundaries 用 AddDate(0,0,-N) 而不是
+// Sub(N*24h)：后者在夏令时切换的时区里会差一小时。跨月、跨年、闰日都要对。
+func TestLogCleanerCutoff_HandlesMonthBoundaries(t *testing.T) {
+	cleaner := NewLogCleaner(nil, 1)
+
+	// 闰年 3 月 1 日往前一天是 2 月 29 日
+	got := cleaner.Cutoff(time.Date(2024, 3, 1, 0, 0, 0, 0, time.UTC))
+	if want := time.Date(2024, 2, 29, 0, 0, 0, 0, time.UTC); !got.Equal(want) {
+		t.Errorf("闰年跨月：期望 %v，实际 %v", want, got)
+	}
+
+	// 跨年
+	got = cleaner.Cutoff(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+	if want := time.Date(2024, 12, 31, 0, 0, 0, 0, time.UTC); !got.Equal(want) {
+		t.Errorf("跨年：期望 %v，实际 %v", want, got)
+	}
+}
+
+// TestLogCleaner_DisabledDoesNothing 保留天数为 0 时必须彻底关闭：
+// 不启动后台 goroutine，RunOnce 也不发任何语句。
+//
+// store 传 nil：一旦实现里真的去碰数据库就会 panic，所以这条测试同时证明了
+// 「关闭时一条删除都不会发出去」。
+func TestLogCleaner_DisabledDoesNothing(t *testing.T) {
+	for _, days := range []int{0, -1} {
+		cleaner := NewLogCleaner(nil, days)
+		if cleaner.Enabled() {
+			t.Errorf("保留天数 %d 时不该启用清理", days)
+		}
+		if stop := cleaner.Start(); stop != nil {
+			stop()
+			t.Errorf("保留天数 %d 时 Start 不该启动后台任务", days)
+		}
+		// 不 panic 即说明没有碰数据库
+		cleaner.RunOnce(context.Background())
+	}
+}
+
+// TestLogCleaner_StartStopDoesNotLeak 启动再停止必须干净退出。
+//
+// Start 返回的停止函数会等 goroutine 真的退出才返回，所以这个测试本身
+// 就是在验证「进程退出时不会泄漏 goroutine」—— 如果 goroutine 不响应取消，
+// 这里会卡死直到测试超时。
+func TestLogCleaner_StartStopDoesNotLeak(t *testing.T) {
+	cleaner := NewLogCleaner(nil, 180)
+	stop := cleaner.Start()
+	if stop == nil {
+		t.Fatal("启用时 Start 应返回停止函数")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("停止函数没有在 5 秒内返回：后台 goroutine 不响应取消，进程退出时会泄漏")
+	}
+}
+
+// TestLogCleanupBatching 分批参数的健全性。
+//
+// 这些常量不是随手填的：批大小太大就退化成长事务（正是分批要避免的），
+// 太小则清理追不上写入速度。上限和停顿同理。
+func TestLogCleanupBatching(t *testing.T) {
+	if logCleanupBatchSize <= 0 || logCleanupBatchSize > 20000 {
+		t.Errorf("单批删除行数 %d 不合理：过大等于没分批（长事务 + 锁表）", logCleanupBatchSize)
+	}
+	if logCleanupMaxBatches <= 0 {
+		t.Error("单轮批次上限必须为正，否则一轮一条都删不掉")
+	}
+	if logCleanupBatchPause <= 0 {
+		t.Error("批次之间需要停顿，否则会把 IO 和行锁占死")
+	}
+	if logCleanupInterval < time.Hour {
+		t.Errorf("清理间隔 %v 过短", logCleanupInterval)
+	}
+	if logCleanupStartDelay <= 0 {
+		t.Error("启动后应延迟一段时间再做第一次清理，避开启动高峰")
+	}
+	if logCleanupStartJitter <= 0 {
+		t.Error("首次延迟必须带随机抖动：多实例同时启动时，没有抖动就会一起删同一批行、互相争锁")
+	}
+	if DefaultLogRetentionDays != 180 {
+		t.Errorf("默认保留期应为 180 天（已确认的方案），实际 %d", DefaultLogRetentionDays)
+	}
+}
+
+// TestRandomizedStartDelay_InRange 抖动后的首次延迟必须落在
+// [基础延迟, 基础延迟 + 抖动上限] 内，且确实会变化。
+//
+// 两头都要钉：下界保证「仍然避开启动高峰」（抖动不能把延迟抖成 0），
+// 上界保证「不会半天不清理」。
+func TestRandomizedStartDelay_InRange(t *testing.T) {
+	seen := make(map[time.Duration]struct{})
+	for i := 0; i < 200; i++ {
+		d := randomizedStartDelay()
+		if d < logCleanupStartDelay || d > logCleanupStartDelay+logCleanupStartJitter {
+			t.Fatalf("首次延迟 %v 超出 [%v, %v]", d, logCleanupStartDelay, logCleanupStartDelay+logCleanupStartJitter)
+		}
+		seen[d] = struct{}{}
+	}
+	// 200 次全撞同一个值说明抖动根本没生效（比如随机上限写成了 0）
+	if len(seen) < 2 {
+		t.Error("200 次取到的首次延迟完全相同：随机抖动没有生效，多实例还是会撞在一起")
+	}
+}
+
+// ==================== purge：分批删除的语句行为 ====================
+
+// newMockLogCleaner 按生产方式装配 LogCleaner，只把 Store 绑到 sqlmock 上。
+//
+// 做法同 password_upgrade_test.go：sqlmock 当连接，跑真的 GORM + repo。
+// sqlmock 按顺序匹配期望，期望里没登记的语句一律报「未预期的语句」，
+// 所以「只发了 N 条 DELETE」「一条都没发」都是硬断言，不靠读代码确认。
+func newMockLogCleaner(t *testing.T, retentionDays, maxBatches int) (*LogCleaner, sqlmock.Sqlmock) {
+	t.Helper()
+	sqlDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("创建 sqlmock 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	db, err := gorm.Open(mysql.New(mysql.Config{Conn: sqlDB, SkipInitializeWithVersion: true}), &gorm.Config{
+		Logger:                 logger.Discard,
+		DisableAutomaticPing:   true,
+		SkipDefaultTransaction: true,
+	})
+	if err != nil {
+		t.Fatalf("GORM 挂载 sqlmock 失败: %v", err)
+	}
+
+	cleaner := NewLogCleaner(repo.NewStoreWithDB(db), retentionDays)
+	cleaner.maxBatches = maxBatches
+	return cleaner, mock
+}
+
+// purgeTarget 测试统一用清单里的第一张表（时间列 created_at）。
+// 用清单里的真值而不是自己造一个 target，顺带保证清单没被改空。
+func purgeTarget(t *testing.T) repo.LogRetentionTarget {
+	t.Helper()
+	if len(repo.LogRetentionTargets) == 0 {
+		t.Fatal("日志清理清单是空的：没有任何表会被清理")
+	}
+	return repo.LogRetentionTargets[0]
+}
+
+// deletePattern 一条分批删除语句的形状（表名 + 时间条件 + LIMIT）。
+func deletePattern(target repo.LogRetentionTarget) string {
+	return "DELETE FROM `" + target.Table + "` WHERE " + target.TimeColumn + " < \\? LIMIT \\?"
+}
+
+// TestLogCleanerPurge_StopsOnPartialBatch 删不满一批就说明删完了，必须收手。
+//
+// 第一批满额（5000）→ 继续；第二批只删到 3 行 → 立刻停。
+// 一共两条 DELETE，返回 5003。
+//
+// 反向的两种写错都会被这条测试抓到：判据写成 `deleted == 0` 会多发一条
+// 无谓的 DELETE（sqlmock 报未预期的语句）；判据写反会少发一条，总数对不上。
+func TestLogCleanerPurge_StopsOnPartialBatch(t *testing.T) {
+	cleaner, mock := newMockLogCleaner(t, 180, logCleanupMaxBatches)
+	target := purgeTarget(t)
+
+	mock.ExpectExec(deletePattern(target)).WillReturnResult(sqlmock.NewResult(0, logCleanupBatchSize))
+	mock.ExpectExec(deletePattern(target)).WillReturnResult(sqlmock.NewResult(0, 3))
+
+	total, err := cleaner.purge(context.Background(), target, cleaner.Cutoff(time.Now()))
+	if err != nil {
+		t.Fatalf("purge 不该报错: %v", err)
+	}
+	if want := int64(logCleanupBatchSize + 3); total != want {
+		t.Errorf("删除总行数应为 %d，实际 %d", want, total)
+	}
+	assertNoUnexpectedStatements(t, mock)
+}
+
+// TestLogCleanerPurge_CanceledContextIssuesNoStatement ctx 已取消时一条语句都不发。
+//
+// 这是进程退出路径：停止函数先 cancel，再等 goroutine 退出。如果 purge 不先看
+// ctx，就会在连接池已经开始关闭时又发一条 DELETE，退出日志里出现
+// `sql: database is closed`，而且那一批删到哪儿没人知道。
+//
+// mock 里没有登记任何期望，所以「发出任何语句」都会被判为未预期。
+func TestLogCleanerPurge_CanceledContextIssuesNoStatement(t *testing.T) {
+	cleaner, mock := newMockLogCleaner(t, 180, logCleanupMaxBatches)
+	target := purgeTarget(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	total, err := cleaner.purge(ctx, target, cleaner.Cutoff(time.Now()))
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("已取消的 ctx 应返回 context.Canceled，实际 %v", err)
+	}
+	if total != 0 {
+		t.Errorf("已取消的 ctx 不该删掉任何行，实际 %d", total)
+	}
+	assertNoUnexpectedStatements(t, mock)
+}
+
+// TestLogCleanerPurge_SafetyValveStops 批次上限是安全阀：每批都满额时也必须收手。
+//
+// 真实触发场景是时间列的数据有问题（比如整列零值时间），此时每一批都能删满，
+// 没有上限的话这个后台任务就会一直刷 DELETE 把库占住。
+// 这里把上限注入成 2：恰好两条 DELETE，不是三条，而且不算错误（下一轮继续）。
+func TestLogCleanerPurge_SafetyValveStops(t *testing.T) {
+	const maxBatches = 2
+	cleaner, mock := newMockLogCleaner(t, 180, maxBatches)
+	target := purgeTarget(t)
+
+	for i := 0; i < maxBatches; i++ {
+		mock.ExpectExec(deletePattern(target)).WillReturnResult(sqlmock.NewResult(0, logCleanupBatchSize))
+	}
+
+	total, err := cleaner.purge(context.Background(), target, cleaner.Cutoff(time.Now()))
+	if err != nil {
+		t.Fatalf("撞上安全阀不是错误（下一轮继续），实际 %v", err)
+	}
+	if want := int64(maxBatches * logCleanupBatchSize); total != want {
+		t.Errorf("删除总行数应为 %d，实际 %d", want, total)
+	}
+	assertNoUnexpectedStatements(t, mock)
+}
+
+// TestLogCleanerPurge_StopsOnError 单批报错时立刻停手，并把已删行数带回去。
+//
+// 已删行数必须带回去：调用方（RunOnce）靠它打「删了多少行」的日志，
+// 报错时丢掉这个数字，排障时就看不出清理到底推进了多少。
+func TestLogCleanerPurge_StopsOnError(t *testing.T) {
+	cleaner, mock := newMockLogCleaner(t, 180, logCleanupMaxBatches)
+	target := purgeTarget(t)
+
+	mock.ExpectExec(deletePattern(target)).WillReturnResult(sqlmock.NewResult(0, logCleanupBatchSize))
+	mock.ExpectExec(deletePattern(target)).WillReturnError(errors.New("lock wait timeout"))
+
+	total, err := cleaner.purge(context.Background(), target, cleaner.Cutoff(time.Now()))
+	if err == nil {
+		t.Fatal("单批失败时 purge 应返回错误")
+	}
+	if want := int64(logCleanupBatchSize); total != want {
+		t.Errorf("报错前已删 %d 行应被带回，实际 %d", want, total)
+	}
+	assertNoUnexpectedStatements(t, mock)
+}

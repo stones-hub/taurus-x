@@ -1,0 +1,225 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"math/rand/v2"
+	"strconv"
+	"time"
+
+	"{{ .Module }}/app/repo"
+)
+
+// 日志表的定期清理。
+//
+// 为什么不用 cron 组件：cron 默认是关闭的（config/autoload/cron），
+// 挂在上面等于「默认不清理」，而日志表长满磁盘这件事不该依赖一个可选组件。
+// 这里用一个自带 ticker 的后台 goroutine，随后端进程一起生效，
+// 并通过 app 包的 cleanups 机制在退出时停掉。
+//
+// 清理只按时间条件删除，保留期内的数据不会被碰到；日志里只打印「哪张表删了多少行」，
+// 绝不打印日志内容本身（访问日志里有 IP、UA、请求路径，操作日志里有操作参数）。
+const (
+	// DefaultLogRetentionDays 默认保留 180 天。
+	// 半年足够覆盖「上季度出过什么问题」这类回溯需求，又不至于让流水表无限膨胀。
+	DefaultLogRetentionDays = 180
+
+	// logRetentionConfigKey 配置键；对应 .env 里的 LOG_RETENTION_DAYS。
+	logRetentionConfigKey = "log_retention_days"
+
+	// logCleanupBatchSize 单条 DELETE 最多删多少行。
+	// 5000 行的删除在 MySQL 上是毫秒级的小事务，锁持有时间短，不会卡住业务查询。
+	logCleanupBatchSize = 5000
+
+	// logCleanupBatchPause 两批之间的停顿，给业务查询让出 IO 和行锁。
+	logCleanupBatchPause = 200 * time.Millisecond
+
+	// logCleanupMaxBatches 单表单轮最多删多少批（安全阀）。
+	// 5000 × 2000 = 1000 万行/表/轮，正常情况远远用不到；
+	// 它的作用是万一时间列上的数据有问题（比如全是零值时间），
+	// 也不会让这个后台任务无限循环刷 DELETE。没删完的下一轮继续。
+	logCleanupMaxBatches = 2000
+
+	// logCleanupStartDelay 启动后第一次清理的基础延迟。
+	// 不在启动瞬间删：那会儿正在建连接池、预热缓存、接第一批请求，
+	// 没必要再叠一个批量删除上去。
+	logCleanupStartDelay = 5 * time.Minute
+
+	// logCleanupStartJitter 首次延迟之上再叠加的随机抖动上限（0~10 分钟）。
+	//
+	// 多实例部署时各进程往往是同时启动（滚动发布、整体重启），没有抖动的话
+	// 四张表的 DELETE 会在同一秒撞到同一个库上：彼此争同一批行的锁，
+	// 实例数越多越慢。抖动把它们摊开到十分钟内，互相不打扰。
+	// 不需要分布式锁：删除只由时间条件决定，重复执行的那条语句命中 0 行，
+	// 不是错误（见 RunOnce）。
+	logCleanupStartJitter = 10 * time.Minute
+
+	// logCleanupInterval 之后的清理间隔。
+	logCleanupInterval = 24 * time.Hour
+)
+
+// ResolveLogRetentionDays 解析日志保留天数。
+//
+// 返回值语义：
+//   - 未配置（取到空串）→ DefaultLogRetentionDays；
+//   - 0 → 关闭清理（明确表示「永久保留」，是一个合法选择）；
+//   - 正数 → 按该天数保留；
+//   - 负数或解析不出来 → 返回 error，调用方据此让启动失败。
+//
+// 为什么非法值选「启动失败」而不是「回退默认值」：这个配置项控制的是**不可逆的删除**。
+// 把 `-365`（大概是想表达「不要删」）悄悄当成 180 天，会真的删掉运维想留的数据，
+// 而且只在日志里留一行警告 —— 没人会注意到。启动失败则是立刻、显眼、且无损的，
+// 改一个字符就能恢复。项目里已有同样取舍的先例：JWT 密钥没配好时直接拒绝启动。
+//
+// 另外刻意用 GetString 而不是 GetInt：GetInt 碰到 `abc` 这种值会返回 0，
+// 而 0 在这里是「关闭清理」的合法值 —— 一个拼错的配置会被静默解读成「永久保留」。
+func ResolveLogRetentionDays(getString func(string) string) (int, error) {
+	raw := getString(logRetentionConfigKey)
+	if raw == "" {
+		return DefaultLogRetentionDays, nil
+	}
+	days, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("配置 %s 不是整数: %q", logRetentionConfigKey, raw)
+	}
+	if days < 0 {
+		return 0, fmt.Errorf("配置 %s 不能为负数（%d）；0 表示不清理，正数表示保留天数", logRetentionConfigKey, days)
+	}
+	return days, nil
+}
+
+// LogCleaner 日志表定期清理器。
+//
+// 刻意不提供 wire provider set：它不是任何接口的依赖，由 app 包在启动时直接构造，
+// 多一个 provider 只会让组件图里多一个没人注入的节点。
+type LogCleaner struct {
+	store         *repo.Store
+	retentionDays int
+
+	// now 时钟来源，测试注入假时钟以断言 cutoff 的计算。
+	now func() time.Time
+	// firstDelay 首次执行的等待时长，测试注入以免等上几分钟。
+	firstDelay func() time.Duration
+	// maxBatches 单表单轮的批次上限，测试注入小值以断言安全阀生效。
+	maxBatches int
+}
+
+// NewLogCleaner 创建清理器。retentionDays <= 0 表示不清理。
+func NewLogCleaner(store *repo.Store, retentionDays int) *LogCleaner {
+	return &LogCleaner{
+		store:         store,
+		retentionDays: retentionDays,
+		now:           time.Now,
+		firstDelay:    randomizedStartDelay,
+		maxBatches:    logCleanupMaxBatches,
+	}
+}
+
+// randomizedStartDelay 首次执行延迟 = 基础延迟 + 0~logCleanupStartJitter 的随机抖动。
+//
+// 用 math/rand 足够：这里要的是「几个进程别撞在一起」，不是不可预测性，
+// 没有任何安全判定依赖这个值。
+func randomizedStartDelay() time.Duration {
+	return logCleanupStartDelay + time.Duration(rand.Int64N(int64(logCleanupStartJitter)+1))
+}
+
+// Enabled 是否启用清理。
+func (c *LogCleaner) Enabled() bool { return c.retentionDays > 0 }
+
+// Cutoff 计算本轮的时间分界点：早于它的日志被删除，不早于它的一律保留。
+func (c *LogCleaner) Cutoff(now time.Time) time.Time {
+	return now.AddDate(0, 0, -c.retentionDays)
+}
+
+// Start 启动后台清理任务，返回用于停止它的函数；未启用时返回 nil。
+//
+// 返回的停止函数会等 goroutine 真正退出才返回，所以进程退出时不会留下
+// 半截执行的 DELETE 循环，也不会泄漏 goroutine。调用方必须把它排在
+// 「关闭数据库」之前（见 app.startLogCleanup 的头插）。
+func (c *LogCleaner) Start() func() {
+	if !c.Enabled() {
+		log.Printf("🔗 -> 日志清理未启用（%s = 0，日志永久保留）\n", logRetentionConfigKey)
+		return nil
+	}
+	first := c.firstDelay()
+	log.Printf("🔗 -> 日志清理已启用：保留 %d 天，%v 后执行第一次，之后每 %v 一次\n",
+		c.retentionDays, first.Truncate(time.Second), logCleanupInterval)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		timer := time.NewTimer(first)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+			}
+			c.RunOnce(ctx)
+			timer.Reset(logCleanupInterval)
+		}
+	}()
+
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+// RunOnce 执行一轮清理：逐表分批删除早于保留期的记录。
+//
+// 单表失败不影响其它表：日志清理是尽力而为的后台维护，一张表的权限或锁等待问题
+// 不该让另外三张表也不清理。
+func (c *LogCleaner) RunOnce(ctx context.Context) {
+	if !c.Enabled() {
+		return
+	}
+	cutoff := c.Cutoff(c.now())
+	for _, target := range repo.LogRetentionTargets {
+		deleted, err := c.purge(ctx, target, cutoff)
+		// 先汇报已经删掉的量，再报错：被 ctx 取消时这个数字也是有意义的
+		if deleted > 0 {
+			log.Printf("🔗 -> 日志清理: %s 删除 %d 行（早于 %s）\n", target.Table, deleted, cutoff.Format(time.DateTime))
+		}
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				// 进程正在退出，剩下的表下次再说
+				return
+			}
+			log.Printf("🔗 -> 日志清理失败: %s, err=%v\n", target.Table, err)
+		}
+	}
+}
+
+// purge 分批删一张表，直到删不满一批（说明已经删完）或撞上安全阀。
+func (c *LogCleaner) purge(ctx context.Context, target repo.LogRetentionTarget, cutoff time.Time) (int64, error) {
+	logRepo := c.store.LogRetention()
+	var total int64
+	for i := 0; i < c.maxBatches; i++ {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		deleted, err := logRepo.DeleteOlderThan(ctx, target, cutoff, logCleanupBatchSize)
+		total += deleted
+		if err != nil {
+			return total, err
+		}
+		if deleted < logCleanupBatchSize {
+			return total, nil
+		}
+		// 还有得删：歇一下再继续，别把 IO 和行锁占死
+		select {
+		case <-ctx.Done():
+			return total, ctx.Err()
+		case <-time.After(logCleanupBatchPause):
+		}
+	}
+	// 撞上安全阀：没删完也先收手，下一轮继续
+	log.Printf("🔗 -> 日志清理: %s 单轮已删 %d 行，达到单轮上限，剩余部分下轮继续\n", target.Table, total)
+	return total, nil
+}

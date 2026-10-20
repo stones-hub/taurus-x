@@ -6,8 +6,6 @@ package generator
 
 import (
 	"bytes"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"io/fs"
@@ -100,12 +98,14 @@ type templateData struct {
 
 	// AdminUsername 初始管理员账号。
 	AdminUsername string
-	// AdminPassword 初始管理员随机密码明文，仅用于计算散列，不渲染进任何模板。
-	AdminPassword string
-	// AdminPasswordSalt 初始管理员密码 salt。
-	AdminPasswordSalt string
-	// AdminPasswordHash 初始管理员密码散列，写进 init.sql。
+	// AdminPasswordSalt 已删除：bcrypt 的盐编码在散列串里，init.sql 的 salt 列写空串。
+	// AdminPasswordHash 初始管理员密码 bcrypt 散列，写进 init.sql。
 	AdminPasswordHash string
+
+	// 这里**刻意没有**明文密码字段。模板数据是整棵模板树的渲染上下文，
+	// 任何一个 .tmpl 只要引用这个字段，就把明文落进了生成文件（而那些文件
+	// 往往会被提交进使用者的版本库）。明文只在 buildTemplateData 的返回值里
+	// 单独传给 Generate，最终只进 Result，由 CLI 在终端打印一次。
 }
 
 // Generate 按 opts 生成项目。
@@ -125,7 +125,8 @@ func Generate(opts Options) (*Result, error) {
 	}
 
 	selected := normalizeComponents(opts.Components)
-	data, err := buildTemplateData(opts, selected)
+	// 明文密码与模板数据分开返回：它不进渲染上下文（见 templateData 结尾的注释）
+	data, adminPassword, err := buildTemplateData(opts, selected)
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +162,7 @@ func Generate(opts Options) (*Result, error) {
 		OutputDir:     outDir,
 		Components:    selected,
 		AdminUsername: data.AdminUsername,
-		AdminPassword: data.AdminPassword,
+		AdminPassword: adminPassword,
 	}, nil
 }
 
@@ -246,7 +247,9 @@ func normalizeComponents(chosen []string) []string {
 	return result
 }
 
-func buildTemplateData(opts Options, selected []string) (*templateData, error) {
+// buildTemplateData 组装模板渲染上下文，并把初始管理员的**明文**密码作为第二个
+// 返回值单独交出去 —— 它不是渲染上下文的一部分，不能进 templateData。
+func buildTemplateData(opts Options, selected []string) (*templateData, string, error) {
 	has := make(map[string]bool, len(components.All))
 	for _, name := range components.AllNames() {
 		has[name] = false
@@ -258,18 +261,17 @@ func buildTemplateData(opts Options, selected []string) (*templateData, error) {
 		requires = append(requires, c)
 	}
 
-	// salt 16 字节 → 32 位 hex，与生成项目 helper.GenerateSalt 的长度一致。
-	salt, err := randomHex(16)
-	if err != nil {
-		return nil, err
-	}
-
 	// 初始管理员密码每次生成都不同：固定密码一旦写进文档/仓库，
 	// 等于所有用 taurus-x 生成的项目共用一个已知口令。
 	const adminUsername = "admin"
 	adminPassword, err := randomPassword(16)
 	if err != nil {
-		return nil, err
+		return nil, "", err
+	}
+	// bcrypt 自带随机盐，所以同一个密码每次散列结果也不同，不需要我们自己造 salt。
+	adminPasswordHash, err := passwordHash(adminPassword)
+	if err != nil {
+		return nil, "", err
 	}
 
 	return &templateData{
@@ -282,10 +284,8 @@ func buildTemplateData(opts Options, selected []string) (*templateData, error) {
 		Requires:          requires,
 		WireVersion:       "v0.6.0",
 		AdminUsername:     adminUsername,
-		AdminPassword:     adminPassword,
-		AdminPasswordSalt: salt,
-		AdminPasswordHash: passwordHash(adminPassword, salt),
-	}, nil
+		AdminPasswordHash: adminPasswordHash,
+	}, adminPassword, nil
 }
 
 // writeTree 遍历 embed 模板树写出项目文件。
@@ -403,12 +403,4 @@ func npmName(projectName string) string {
 		name = "app"
 	}
 	return name
-}
-
-func randomHex(n int) (string, error) {
-	buf := make([]byte, n)
-	if _, err := rand.Read(buf); err != nil {
-		return "", fmt.Errorf("生成随机值失败: %w", err)
-	}
-	return hex.EncodeToString(buf), nil
 }

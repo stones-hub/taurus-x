@@ -36,8 +36,10 @@
 - accessor：各仓储的 `Store.Xxx()` / `Tx.Xxx()` 以 `repoSet` 为载体**单份定义**（`func (r repoSet) Xxx()`），`Store` 与 `Tx` 内嵌 `repoSet`，两作用域完全对称（见第 7 节）。
 
 ### 3. 密码
-- SHA-256(`password` + `salt`)，用 `helper/crypto.go`；**不是** bcrypt / MD5。散列与 salt 存 `admin_user_logins`。
-- 这是底座沿用的既有算法。如果本项目没有存量账号要兼容，**建议尽早换成 bcrypt / argon2id**（SHA-256 无计算成本因子，离线爆破成本低）；换的时候只改 `helper/crypto.go` 与 `scripts/sql/init.sql` 里初始管理员的散列。
+- 一律用 `helper/crypto.go`：`HashPassword` 生成 bcrypt 散列（写入 `admin_user_logins.login_credential`，`salt` 列写空串），`VerifyPassword` 校验。**不要自己写散列，也不要用 MD5 / SHA 系列存密码。**
+- `VerifyPassword` 兼容历史的 SHA-256(`password` + `salt`) 散列，登录成功后自动升级为 bcrypt；`LegacyHashPassword` 只用于校验历史数据和测试，禁止用来生成新密码。
+- bcrypt 只取前 72 字节，`HashPassword` 对超长密码返回 `ErrPasswordTooLong`，调用方必须把错误回给用户，不能自己截断。
+- **bcrypt 这类慢计算不得放在事务里执行**：在进 `store.RunInTx` 之前算好散列，事务内只写算好的字符串（仓储只提供 `SyncPasswordHash` 这类收散列的方法）。否则行锁和数据库连接会被占用上百毫秒。
 
 ### 4. 不开 AutoMigrate
 - **不使用 GORM 的 `AutoMigrate`**：建表、加字段、加索引一律手写 SQL 落盘 `scripts/sql/`，让 schema 变更可审查、可回放、可按环境执行。

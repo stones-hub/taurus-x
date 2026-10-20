@@ -3,6 +3,12 @@ version: "${VERSION:v1.0.0}"
 app_name: "${APP_NAME:{{ .ProjectName }}}"
 pprof_enabled: ${PPROF_ENABLED:false} # pprof 默认关闭；需要时在本机临时打开（只监听 127.0.0.1:6060）
 
+# 数据库日志表（访问日志/操作日志/登录日志/前端错误上报）的保留天数。
+# 后端启动后会有一个后台任务按这个保留期分批删除过期记录（见 app/service/log_cleanup.go）。
+# 0 表示永久保留、不清理；负数或非整数会让服务拒绝启动（这个值控制不可逆的删除，
+# 不猜）。
+log_retention_days: "${LOG_RETENTION_DAYS:180}"
+
 # Go 运行时配置
 go:
   max_procs: 8 # 最大cpu核心数

@@ -1,0 +1,88 @@
+// hashpw：忘记管理员密码时用的离线工具。
+//
+//	cd backend && go run ./bin/hashpw
+//
+// 从标准输入读一个新密码，打印它的 bcrypt 散列，然后把散列手动更新进库：
+//
+//	UPDATE admin_user_logins SET login_credential='<散列>', salt=''
+//	 WHERE login_type='username' AND login_value='admin';
+//	-- 顺带把该账号的所有在线会话踢掉（密码换了，旧 Token 不该还能用）：
+//	UPDATE admin_users SET auth_version = auth_version + 1 WHERE username='admin';
+//
+// 刻意做成只算散列、不连数据库：它要在「登不进后台」的时候用，这种时候往往
+// 配置都还没对，连库只会多一类失败原因；而且让人自己执行那条 UPDATE，
+// 比给一个能直接改任意账号密码的命令行工具安全得多。
+//
+// 关于密码的处理：
+//   - 密码只从标准输入读，**不接受命令行参数** —— 参数会进 shell 历史和 ps 输出；
+//   - 终端下关闭回显（golang.org/x/term），管道/重定向输入时读一行；
+//   - 全程只存在内存里，不写任何文件、不打日志、不回显，输出只有散列本身。
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+
+	"golang.org/x/term"
+
+	"{{ .Module }}/app/helper"
+)
+
+func main() {
+	if len(os.Args) > 1 {
+		fmt.Fprintln(os.Stderr, "用法: go run ./bin/hashpw   （密码只从标准输入读，不接受命令行参数）")
+		os.Exit(2)
+	}
+
+	password, err := readPassword()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "读取密码失败: %v\n", err)
+		os.Exit(1)
+	}
+	if password == "" {
+		fmt.Fprintln(os.Stderr, "密码不能为空")
+		os.Exit(1)
+	}
+
+	// 用后端自己的强度规则先挡一遍：这里算出的散列是要给后端校验的，
+	// 生成一个后端自己都不允许设置的密码没有意义（6-20 字节、含字母和数字）。
+	if err := helper.ValidatePasswordStrength(password); err != nil {
+		fmt.Fprintf(os.Stderr, "密码不符合要求: %v\n", err)
+		os.Exit(1)
+	}
+
+	hashed, err := helper.HashPassword(password)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "计算散列失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 只有散列走标准输出，方便 `go run ./bin/hashpw | pbcopy` 之类的用法；
+	// 提示文字一律走标准错误。
+	fmt.Println(hashed)
+}
+
+// readPassword 读一次密码。终端下不回显，非终端（管道、重定向）下读一行。
+func readPassword() (string, error) {
+	fd := int(os.Stdin.Fd())
+	if term.IsTerminal(fd) {
+		fmt.Fprint(os.Stderr, "请输入新密码（不回显）: ")
+		b, err := term.ReadPassword(fd)
+		fmt.Fprintln(os.Stderr)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	}
+
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && err != io.EOF {
+		return "", err
+	}
+	// 去掉行尾换行；前后空格保留 —— 空格是合法密码字符，替用户 trim 掉
+	// 只会让他算出一个和自己输入不一致的散列。
+	return strings.TrimRight(line, "\r\n"), nil
+}

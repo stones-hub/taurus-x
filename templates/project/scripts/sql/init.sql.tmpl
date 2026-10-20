@@ -47,15 +47,17 @@ CREATE TABLE IF NOT EXISTS `admin_users` (
   KEY `idx_user_source` (`user_source`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='用户基础信息表';
 
--- 密码 hash 与盐存在本表（SHA-256(password + salt)，见 app/helper/crypto.go），
+-- 密码 hash 存在本表（bcrypt，见 app/helper/crypto.go）。bcrypt 的盐已经编码在
+-- 散列串里，所以 salt 列在新算法下不再使用（一律空串）；列保留只是为了兼容
+-- 历史数据：老项目里存的是 SHA-256(password + salt)，登录时会被自动升级成 bcrypt。
 -- 一个用户可有多种登录方式（username / mobile / 各 SSO），按 login_type 区分。
 CREATE TABLE IF NOT EXISTS `admin_user_logins` (
   `login_id`         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '登录方式ID',
   `user_id`          BIGINT UNSIGNED NOT NULL                COMMENT '用户ID',
   `login_type`       VARCHAR(64)     NOT NULL                COMMENT '登录类型（username/mobile/wechat_work/dingtalk/feishu）',
   `login_value`      VARCHAR(100)    NOT NULL                COMMENT '登录标识',
-  `login_credential` VARCHAR(255)    NOT NULL DEFAULT ''     COMMENT '登录凭证（密码hash）',
-  `salt`             VARCHAR(32)     NOT NULL DEFAULT ''     COMMENT '密码盐值',
+  `login_credential` VARCHAR(255)    NOT NULL DEFAULT ''     COMMENT '登录凭证（bcrypt 散列，60 字符）',
+  `salt`             VARCHAR(32)     NOT NULL DEFAULT ''     COMMENT '历史遗留盐值；bcrypt 下不使用，恒为空串',
   `status`           TINYINT         NOT NULL DEFAULT 1      COMMENT '状态：1启用，0禁用',
   `created_at`       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   `updated_at`       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '修改时间',
@@ -375,14 +377,16 @@ SELECT 1, `permission_id` FROM `admin_permissions`;
 
 -- ============================ 七、初始管理员 ============================
 
--- 密码散列：login_credential = SHA-256(明文密码 + salt) 的小写 hex，salt 为 16 字节随机数的
--- 32 位 hex（由 taurus-x 生成项目时一次性生成，每个项目都不同）。
--- 算法与 app/helper/crypto.go 的 HashPassword/GenerateSalt 完全一致。
+-- 密码散列：login_credential = bcrypt(明文密码)，cost 10，形如 `$2a$10$...`（60 字符）。
+-- bcrypt 自带随机盐并编码在散列串里，所以每个项目的散列都不同，salt 列写空串。
+-- 算法与 app/helper/crypto.go 的 HashPassword 一致（生成侧见 taurus-x
+-- internal/generator/password.go，两边必须用同一个 cost 常量）。
 --
 --   初始账号：{{ .AdminUsername }}
 --   初始密码：**不写在本文件里**。生成项目时由 taurus-x 随机产生并只在终端打印一次
---             （见生成项目 README「初始管理员」一节）。没记下来就改掉下面的散列重新来：
---             散列算法如上，或直接重新生成项目。
+--             （见生成项目 README「初始管理员」一节）。没记下来就换掉下面的散列：
+--             `cd backend && go run ./bin/hashpw`，从标准输入读新密码并输出 bcrypt
+--             散列，再 UPDATE admin_user_logins 的 login_credential（salt 置空串）。
 --
 -- ⚠️ 首次登录后请立刻通过「个人信息 → 修改密码」改掉初始密码。
 INSERT INTO `admin_users`
@@ -393,6 +397,6 @@ VALUES
 INSERT INTO `admin_user_logins`
   (`user_id`, `login_type`, `login_value`, `login_credential`, `salt`, `status`)
 VALUES
-  (1, 'username', '{{ .AdminUsername }}', '{{ .AdminPasswordHash }}', '{{ .AdminPasswordSalt }}', 1);
+  (1, 'username', '{{ .AdminUsername }}', '{{ .AdminPasswordHash }}', '', 1);
 
 INSERT INTO `admin_user_roles` (`user_id`, `role_id`) VALUES (1, 1);

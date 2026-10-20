@@ -26,6 +26,8 @@ import (
 	"{{ .Module }}/app/crontab"
 	"{{ .Module }}/app/helper"
 	"{{ .Module }}/app/hooks"
+	"{{ .Module }}/app/repo"
+	"{{ .Module }}/app/service"
 	"{{ .Module }}/internal/taurus"
 )
 
@@ -134,7 +136,13 @@ func signalWaiter(errCh chan error) error {
 	}
 }
 
-// gracefulCleanup 清理回调
+// gracefulCleanup 清理回调。
+//
+// cleanups 的顺序**就是**关闭顺序（下面是顺序遍历）：后台任务必须排在资源关闭
+// 之前。BuildComponents 注册的 cleanup 关的是 DB / Redis / 日志，它一旦先跑，
+// 还在运行的后台任务就会拿着已关闭的连接池继续发语句，退出日志里全是
+// `sql: database is closed`。所以注册后台任务的停止函数时要**头插**
+// （见 startLogCleanup），不能直接 append。
 func gracefulCleanup(ctx context.Context) {
 	log.Printf("%s🔗 -> Waiting for all requests to be processed... %s\n", Yellow, Reset)
 	done := make(chan struct{})
@@ -183,6 +191,9 @@ func init() {
 	// 安全启动自检：密钥没配好就不要起服务
 	checkSecurityConfig()
 
+	// 日志表定期清理（配置非法时在这里就让启动失败）
+	startLogCleanup()
+
 	// 设置 Go 相关配置
 	setGoConfig()
 
@@ -216,6 +227,24 @@ func init() {
 func checkSecurityConfig() {
 	if err := helper.ValidateStartupSecurity(taurus.Container.Config.GetString); err != nil {
 		log.Fatalf("%s启动自检失败: %v%s\n", Red, err, Reset)
+	}
+}
+
+// startLogCleanup 启动日志表的定期清理（保留期由 log_retention_days 配置决定）。
+//
+// 配置非法时直接退出：这个配置项控制不可逆的删除，宁可启动失败也不要按一个
+// 猜出来的保留期去删数据（理由详见 service.ResolveLogRetentionDays）。
+//
+// 停止函数**头插**进 cleanups：cleanups 是顺序执行的，而 BuildComponents 的
+// cleanup（关 DB / Redis / 日志）已经在队首。append 的话会先关数据库、
+// 再去停这个还在发 DELETE 的后台任务。
+func startLogCleanup() {
+	days, err := service.ResolveLogRetentionDays(taurus.Container.Config.GetString)
+	if err != nil {
+		log.Fatalf("%s启动自检失败: %v%s\n", Red, err, Reset)
+	}
+	if stop := service.NewLogCleaner(repo.NewStore(), days).Start(); stop != nil {
+		cleanups = append([]func(){stop}, cleanups...)
 	}
 }
 

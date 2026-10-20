@@ -326,7 +326,7 @@ cd backend && make wire && go build ./...
 - [ ] 路由 path 与 `admin_permissions.path` 一致；下拉挂 `/admin/option/*`（userBaseChain），业务挂各自前缀（userProtectedChain）
 - [ ] `make wire` 已跑，`go build ./...` 通过
 - [ ] 状态「不过滤」用 -1（QUERY_ALL）语义（`status >= 0`），枚举/外键用 0（`> 0`）
-- [ ] 密码相关用 `helper/crypto.go`（SHA-256+salt）
+- [ ] 密码相关用 `helper/crypto.go`（bcrypt；`HashPassword` 返回 error 要处理）
 - [ ] 有状态机门控的操作按钮：后端响应暴露 `can_xxx`（service 算好），禁 disabled 置灰
 - [ ] 建表 + 三级权限 SQL 落盘 `scripts/sql/` 留痕
 
@@ -350,7 +350,7 @@ cd backend && make wire && go build ./...
 | `backend/app/repo/base.go` | `baseRepository[T TableNamer]` 零条件原子操作（Create/CreateBatch/Delete/DeleteByID/FindByID/Count/Save）+ 私有查询辅助（firstBy/findBy/page + 包级 paginate） |
 | `backend/app/repo/store.go` | `Store`（工作单元）+ `Tx`（事务上下文）+ `repoSet`（accessor 载体）；事务 seam `store.RunInTx`（返回 error 回滚，nil 提交） |
 | `backend/app/helper/query.go` | `WhereBuilder` 动态条件（repo 内部复杂查询可用；service 层列表已统一走 `ListFilter`） |
-| `backend/app/helper/crypto.go` | `GenerateSalt/HashPassword/VerifyPassword`（SHA-256+salt） |
+| `backend/app/helper/crypto.go` | `HashPassword/VerifyPassword`（bcrypt，兼容并自动升级历史 SHA-256 散列） |
 | `backend/app/helper/validate.go` | 密码强度 / 手机号校验 |
 | `backend/app/helper/verification_code.go` | 验证码生成 / 校验（Redis 存取） |
 | `backend/app/controller/common.go` | 控制器深 helper `BindJSON` / `OK` / `Fail` |

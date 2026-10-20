@@ -1,0 +1,93 @@
+package repo
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"gorm.io/gorm"
+
+	"{{ .Module }}/app/model"
+)
+
+// 日志表按保留期清理的数据访问层。
+//
+// 这几张表是只追加的流水：一个中等流量的后台一天就能写进去几万条访问日志，
+// 不清理的话库会一直长到磁盘满，而且 90 天前的访问日志对排障已经没有价值。
+//
+// 删除条件**只看时间**，没有任何别的过滤：保留期内的数据不会被碰到，
+// 保留期外的全部出局。这样「会删掉什么」只由一个配置项决定，便于审计。
+type LogRetentionRepository struct {
+	db *gorm.DB
+}
+
+func NewLogRetentionRepositoryWithDB(db *gorm.DB) *LogRetentionRepository {
+	return &LogRetentionRepository{db: db}
+}
+
+// LogRetention 返回日志清理仓储
+func (r repoSet) LogRetention() *LogRetentionRepository {
+	return NewLogRetentionRepositoryWithDB(r.db)
+}
+
+// LogRetentionTarget 一张待清理日志表的描述。
+type LogRetentionTarget struct {
+	// Table 表名，只用于日志输出；真正的表名由 newModel 返回的 model 决定，
+	// 不拼进 SQL，所以这里不存在注入面。
+	Table string
+	// TimeColumn 判定「多久以前」用的时间列。取值来自下面这张固定的清单，
+	// 不接受外部输入。
+	TimeColumn string
+	// newModel 返回一个空 model，交给 GORM 解析表名。
+	newModel func() interface{}
+}
+
+// LogRetentionTargets 需要按保留期清理的日志表清单。
+//
+// 时间列刻意各表分别写明，而不是统一假设 created_at：
+// admin_user_login_logs 的时间列是 login_time（见 scripts/sql/init.sql）。
+// 四张表的时间列上都建了索引（idx_created / idx_login_time），
+// 所以 `WHERE <时间列> < ?` 走索引范围扫描，不会全表扫。
+//
+// 新增日志表时记得往这里加一条，否则那张表不会被清理。
+var LogRetentionTargets = []LogRetentionTarget{
+	{Table: "admin_access_logs", TimeColumn: "created_at", newModel: func() interface{} { return &model.AccessLog{} }},
+	{Table: "admin_operation_logs", TimeColumn: "created_at", newModel: func() interface{} { return &model.OperationLog{} }},
+	{Table: "admin_front_error_logs", TimeColumn: "created_at", newModel: func() interface{} { return &model.FrontErrorLog{} }},
+	{Table: "admin_user_login_logs", TimeColumn: "login_time", newModel: func() interface{} { return &model.AdminUserLoginLog{} }},
+}
+
+// DeleteOlderThan 删除一批早于 cutoff 的日志，返回实际删除行数。
+//
+// 带 LIMIT 分批删，而不是一条 DELETE 删干净：第一次清理可能要删掉几百万行，
+// 单条语句会开一个巨大的事务 —— undo log 暴涨、从库延迟、大量行锁长时间不放，
+// 业务查询会被拖住。分批之后每条语句只碰 limit 行，锁也只持有很短时间。
+//
+// 多实例同时跑是安全的：这条语句是幂等的，两个实例删到同一批数据时，
+// 后到的那个只是匹配不到行、RowsAffected 变小，不会报错（没有唯一键冲突，
+// 删一个已经不存在的行也不是错误）。
+//
+// 前提：binlog_format = ROW（MySQL 5.7.7 起的默认值，MySQL 8 同样默认 ROW）。
+// `DELETE ... LIMIT` 不带 ORDER BY 时删的是哪几行由存储引擎决定，在
+// STATEMENT / MIXED 格式下属于 unsafe statement：binlog 里记的是语句本身，
+// 从库重放时可能删到另外几行，主从数据因此不一致，错误日志里会出现
+// `Statement is unsafe because it uses a LIMIT clause` 的警告。
+// ROW 格式记的是实际变更的行，没有这个问题。
+// 如果部署环境把 binlog_format 改成了 STATEMENT/MIXED，要么改回 ROW，
+// 要么给这条语句补一个 ORDER BY <时间列>（代价是每批都要排序）。
+func (r *LogRetentionRepository) DeleteOlderThan(ctx context.Context, target LogRetentionTarget, cutoff time.Time, limit int) (int64, error) {
+	if r.db == nil {
+		return 0, errors.New("database is not initialized")
+	}
+	if limit <= 0 {
+		return 0, errors.New("limit must be positive")
+	}
+	res := r.db.WithContext(ctx).
+		Where(target.TimeColumn+" < ?", cutoff).
+		Limit(limit).
+		Delete(target.newModel())
+	if res.Error != nil {
+		return 0, res.Error
+	}
+	return res.RowsAffected, nil
+}

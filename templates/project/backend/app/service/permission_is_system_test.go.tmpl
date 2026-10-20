@@ -1,0 +1,224 @@
+// is_system 只升不降的回归测试。
+//
+// 为什么这条值得单独测：is_system 是 UpdatePermission（系统权限不能修改）和
+// DeletePermission（系统权限不能删除）唯一的判据。只要存在任何一条能把它写成
+// 「不等于 1」的路径，上面两道保护就能被两步绕开 —— 先降级，再改编码或删除。
+// 所以这里不只测「接口返回了错误」，还用 sqlmock 证明**一条写语句都没发出去**：
+// 期望里没登记的语句一律报「未预期的语句」，零写入因此是硬断言。
+//
+// 这里不连真实数据库：能证明语句形状、绑定参数和「有没有发」，
+// 证不了真实 MySQL 下的并发交错结果。SQL 层那道 `WHERE is_system = 0`
+// 的护栏由语句形状断言覆盖（见 TestUpdatePermissionIsSystem_PromoteGuardsOnCurrentValue）。
+package service
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+
+	"{{ .Module }}/app/repo"
+)
+
+const permTestID uint64 = 42
+
+// newPermissionService 按生产方式装配服务，只把 Store 绑到 sqlmock 上。
+// 返回的 *gorm.DB 用来挂回调抓真实执行的 SQL。
+func newPermissionService(t *testing.T) (*AdminPermissionsService, sqlmock.Sqlmock, *gorm.DB) {
+	t.Helper()
+	sqlDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("创建 sqlmock 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	db, err := gorm.Open(mysql.New(mysql.Config{Conn: sqlDB, SkipInitializeWithVersion: true}), &gorm.Config{
+		Logger:                 logger.Discard,
+		DisableAutomaticPing:   true,
+		SkipDefaultTransaction: true,
+	})
+	if err != nil {
+		t.Fatalf("GORM 挂载 sqlmock 失败: %v", err)
+	}
+	return NewAdminPermissionsService(repo.NewStoreWithDB(db)), mock, db
+}
+
+// expectPermissionRow 登记一次 FindByPermissionID 的返回。
+func expectPermissionRow(mock sqlmock.Sqlmock, isSystem int8) {
+	mock.ExpectQuery("SELECT .* FROM `admin_permissions`").
+		WillReturnRows(sqlmock.NewRows([]string{"permission_id", "permission_name", "permission_code", "permission_type", "status", "is_system"}).
+			AddRow(permTestID, "用户管理", "system:user:list", 1, 1, isSystem))
+}
+
+// captureUpdateSQL 抓下所有真正执行的 UPDATE 语句原文。
+// 用来断言某一列**没有**出现在 SET 里 —— 这种「不存在」的断言没法用
+// sqlmock 的正则表达（Go 的 RE2 不支持否定前瞻）。
+func captureUpdateSQL(t *testing.T, db *gorm.DB) *[]string {
+	t.Helper()
+	var stmts []string
+	err := db.Callback().Update().After("gorm:update").Register("test:capture_update", func(tx *gorm.DB) {
+		stmts = append(stmts, tx.Statement.SQL.String())
+	})
+	if err != nil {
+		t.Fatalf("注册 UPDATE 回调失败: %v", err)
+	}
+	return &stmts
+}
+
+func assertPermissionExpectationsMet(t *testing.T, mock sqlmock.Sqlmock) {
+	t.Helper()
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("SQL 期望未满足（多发或少发了语句）: %v", err)
+	}
+}
+
+// TestUpdatePermissionIsSystem_RejectsDowngrade 系统权限 → 普通权限必须被拒，
+// 且不产生任何写语句。
+func TestUpdatePermissionIsSystem_RejectsDowngrade(t *testing.T) {
+	s, mock, _ := newPermissionService(t)
+	expectPermissionRow(mock, 1)
+	// 故意不登记任何 Exec：发出去的任何 UPDATE 都会让测试失败
+
+	err := s.UpdatePermissionIsSystem(context.Background(), permTestID, 0)
+	if err == nil {
+		t.Fatal("系统权限被改成了普通权限：UpdatePermission / DeletePermission 的保护等于失效")
+	}
+	if !strings.Contains(err.Error(), "系统权限") {
+		t.Errorf("错误信息应当说清为什么被拒，实际: %v", err)
+	}
+	assertPermissionExpectationsMet(t, mock)
+}
+
+// TestUpdatePermissionIsSystem_RejectsOutOfRangeValue 只判「等于 0」是不够的：
+// 全代码库都用 `IsSystem == 1` 判定系统权限，写进一个 2 就等于降级，只是绕了一步。
+func TestUpdatePermissionIsSystem_RejectsOutOfRangeValue(t *testing.T) {
+	for _, bad := range []int8{2, -1, 127} {
+		s, mock, _ := newPermissionService(t)
+		// 连 SELECT 都不该发：参数非法应当在读库之前就被拒
+
+		if err := s.UpdatePermissionIsSystem(context.Background(), permTestID, bad); err == nil {
+			t.Fatalf("is_system=%d 应当被拒：它既不是系统权限也不是普通权限", bad)
+		}
+		assertPermissionExpectationsMet(t, mock)
+	}
+}
+
+// TestUpdatePermissionIsSystem_AllowsPromotion 普通权限 → 系统权限允许。
+func TestUpdatePermissionIsSystem_AllowsPromotion(t *testing.T) {
+	s, mock, _ := newPermissionService(t)
+	expectPermissionRow(mock, 0)
+	mock.ExpectExec("UPDATE `admin_permissions` SET .*WHERE permission_id = \\? AND is_system = 0").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := s.UpdatePermissionIsSystem(context.Background(), permTestID, 1); err != nil {
+		t.Fatalf("普通权限升级为系统权限应当允许: %v", err)
+	}
+	assertPermissionExpectationsMet(t, mock)
+}
+
+// TestUpdatePermissionIsSystem_PromoteGuardsOnCurrentValue 升级语句的 WHERE 必须带
+// is_system = 0。
+//
+// 这是防时序窗口的那道护栏：上层「先读后判」读到的快照可能已经过期，
+// 但只要 SQL 自带这个条件，这条语句在任何交错下都只能把 0 写成 1。
+func TestUpdatePermissionIsSystem_PromoteGuardsOnCurrentValue(t *testing.T) {
+	s, mock, db := newPermissionService(t)
+	stmts := captureUpdateSQL(t, db)
+	expectPermissionRow(mock, 0)
+	mock.ExpectExec("UPDATE `admin_permissions`").WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := s.UpdatePermissionIsSystem(context.Background(), permTestID, 1); err != nil {
+		t.Fatalf("升级不该失败: %v", err)
+	}
+	if len(*stmts) != 1 {
+		t.Fatalf("应当只有一条 UPDATE，实际 %d 条: %v", len(*stmts), *stmts)
+	}
+	sql := (*stmts)[0]
+	if !strings.Contains(sql, "is_system = 0") {
+		t.Errorf("升级语句的 WHERE 必须带 is_system = 0，否则存在「读到 0、写之前被升级、又被写回」的窗口\nSQL: %s", sql)
+	}
+	if !strings.Contains(sql, "`is_system`=") {
+		t.Errorf("升级语句应当把 is_system 写成 1\nSQL: %s", sql)
+	}
+}
+
+// TestUpdatePermissionIsSystem_NoopWhenAlreadyNonSystem 普通权限写 0：无事可做，
+// 不发多余的 UPDATE。
+func TestUpdatePermissionIsSystem_NoopWhenAlreadyNonSystem(t *testing.T) {
+	s, mock, _ := newPermissionService(t)
+	expectPermissionRow(mock, 0)
+
+	if err := s.UpdatePermissionIsSystem(context.Background(), permTestID, 0); err != nil {
+		t.Fatalf("普通权限写 0 应当是无害的空操作: %v", err)
+	}
+	assertPermissionExpectationsMet(t, mock)
+}
+
+// TestUpdatePermissionIsSystem_PermissionNotFound 权限不存在要明确报错，不能静默成功。
+func TestUpdatePermissionIsSystem_PermissionNotFound(t *testing.T) {
+	s, mock, _ := newPermissionService(t)
+	mock.ExpectQuery("SELECT .* FROM `admin_permissions`").
+		WillReturnRows(sqlmock.NewRows([]string{"permission_id", "is_system"}))
+
+	err := s.UpdatePermissionIsSystem(context.Background(), permTestID, 1)
+	if err == nil {
+		t.Fatal("权限不存在时不该返回成功")
+	}
+	if !strings.Contains(err.Error(), "不存在") {
+		t.Errorf("错误信息应当说明权限不存在，实际: %v", err)
+	}
+	assertPermissionExpectationsMet(t, mock)
+}
+
+// TestUpdatePermission_NeverWritesIsSystem UpdatePermission 的 SET 里不能出现
+// is_system —— 否则它就是第二条降级通道：读到 0 放行，写的时候把入参里的 0 盖回去，
+// 而这期间这行可能已经被升级成系统权限了。
+func TestUpdatePermission_NeverWritesIsSystem(t *testing.T) {
+	s, mock, db := newPermissionService(t)
+	stmts := captureUpdateSQL(t, db)
+	expectPermissionRow(mock, 0)
+	mock.ExpectExec("UPDATE `admin_permissions`").WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// 入参里把 isSystem 传 0：实现必须忽略它
+	err := s.UpdatePermission(context.Background(), permTestID, 0, "用户管理", "system:user:list", 1, "/user", "icon", 1, 1, 0)
+	if err != nil {
+		t.Fatalf("普通权限应当可以修改: %v", err)
+	}
+	if len(*stmts) != 1 {
+		t.Fatalf("应当只有一条 UPDATE，实际 %d 条: %v", len(*stmts), *stmts)
+	}
+	if sql := (*stmts)[0]; strings.Contains(sql, "is_system") {
+		t.Errorf("UpdatePermission 不得写 is_system（这是一条降级通道）\nSQL: %s", sql)
+	}
+	assertPermissionExpectationsMet(t, mock)
+}
+
+// TestUpdatePermission_RejectsSystemPermission 既有保护不能在这次改动里丢掉。
+func TestUpdatePermission_RejectsSystemPermission(t *testing.T) {
+	s, mock, _ := newPermissionService(t)
+	expectPermissionRow(mock, 1)
+
+	err := s.UpdatePermission(context.Background(), permTestID, 0, "改名", "system:user:list", 1, "/user", "icon", 1, 1, 1)
+	if err == nil {
+		t.Fatal("系统权限不该可以修改")
+	}
+	assertPermissionExpectationsMet(t, mock)
+}
+
+// TestAddPermission_RejectsOutOfRangeIsSystem 新建时同样只收 0/1。
+func TestAddPermission_RejectsOutOfRangeIsSystem(t *testing.T) {
+	s, mock, _ := newPermissionService(t)
+	// 编码查重会先发一条 SELECT，返回空表示编码可用
+	mock.ExpectQuery("SELECT .* FROM `admin_permissions`").
+		WillReturnRows(sqlmock.NewRows([]string{"permission_id", "is_system"}))
+
+	err := s.AddPermission(context.Background(), 0, "用户管理", "system:user:new", 1, "/user", "icon", 1, 1, 2)
+	if err == nil {
+		t.Fatal("is_system=2 应当被拒")
+	}
+	assertPermissionExpectationsMet(t, mock)
+}
