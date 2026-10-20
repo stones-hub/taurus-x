@@ -165,7 +165,7 @@ mysql -uroot -p -e "UPDATE {{ .DBName }}.admin_user_logins SET login_credential=
 | [`docs/项目规范.md`](docs/项目规范.md) | **唯一权威规则**：分层边界、RBAC、DTO、命名、分页哨兵、前端交互 |
 | [`docs/后端开发流程.md`](docs/后端开发流程.md) | 后端新模块 6 步（model → repo → dto → service → controller → routes + 权限 SQL） |
 | [`docs/前端开发流程.md`](docs/前端开发流程.md) | 前端新模块 4 步（types → api → router → views） |
-| [`docs/部署文档.md`](docs/部署文档.md) | 裸机（supervisor）与 Docker（compose）两种部署方式 |
+| [`docs/部署文档.md`](docs/部署文档.md) | Ubuntu 裸机（supervisor）、macOS（launchd）、Docker（compose）三种部署方式，含 amd64 / arm64 说明与可选 nginx |
 
 几条最容易踩的硬约束：
 
@@ -180,7 +180,7 @@ mysql -uroot -p -e "UPDATE {{ .DBName }}.admin_user_logins SET login_credential=
 ## 六、Docker
 
 ```bash
-# 先按 docs/部署文档.md 第 5.3 节在项目根目录写一份 .env
+# 先按 docs/部署文档.md 第 6.3 节在项目根目录写一份 .env
 # （至少要有 MYSQL_PASSWORD / JWT_SECRET / DB_DSN，JWT_SECRET 未设置时 compose 会直接拒绝启动）
 
 # 日志 bind mount 目录：app 容器以非 root（uid=1000）运行，不 chown 会起不来
@@ -195,12 +195,12 @@ docker compose up -d --build
 运行时阶段跟随同一目标），x86_64 与 arm64 都能直接 `up`；**不要**在 `docker-compose.yml`
 里写 `platform:`。给另一种架构的服务器出包用 `docker buildx build --platform linux/amd64 .`，
 但交叉构建出的镜像**不能在本机验证**，必须在目标架构的机器上实际启动确认 —— 见
-[`docs/部署文档.md`](docs/部署文档.md) 第 5.4.1 节。
+[`docs/部署文档.md`](docs/部署文档.md) 第 6.4.1 节。
 {{- if .Has.milvus }}
 
 > ⚠️ 本项目勾选了 milvus：compose 里 Milvus standalone 依赖的 minio 镜像 tag 当前**无已确认
 > 可用的公开来源**（匿名 manifest 401），完整 `up` 会在拉镜像这一步失败。处置方式见
-> [`docs/部署文档.md`](docs/部署文档.md) 第一节的已知阻塞说明；app 自身不依赖 Milvus 启动。
+> [`docs/部署文档.md`](docs/部署文档.md) 第二节的已知阻塞说明；app 自身不依赖 Milvus 启动。
 {{- end }}
 
 ---
