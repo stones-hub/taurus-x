@@ -356,7 +356,7 @@ sudo chown -R app:app /data/app/backend/logs
 ```
 
 > ⚠️ **以后每次编辑 `.env.local`，都要重新执行上面的 `chown` 和 `chmod`**。部分编辑方式（如 `sed -i`）会把文件属组改回你自己，`app` 用户就读不到了。
-> 读不到 `.env.local` 时程序**不会退出**，而是打印 `Error loading .env file` 后按默认配置运行：supervisor 显示 `RUNNING`，但 9080 不监听，日志反复报 `Access denied for user 'root'@'localhost'`。
+> 读不到 `.env.local` 时程序**直接退出**（启动日志里写明路径和原因），supervisor 显示 `FATAL` / `BACKOFF`，不会带着默认配置假装运行。
 
 ### 4.8 先手动试运行
 
@@ -914,7 +914,7 @@ curl -I http://{{ .ProjectName }}.example.com/
 | 现象 | 排查 |
 |------|------|
 | supervisor `FATAL` / `BACKOFF` | `sudo supervisorctl tail {{ .ProjectName }}`；常见原因：日志目录不可写、`directory` 没指向 `backend/`、程序架构不对、`JWT_SECRET` 未配置 |
-| supervisor 显示 `RUNNING`，但 9080 不通，日志反复报 `Access denied for user 'root'@'localhost'` | `.env.local` 缺失或 `app` 用户读不到，程序用默认配置在反复重连数据库。日志开头会有 `Error loading .env file`。按 4.7 重新 `chown "$USER":app` 和 `chmod 640` 后重启 |
+| supervisor 显示 `FATAL` / `BACKOFF`，日志里是「环境变量文件 .env.local 不存在 / 打不开」 | `.env.local` 缺失或 `app` 用户读不到，程序启动时直接退出。按 4.7 重新 `cp .env.example .env.local`、`chown "$USER":app` 和 `chmod 640` 后重启 |
 | launchd 程序起不来 | 看 `backend/logs/launchd.log`；`sudo launchctl print system/com.{{ .ProjectNameLower }}.app` 查看最后退出码；检查 `UserName` 是否存在、目录权限、plist 路径是否写对 |
 | `exec format error` / `cannot execute binary file` | 程序架构与机器不符。按第一节的表重新确认 `GOOS` / `GOARCH` 后重新编译 |
 | 启动报 `JWT_SECRET` 相关错误 | 启动保护：密钥未配置、过短或是弱值。用 `openssl rand -hex 32` 生成后填入 |

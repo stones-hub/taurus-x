@@ -3,6 +3,7 @@ package taurus
 import (
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -31,7 +32,6 @@ import (
 
 	"crypto/tls"
 	"crypto/x509"
-	"os"
 
 	grpcserver "github.com/stones-hub/taurus-pro-grpc/pkg/grpc/server"
 	"google.golang.org/grpc/keepalive"
@@ -80,8 +80,53 @@ type Components struct {
 {{- end }}
 }
 
+// envFileHint 环境变量文件不可用时统一追加的处理指引。
+// 刻意只给路径和动作，不读取、不回显文件内容或任何配置值。
+const envFileHint = "；请在 backend/ 目录下执行 `cp .env.example .env.local` 生成该文件并填好配置，" +
+	"或检查当前运行用户对该文件及其各级目录是否有读权限（必要时 chown 运行用户 + chmod 640）"
+
+// ensureEnvFileReadable 校验 -env 指定的环境变量文件存在、是普通文件且当前进程能读。
+//
+// 为什么要自己查：配置库 taurus-pro-config 的 Initialize 在加载 env 文件失败时
+// 只打印 `Error loading .env file` 就继续走，进程会带着默认配置启动 ——
+// 端口不监听、数据库反复 Access denied，而 supervisor / launchd 只看到「运行中」。
+// 这里提前把它变成启动失败，由 bootstrap 的 log.Fatal 以非 0 码退出。
+//
+// env 为空串时（Docker 的 CMD 用 -env ""，变量直接来自容器环境）跳过检查，行为不变。
+func ensureEnvFileReadable(env string) error {
+	if env == "" {
+		return nil
+	}
+
+	info, err := os.Stat(env)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("环境变量文件 %s 不存在%s", env, envFileHint)
+		}
+		return fmt.Errorf("环境变量文件 %s 无法访问: %v%s", env, err, envFileHint)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("环境变量文件 %s 是一个目录（-env 必须指向文件，例如 -env .env.local）%s", env, envFileHint)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("环境变量文件 %s 不是普通文件（-env 必须指向文件，例如 -env .env.local）%s", env, envFileHint)
+	}
+
+	// Stat 通过不代表能读：目录权限、属组、ACL 都可能让 open 失败，所以实际打开一次。
+	f, err := os.Open(env)
+	if err != nil {
+		return fmt.Errorf("环境变量文件 %s 打不开: %v%s", env, err, envFileHint)
+	}
+	return f.Close()
+}
+
 // ProvideConfigComponent 注入配置模块
 func ProvideConfigComponent(opts *ConfigOptions) (*config.Config, error) {
+	// 必须在 Initialize 之前：配置库读不到 env 文件时只打日志不报错，见 ensureEnvFileReadable
+	if err := ensureEnvFileReadable(opts.Env); err != nil {
+		return nil, err
+	}
+
 	configComponent := config.New(config.WithPrintEnable(opts.PrintEnable))
 	if err := configComponent.Initialize(opts.ConfigPath, opts.Env); err != nil {
 		return nil, fmt.Errorf("failed to initialize config: %v", err)

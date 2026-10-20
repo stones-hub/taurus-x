@@ -1,0 +1,105 @@
+package taurus
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// 契约：-env 指定的文件读不到时必须返回错误（最终由 bootstrap 的 log.Fatal 非 0 退出），
+// 而不是让进程带着默认配置「假装启动成功」。配置库自身在这种情况下只打日志不报错。
+
+// assertHasHint 失败信息必须带上路径和可执行的处理指引，否则排查时只能看到一句「启动失败」。
+func assertHasHint(t *testing.T, err error, path string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("期望返回错误，实际为 nil")
+	}
+	msg := err.Error()
+	for _, want := range []string{path, "cp .env.example .env.local", "读权限"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("错误信息缺少 %q：%s", want, msg)
+		}
+	}
+}
+
+func TestEnsureEnvFileReadable_Empty(t *testing.T) {
+	// -env ""（Docker CMD 的用法）表示不加载文件，环境变量直接来自容器环境：必须跳过检查
+	if err := ensureEnvFileReadable(""); err != nil {
+		t.Fatalf("env 为空串时不应报错: %v", err)
+	}
+}
+
+func TestEnsureEnvFileReadable_OK(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".env.local")
+	if err := os.WriteFile(path, []byte("JWT_SECRET=x\n"), 0o600); err != nil {
+		t.Fatalf("准备测试文件失败: %v", err)
+	}
+	if err := ensureEnvFileReadable(path); err != nil {
+		t.Fatalf("可读的普通文件不应报错: %v", err)
+	}
+}
+
+func TestEnsureEnvFileReadable_Missing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".env.local")
+	err := ensureEnvFileReadable(path)
+	assertHasHint(t, err, path)
+	if !strings.Contains(err.Error(), "不存在") {
+		t.Errorf("缺失文件的错误应说明文件不存在：%s", err)
+	}
+}
+
+func TestEnsureEnvFileReadable_Dir(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".env.local")
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatalf("准备测试目录失败: %v", err)
+	}
+	err := ensureEnvFileReadable(path)
+	assertHasHint(t, err, path)
+	if !strings.Contains(err.Error(), "目录") {
+		t.Errorf("目录的错误应说明它是目录：%s", err)
+	}
+}
+
+func TestEnsureEnvFileReadable_Unreadable(t *testing.T) {
+	// root 无视文件权限位，open 会成功，这个子用例在 root 下没有意义
+	if os.Geteuid() == 0 {
+		t.Skip("以 root 运行：权限位对 root 无效，跳过无读权限用例")
+	}
+
+	path := filepath.Join(t.TempDir(), ".env.local")
+	if err := os.WriteFile(path, []byte("JWT_SECRET=x\n"), 0o600); err != nil {
+		t.Fatalf("准备测试文件失败: %v", err)
+	}
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatalf("去掉读权限失败: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+
+	err := ensureEnvFileReadable(path)
+	assertHasHint(t, err, path)
+	if !strings.Contains(err.Error(), "打不开") {
+		t.Errorf("无读权限的错误应说明打不开：%s", err)
+	}
+}
+
+func TestEnsureEnvFileReadable_NoFileContentInError(t *testing.T) {
+	// 错误信息只能提路径和指引，不能把配置值带进日志
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env.local")
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatalf("准备测试目录失败: %v", err)
+	}
+	// 目录下放一个「配置值」，确保实现没有去读内容
+	if err := os.WriteFile(filepath.Join(path, "x"), []byte("SECRET-MARKER-5f1c2e"), 0o600); err != nil {
+		t.Fatalf("准备测试文件失败: %v", err)
+	}
+	err := ensureEnvFileReadable(path)
+	if err == nil {
+		t.Fatal("期望返回错误，实际为 nil")
+	}
+	if strings.Contains(err.Error(), "SECRET-MARKER-5f1c2e") {
+		t.Errorf("错误信息里出现了文件内容：%s", err)
+	}
+}

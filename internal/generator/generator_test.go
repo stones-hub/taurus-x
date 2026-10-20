@@ -74,6 +74,7 @@ func TestGenerate_Combinations(t *testing.T) {
 			assertSessionRevocationWiring(t, outDir)
 			assertUserManageGuardWiring(t, outDir)
 			assertStartupSelfCheckWiring(t, outDir)
+			assertEnvFileFailFast(t, outDir)
 			assertSQLLogNoLeak(t, outDir)
 			assertLoginAuditStatus(t, outDir)
 			assertNoDeadRegisterFlow(t, outDir)
@@ -849,6 +850,73 @@ func assertStartupSelfCheckWiring(t *testing.T, outDir string) {
 	startup := readFile(t, filepath.Join(backend, "app", "helper", "startup_check.go"))
 	if !strings.Contains(startup, "func ValidateStartupSecurity(getString func(key string) string) error") {
 		t.Error("helper 缺少可测的 ValidateStartupSecurity(getString) 契约入口")
+	}
+}
+
+// assertEnvFileFailFast -env 指定的环境变量文件读不到时必须启动失败。
+//
+// 配置库 taurus-pro-config 的 Initialize 只在加载 env 文件失败时打一行
+// `Error loading .env file` 就继续，进程会带着默认配置起来：端口不监听、
+// 数据库反复 Access denied，而 supervisor 只显示 RUNNING。所以校验必须在
+// Initialize 之前，并把错误返回出去（bootstrap 的 log.Fatal 负责非 0 退出）。
+func assertEnvFileFailFast(t *testing.T, outDir string) {
+	t.Helper()
+
+	backend := filepath.Join(outDir, "backend")
+	componentsSrc := readFile(t, filepath.Join(backend, "internal", "taurus", "components.go"))
+
+	if !strings.Contains(componentsSrc, "func ensureEnvFileReadable(env string) error") {
+		t.Fatal("internal/taurus/components.go 缺少 ensureEnvFileReadable(env) 校验入口")
+	}
+
+	// 1. 必须在 Initialize 之前调用，且失败直接返回错误
+	provide := funcBody(componentsSrc, "func ProvideConfigComponent(opts *ConfigOptions) (*config.Config, error) {")
+	if provide == "" {
+		t.Fatal("components.go 找不到 ProvideConfigComponent")
+	}
+	call := strings.Index(provide, "ensureEnvFileReadable(opts.Env)")
+	initialize := strings.Index(provide, "configComponent.Initialize(")
+	switch {
+	case call < 0:
+		t.Error("ProvideConfigComponent 未调用 ensureEnvFileReadable(opts.Env)")
+	case initialize < 0:
+		t.Error("ProvideConfigComponent 找不到 configComponent.Initialize 调用")
+	case call > initialize:
+		t.Error("ensureEnvFileReadable 必须在 configComponent.Initialize 之前调用")
+	}
+	if !strings.Contains(provide, "if err := ensureEnvFileReadable(opts.Env); err != nil {") {
+		t.Error("env 文件校验失败必须直接返回错误，不能只打日志")
+	}
+
+	// 2. -env ""（Docker CMD 的用法）保持跳过加载
+	check := funcBody(componentsSrc, "func ensureEnvFileReadable(env string) error {")
+	if !strings.Contains(check, `if env == "" {`) || !strings.Contains(check, "return nil") {
+		t.Error("ensureEnvFileReadable 必须在 env 为空串时跳过检查：Docker CMD 用 -env \"\"")
+	}
+
+	// 3. 存在 + 普通文件 + 实际 open 一次（Stat 通过不代表运行用户能读）
+	for _, want := range []string{"os.Stat(env)", "os.IsNotExist(err)", "info.IsDir()", "info.Mode().IsRegular()", "os.Open(env)"} {
+		if !strings.Contains(check, want) {
+			t.Errorf("ensureEnvFileReadable 缺少 %q", want)
+		}
+	}
+
+	// 4. 错误信息要给出路径和可执行指引，且不读文件内容
+	if !strings.Contains(componentsSrc, "cp .env.example .env.local") {
+		t.Error("env 校验的错误信息缺少 `cp .env.example .env.local` 指引")
+	}
+	if !strings.Contains(componentsSrc, "读权限") {
+		t.Error("env 校验的错误信息缺少运行用户读权限的提示")
+	}
+	for _, forbidden := range []string{"os.ReadFile(env)", "io.ReadAll"} {
+		if strings.Contains(check, forbidden) {
+			t.Errorf("ensureEnvFileReadable 不得读取文件内容（出现 %q）：错误信息可能带出配置值", forbidden)
+		}
+	}
+
+	// 5. 生成项目自带该校验的单元测试
+	if _, err := os.Stat(filepath.Join(backend, "internal", "taurus", "env_check_test.go")); err != nil {
+		t.Errorf("生成项目缺少 internal/taurus/env_check_test.go: %v", err)
 	}
 }
 
