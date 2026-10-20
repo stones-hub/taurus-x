@@ -203,11 +203,25 @@ go version
 
 ### 4.1 用 go install 安装，推荐
 
+安装最新发布版：
+
 ```bash
 go install github.com/stones-hub/taurus-x@latest
 ```
 
+也可以安装指定版本，所有版本见 GitHub 的 [Releases](https://github.com/stones-hub/taurus-x/releases) 页面：
+
+```bash
+go install github.com/stones-hub/taurus-x@v0.1.0
+```
+
 安装后命令通常位于 `$(go env GOPATH)/bin`，需要该目录在 `PATH` 中。如果提示找不到命令，先检查安装目录，不必重复安装。
+
+确认安装的版本：
+
+```bash
+taurus-x version
+```
 
 查看帮助：
 
@@ -215,7 +229,21 @@ go install github.com/stones-hub/taurus-x@latest
 taurus-x help
 ```
 
-### 4.2 从源码构建
+### 4.2 升级脚手架
+
+重新执行安装命令即可，新版本会覆盖旧的 `taurus-x`：
+
+```bash
+go install github.com/stones-hub/taurus-x@latest
+```
+
+注意：
+
+- **升级只影响以后生成的新项目**。已经生成的项目是独立代码，不会随脚手架升级而改变；需要新版本的改进时，参考 Release 说明自行把改动迁移过去，不要对已有项目重新生成覆盖。
+- 刚发布的新版本，`@latest` 可能因 Go 依赖代理（如 `goproxy.cn`）的缓存暂时还装到旧版本。此时直接写明版本号安装，或临时绕过代理：`GOPROXY=direct go install github.com/stones-hub/taurus-x@latest`。
+- 装完用 `taurus-x version` 确认版本号。
+
+### 4.3 从源码构建
 
 需要修改模板，或要使用尚未发布的改动时，从源码构建：
 
@@ -231,7 +259,7 @@ mkdir -p /tmp/taurusx-bin && go build -o /tmp/taurusx-bin/taurus-x .
 
 之后用 `/tmp/taurusx-bin/taurus-x` 代替下文的 `taurus-x`。
 
-> 模板通过 `embed` 打进二进制，改模板后必须重新构建；CLI 版本号不能区分本机未提交改动。
+> 模板通过 `embed` 打进二进制，改模板后必须重新构建。从源码构建时，`taurus-x version` 显示基于提交号的版本，例如 `v0.0.0-20261020065805-1e15e63db2fd`；有未提交的改动时末尾带 `+dirty`。
 
 ## 5. 生成你的项目
 
@@ -626,7 +654,7 @@ cd backend && go mod tidy && make wire
 
 修改模板后必须重新构建 CLI，旧二进制不会自动带上新模板。
 
-### 检查与测试
+### 13.1 检查与测试
 
 从脚手架仓库执行静态检查：
 
@@ -649,5 +677,56 @@ go test -count=1 ./...
 ```bash
 GOCACHE=/tmp/gocache-taurusx go test -count=1 ./...
 ```
+
+### 13.2 发布新版本
+
+使用者通过 `go install ...@latest` 或 `@vX.Y.Z` 安装，取的是仓库里的 Git tag。所以**发布新版本就是打一个新 tag**，再在 GitHub 上写一份 Release 说明。
+
+**版本号规则**（`v主版本.次版本.修订号`）：
+
+| 改动类型 | 例子 | 怎么升 |
+| --- | --- | --- |
+| 只修问题、改文档 | 修模板里的 bug、改错别字 | 修订号 +1：`v0.1.0` → `v0.1.1` |
+| 新增功能 | 新增组件、新增底座页面 | 次版本 +1，修订号归零：`v0.1.1` → `v0.2.0` |
+| 不兼容的改动 | 改命令行用法、改生成项目的目录结构 | 当前是 `v0.x` 阶段，同样升次版本；进入 `v1` 之后升主版本 |
+
+**发布步骤**（在仓库根目录、`master` 分支执行）：
+
+1. 确认要发布的改动都已提交并推送，工作区干净：
+
+```bash
+git status
+```
+
+2. 运行检查和测试，必须全部通过：
+
+```bash
+go vet ./... && go test -count=1 ./...
+```
+
+3. 打 tag 并推送，把 `v0.1.1` 换成新版本号：
+
+```bash
+git tag -a v0.1.1 -m "v0.1.1" && git push origin v0.1.1
+```
+
+4. 在 GitHub 创建 Release，写明这一版改了什么、使用者升级要注意什么。用 GitHub CLI 的话：
+
+```bash
+gh release create v0.1.1 --title "v0.1.1" --notes-file 发布说明.md
+```
+
+也可以在 GitHub 网页的 Releases 页面手动创建。Release 不需要附带编译好的程序，使用者用 `go install` 安装。
+
+5. 实际安装一次确认：
+
+```bash
+GOPROXY=direct go install github.com/stones-hub/taurus-x@v0.1.1 && taurus-x version
+```
+
+注意：
+
+- **tag 推送后不要删除或改指向**。Go 依赖代理会永久缓存每个版本的内容，改了也不会生效，还会让不同人装到的同一版本内容不一致。发错了就再发一个新版本。
+- 版本号由 tag 决定，代码里不需要手工改版本号。
 
 本仓库正式交付形态是 CLI 二进制；生成项目则由使用者按自己的 Git 和发布流程管理。

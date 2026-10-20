@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 
 	"github.com/AlecAivazis/survey/v2"
@@ -18,8 +19,58 @@ import (
 	"github.com/stones-hub/taurus-x/internal/generator"
 )
 
-// Version taurus-x 版本号，构建时可用 -ldflags 覆盖。
-var Version = "v0.1.0"
+// Version taurus-x 版本号。默认留空，由 resolveVersion 退回 go module 信息；
+// 需要固定显示某个值时在构建时注入：
+//
+//	go build -ldflags "-X github.com/stones-hub/taurus-x/internal/cli.Version=v1.2.3" .
+var Version = ""
+
+// revisionLen 提交号截断长度，和 git 短提交号的常见位数保持一致。
+const revisionLen = 12
+
+// version 返回展示用的版本号，读不到构建信息时退回 resolveVersion 的兜底值。
+func version() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		info = nil
+	}
+	return resolveVersion(Version, info)
+}
+
+// resolveVersion 按「注入值 → module 版本 → dev + 提交号」的优先级解析版本号。
+// 不读全局状态，便于直接用构造好的 BuildInfo 做单元测试。
+func resolveVersion(injected string, info *debug.BuildInfo) string {
+	if v := strings.TrimSpace(injected); v != "" {
+		return v
+	}
+	if info == nil {
+		return "dev"
+	}
+	// go install ...@v0.1.0 为 tag；@<commit> 为伪版本；源码目录 go build 为 (devel)。
+	if v := strings.TrimSpace(info.Main.Version); v != "" && v != "(devel)" {
+		return v
+	}
+
+	revision, modified := "", false
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			revision = strings.TrimSpace(s.Value)
+		case "vcs.modified":
+			modified = s.Value == "true"
+		}
+	}
+	if revision == "" {
+		return "dev"
+	}
+	if len(revision) > revisionLen {
+		revision = revision[:revisionLen]
+	}
+	if modified {
+		revision += "-dirty"
+	}
+	return fmt.Sprintf("dev (%s)", revision)
+}
 
 // 终端颜色
 const (
@@ -53,7 +104,7 @@ func Run(args []string) int {
 		}
 		return 0
 	case "version", "-v", "--version":
-		fmt.Printf("taurus-x %s\n", Version)
+		fmt.Printf("taurus-x %s\n", version())
 		return 0
 	case "help", "-h", "--help":
 		usage()
@@ -74,7 +125,7 @@ func usage() {
   taurus-x help          输出本帮助
 
 项目名只能包含字母、数字、下划线和短横线。
-`, Version)
+`, version())
 }
 
 // runNew 走完整交互并生成项目。
