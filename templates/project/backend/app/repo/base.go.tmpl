@@ -6,8 +6,24 @@ import (
 	"fmt"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"{{ .Module }}/internal/taurus"
+)
+
+// 加锁当前读（locking read）的两种强度。
+//
+// 为什么需要它们：MySQL 默认隔离级别是 REPEATABLE READ，事务里第一次普通 SELECT
+// 建立一致性快照，之后的普通 SELECT 都读那个快照 —— 别的事务已经提交的新值看不到。
+// 所以「在事务里读」并不等于「读到的是当前事实」，拿普通读的结果做授权判定，
+// 判定依据可能是一份过期身份。只有加锁读（FOR UPDATE / FOR SHARE）是当前读：
+// 读最新已提交版本，并在本事务结束前挡住别人改这些行。
+//
+// 隔离级别换成 READ COMMITTED 也不能省掉它们：普通读那时虽然能看到最新已提交值，
+// 但不加锁，「读完之后、写之前」照样可以被改。
+const (
+	lockForUpdate = "UPDATE" // 排他锁：当前读 + 本事务独占这些行
+	lockForShare  = "SHARE"  // 共享锁：当前读 + 挡住别人改，但共享者之间不互斥
 )
 
 // TableNamer 干净 model 只需实现 TableName()，无需 DB()/gorm 依赖
@@ -115,6 +131,32 @@ func (r *baseRepository[T]) firstBy(ctx context.Context, where string, args ...i
 func (r *baseRepository[T]) findBy(ctx context.Context, where string, args ...interface{}) ([]T, error) {
 	var list []T
 	err := r.db.WithContext(ctx).Where(where, args...).Find(&list).Error
+	return list, err
+}
+
+// firstLocking 按条件执行加锁当前读的单行查询（未找到返回 nil），仅供包内领域方法复用。
+// strength 取 lockForUpdate / lockForShare。
+func (r *baseRepository[T]) firstLocking(ctx context.Context, strength, where string, args ...interface{}) (*T, error) {
+	var v T
+	if err := r.db.WithContext(ctx).
+		Clauses(clause.Locking{Strength: strength}).
+		Where(where, args...).
+		First(&v).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &v, nil
+}
+
+// findLocking 按条件执行加锁当前读的多行查询，仅供包内领域方法复用。
+func (r *baseRepository[T]) findLocking(ctx context.Context, strength, where string, args ...interface{}) ([]T, error) {
+	var list []T
+	err := r.db.WithContext(ctx).
+		Clauses(clause.Locking{Strength: strength}).
+		Where(where, args...).
+		Find(&list).Error
 	return list, err
 }
 

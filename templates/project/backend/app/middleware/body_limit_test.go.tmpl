@@ -1,0 +1,158 @@
+package middleware
+
+import (
+	"bytes"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+// 请求体上限是「匿名接口不能被一个巨大 body 打爆内存」的实现点。
+// 断言同时检查状态码和「handler 没被进入」：
+// 只返回错误码但照样把 body 读进 handler，等于没限。
+
+// TestBodyLimit_RejectsDeclaredOversizeBody 声明了 Content-Length 且超限 → 413 且不进 handler。
+func TestBodyLimit_RejectsDeclaredOversizeBody(t *testing.T) {
+	const maxBytes int64 = 64
+
+	entered := false
+	h := bodyLimitMiddleware(maxBytes)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entered = true
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	body := strings.Repeat("x", int(maxBytes)+1)
+	req := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("超限请求应返回 413，实际 %d", rec.Code)
+	}
+	if entered {
+		t.Error("超限请求不应进入 handler")
+	}
+}
+
+// TestBodyLimit_AllowsBodyAtLimit 刚好等于上限的请求必须放行，
+// 阈值判断写成 >= 会把合法请求也挡掉。
+func TestBodyLimit_AllowsBodyAtLimit(t *testing.T) {
+	const maxBytes int64 = 64
+
+	var read []byte
+	h := bodyLimitMiddleware(maxBytes)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("等于上限的请求体应能完整读出，实际报错: %v", err)
+		}
+		read = b
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	body := strings.Repeat("x", int(maxBytes))
+	req := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("等于上限的请求应放行，实际 %d", rec.Code)
+	}
+	if len(read) != int(maxBytes) {
+		t.Errorf("handler 应读到 %d 字节，实际 %d", maxBytes, len(read))
+	}
+}
+
+// TestBodyLimit_ChunkedBodyFailsOnRead 没声明长度（chunked）时靠 MaxBytesReader 兜底：
+// handler 读到超限处必须报错，而不是把全部数据读进内存。
+func TestBodyLimit_ChunkedBodyFailsOnRead(t *testing.T) {
+	const maxBytes int64 = 32
+
+	var readErr error
+	var readLen int
+	h := bodyLimitMiddleware(maxBytes)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		readLen = len(b)
+		readErr = err
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/front/error", bytes.NewReader([]byte(strings.Repeat("x", int(maxBytes)*10))))
+	// ContentLength = -1 模拟 chunked 传输（没有声明长度）
+	req.ContentLength = -1
+	rec := httptest.NewRecorder()
+
+	h.ServeHTTP(rec, req)
+
+	if readErr == nil {
+		t.Errorf("超限的 chunked 请求体读取应报错，实际读到 %d 字节且无错误", readLen)
+	}
+	if int64(readLen) > maxBytes {
+		t.Errorf("读取量不应超过上限 %d 字节，实际 %d", maxBytes, readLen)
+	}
+}
+
+// TestBodyLimit_ChunkedBodyWithinLimit 未声明长度但没超限的请求要能正常读完。
+func TestBodyLimit_ChunkedBodyWithinLimit(t *testing.T) {
+	const maxBytes int64 = 32
+	const payload = "{\"msg\":\"ok\"}"
+
+	var got string
+	var readErr error
+	h := bodyLimitMiddleware(maxBytes)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		got, readErr = string(b), err
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/front/error", strings.NewReader(payload))
+	req.ContentLength = -1
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	if readErr != nil {
+		t.Errorf("未超限的 chunked 请求体应能读完，实际 %v", readErr)
+	}
+	if got != payload {
+		t.Errorf("handler 读到的内容应与发送一致，实际 %q", got)
+	}
+}
+
+// TestBodyLimit_DisabledByNonPositiveMax maxBytes<=0 表示不限制（配置里显式关掉时）。
+func TestBodyLimit_DisabledByNonPositiveMax(t *testing.T) {
+	for _, maxBytes := range []int64{0, -1} {
+		entered := false
+		var readErr error
+		h := bodyLimitMiddleware(maxBytes)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			entered = true
+			_, readErr = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		req := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(strings.Repeat("x", 4096)))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if !entered {
+			t.Errorf("maxBytes=%d 应放行，handler 未被调用", maxBytes)
+		}
+		if readErr != nil {
+			t.Errorf("maxBytes=%d 时读取不应受限，实际 %v", maxBytes, readErr)
+		}
+		if rec.Code != http.StatusOK {
+			t.Errorf("maxBytes=%d 应放行，实际状态码 %d", maxBytes, rec.Code)
+		}
+	}
+}
+
+// TestDefaultMaxBodyBytes 兜底上限必须是个有意义的正数：
+// 配成 0 会让「未配置」等于「不限制」，正好是我们要防的那种情况。
+func TestDefaultMaxBodyBytes(t *testing.T) {
+	if defaultMaxBodyBytes <= 0 {
+		t.Fatalf("默认请求体上限必须为正数，实际 %d", defaultMaxBodyBytes)
+	}
+	if defaultMaxBodyBytes > 16<<20 {
+		t.Errorf("默认请求体上限过大（%d 字节），底座没有上传接口", defaultMaxBodyBytes)
+	}
+}

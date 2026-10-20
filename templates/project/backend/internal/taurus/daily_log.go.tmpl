@@ -2,12 +2,17 @@ package taurus
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
+	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
 
@@ -115,22 +120,112 @@ func (l *DailyGormLogger) Error(ctx context.Context, msg string, data ...interfa
 	}
 }
 
-// Trace 实现 logger.Interface（记录 SQL 执行）
+// slowSQLThreshold 慢 SQL 判定阈值
+const slowSQLThreshold = 200 * time.Millisecond
+
+// Trace 实现 logger.Interface（记录 SQL 执行）。
+//
+// **任何级别都不写 SQL 语句本身，也不写原始数据库错误**：
+//   - GORM 回调给出的是「已插值」SQL，绑定参数直接拼在语句里 —— 密码 hash、
+//     盐、手机号、邮箱、Token 都会被原样落盘；
+//   - 原始数据库错误同样回显数据值，典型如
+//     `Error 1062 (23000): Duplicate entry 'someone@example.com' for key 'uk_email'`。
+//
+// 日志文件通常比数据库更容易被读到（挂载、采集、备份都会带走它），所以这里
+// 只保留排障真正需要的「耗时 / 影响行数 / 语句类型 / 错误类别」。
+// 需要完整 SQL 请用数据库自身的审计与慢查询日志，由 DBA 权限控制。
 func (l *DailyGormLogger) Trace(ctx context.Context, begin time.Time, fc func() (sql string, rowsAffected int64), err error) {
 	if l.level <= logger.Silent {
 		return
 	}
 	elapsed := time.Since(begin)
+	// fc() 的第一个返回值是插值 SQL：只取语句类型，语句原文就地丢弃。
 	sqlStr, rows := fc()
+	verb := sqlVerb(sqlStr)
 	switch {
 	case err != nil && l.level >= logger.Error:
-		msg := fmt.Sprintf("[%.3fms] [rows:%v] %s; %v", float64(elapsed.Nanoseconds())/1e6, rows, sqlStr, err)
-		_, _ = l.writer.Write([]byte(l.formatter(logger.Error, msg) + "\n"))
-	case elapsed > 200*time.Millisecond && l.level >= logger.Warn:
-		msg := fmt.Sprintf("[%.3fms] [rows:%v] %s; slow sql", float64(elapsed.Nanoseconds())/1e6, rows, sqlStr)
-		_, _ = l.writer.Write([]byte(l.formatter(logger.Warn, msg) + "\n"))
+		l.writeTrace(logger.Error, fmt.Sprintf("[%.3fms] [rows:%v] [op:%s] error=%s",
+			durationMillis(elapsed), rows, verb, safeDBErrorClass(err)))
+	case elapsed > slowSQLThreshold && l.level >= logger.Warn:
+		l.writeTrace(logger.Warn, fmt.Sprintf("[%.3fms] [rows:%v] [op:%s] slow sql",
+			durationMillis(elapsed), rows, verb))
 	case l.level >= logger.Info:
-		msg := fmt.Sprintf("[%.3fms] [rows:%v] %s", float64(elapsed.Nanoseconds())/1e6, rows, sqlStr)
-		_, _ = l.writer.Write([]byte(l.formatter(logger.Info, msg) + "\n"))
+		l.writeTrace(logger.Info, fmt.Sprintf("[%.3fms] [rows:%v] [op:%s]",
+			durationMillis(elapsed), rows, verb))
 	}
+}
+
+func (l *DailyGormLogger) writeTrace(level logger.LogLevel, msg string) {
+	_, _ = l.writer.Write([]byte(l.formatter(level, msg) + "\n"))
+}
+
+func durationMillis(d time.Duration) float64 { return float64(d.Nanoseconds()) / 1e6 }
+
+// sqlVerbs Trace 允许输出的语句类型白名单。
+// 只输出白名单里的固定字符串，语句原文永远不进日志。
+var sqlVerbs = []string{
+	"SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE",
+	"CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME",
+	"BEGIN", "START", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE",
+	"SET", "SHOW", "DESCRIBE", "EXPLAIN", "CALL", "WITH", "LOCK", "UNLOCK",
+}
+
+// sqlVerb 取语句首个关键字。返回值必定是 sqlVerbs 之一或 "OTHER"，
+// 因此不可能把语句里的任何数据值带出来。
+func sqlVerb(stmt string) string {
+	upper := strings.ToUpper(strings.TrimLeft(stmt, " \t\r\n("))
+	for _, v := range sqlVerbs {
+		if !strings.HasPrefix(upper, v) {
+			continue
+		}
+		// 必须是完整单词，否则 SELECTED_AT 这类列名开头会被误判成 SELECT
+		if len(upper) == len(v) || !isSQLWordByte(upper[len(v)]) {
+			return v
+		}
+	}
+	return "OTHER"
+}
+
+func isSQLWordByte(b byte) bool {
+	return b == '_' || (b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+}
+
+// mysqlErrNoPattern 从 go-sql-driver 的错误文本里只截取错误号。
+// 捕获组限定为数字，不可能带出数据值。
+var mysqlErrNoPattern = regexp.MustCompile(`^Error (\d{3,5})\b`)
+
+// safeDBErrorClass 把数据库错误压成不含数据值的分类标签。
+//
+// 分类足够定位问题（哪类错误、MySQL 错误号），又不会像原始错误那样
+// 把冲突的邮箱、手机号、主键值写进日志。
+func safeDBErrorClass(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		return "record_not_found"
+	case errors.Is(err, gorm.ErrDuplicatedKey):
+		return "duplicated_key"
+	case errors.Is(err, gorm.ErrForeignKeyViolated):
+		return "foreign_key_violated"
+	case errors.Is(err, gorm.ErrInvalidTransaction):
+		return "invalid_transaction"
+	case errors.Is(err, gorm.ErrInvalidField):
+		return "invalid_field"
+	case errors.Is(err, context.Canceled):
+		return "context_canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "context_deadline_exceeded"
+	case errors.Is(err, sql.ErrTxDone):
+		return "tx_done"
+	case errors.Is(err, sql.ErrConnDone):
+		return "conn_done"
+	case errors.Is(err, sql.ErrNoRows):
+		return "no_rows"
+	}
+	if m := mysqlErrNoPattern.FindStringSubmatch(err.Error()); m != nil {
+		return "mysql_errno_" + m[1]
+	}
+	// 兜底只输出错误类型名，不输出 err.Error()
+	return fmt.Sprintf("db_error(%T)", err)
 }

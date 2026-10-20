@@ -1,0 +1,380 @@
+package store
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+)
+
+// fakeKV 内存版 KVStore，可切换为「故障」状态，用来覆盖 Redis 不可用的分支。
+type fakeKV struct {
+	data    map[string]string
+	failing bool
+}
+
+func newFakeKV() *fakeKV {
+	return &fakeKV{data: map[string]string{}}
+}
+
+var errFakeDown = errors.New("fake redis down")
+
+func (f *fakeKV) Get(_ context.Context, key string) (string, error) {
+	if f.failing {
+		return "", errFakeDown
+	}
+	// 与 redisx 行为一致：键不存在返回空串 + nil error
+	return f.data[key], nil
+}
+
+func (f *fakeKV) Set(_ context.Context, key string, value interface{}, _ time.Duration) error {
+	if f.failing {
+		return errFakeDown
+	}
+	s, ok := value.(string)
+	if !ok {
+		return errors.New("fake kv 只接受字符串值")
+	}
+	f.data[key] = s
+	return nil
+}
+
+func (f *fakeKV) Del(_ context.Context, keys ...string) error {
+	if f.failing {
+		return errFakeDown
+	}
+	for _, k := range keys {
+		delete(f.data, k)
+	}
+	return nil
+}
+
+// fakeAuthVersions 内存版认证版本权威来源，模拟 admin_users.auth_version。
+// bump 代表「改密/禁用等变更已随事务提交」。
+type fakeAuthVersions struct {
+	versions map[uint64]int64
+	err      error
+}
+
+func newFakeAuthVersions(users ...uint64) *fakeAuthVersions {
+	v := &fakeAuthVersions{versions: map[uint64]int64{}}
+	for _, uid := range users {
+		v.versions[uid] = 1 // 新建用户版本从 1 起算
+	}
+	return v
+}
+
+func (f *fakeAuthVersions) CurrentAuthVersion(_ context.Context, userID uint64) (int64, error) {
+	if f.err != nil {
+		return 0, f.err
+	}
+	// 用户不存在约定返回 (0, nil)
+	return f.versions[userID], nil
+}
+
+func (f *fakeAuthVersions) bump(userID uint64) int64 {
+	f.versions[userID]++
+	return f.versions[userID]
+}
+
+func (f *fakeAuthVersions) current(t *testing.T, userID uint64) int64 {
+	t.Helper()
+	v, err := f.CurrentAuthVersion(context.Background(), userID)
+	if err != nil {
+		t.Fatalf("读取认证版本失败: %v", err)
+	}
+	return v
+}
+
+func newTestStore(t *testing.T, users ...uint64) (*AuthRedisStore, *fakeKV, *fakeAuthVersions) {
+	t.Helper()
+	kv := newFakeKV()
+	versions := newFakeAuthVersions(users...)
+	return NewAuthRedisStoreWith(kv, versions), kv, versions
+}
+
+// TestSession_RegisterThenValidate 正常签发的 Token 应当通过校验。
+func TestSession_RegisterThenValidate(t *testing.T) {
+	s, _, versions := newTestStore(t, 7)
+	if err := s.RegisterSession(7, "jti-a", time.Hour, versions.current(t, 7)); err != nil {
+		t.Fatalf("登记会话失败: %v", err)
+	}
+	got, err := s.ValidateSession(7, "jti-a")
+	if err != nil {
+		t.Fatalf("已登记的会话应通过校验，实际: %v", err)
+	}
+	if got != versions.current(t, 7) {
+		t.Fatalf("校验应返回会话登记时的认证版本，期望 %d 实际 %d", versions.current(t, 7), got)
+	}
+}
+
+// TestSession_UnknownAndEmptyJTI 未登记或空 jti 一律拒绝（不能因为「查不到」就放行）。
+func TestSession_UnknownAndEmptyJTI(t *testing.T) {
+	s, _, _ := newTestStore(t, 7)
+	if _, err := s.ValidateSession(7, "never-registered"); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("未登记的会话应被拒绝，实际: %v", err)
+	}
+	if _, err := s.ValidateSession(7, ""); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("空 jti 应被拒绝，实际: %v", err)
+	}
+}
+
+// TestSession_RevokeSingle 登出只吊销当前 Token，同一用户的其他 Token 不受影响。
+func TestSession_RevokeSingle(t *testing.T) {
+	s, _, versions := newTestStore(t, 7)
+	mustRegister(t, s, 7, "jti-a", versions.current(t, 7))
+	mustRegister(t, s, 7, "jti-b", versions.current(t, 7))
+
+	if err := s.RevokeSession("jti-a"); err != nil {
+		t.Fatalf("吊销会话失败: %v", err)
+	}
+	if _, err := s.ValidateSession(7, "jti-a"); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("已登出的会话应被拒绝，实际: %v", err)
+	}
+	if _, err := s.ValidateSession(7, "jti-b"); err != nil {
+		t.Fatalf("另一个会话不应被误伤，实际: %v", err)
+	}
+}
+
+// TestSession_InvalidateAllThenRelogin 认证版本自增（改密/禁用提交）后旧 Token 全部失效，
+// 紧随其后（同一秒内）的新登录必须仍然可用 —— 这是时间戳方案做不到的边界。
+func TestSession_InvalidateAllThenRelogin(t *testing.T) {
+	s, _, versions := newTestStore(t, 7, 8)
+	mustRegister(t, s, 7, "old-1", versions.current(t, 7))
+	mustRegister(t, s, 7, "old-2", versions.current(t, 7))
+	mustRegister(t, s, 8, "other-user", versions.current(t, 8))
+
+	versions.bump(7) // 改密事务提交
+
+	for _, jti := range []string{"old-1", "old-2"} {
+		if _, err := s.ValidateSession(7, jti); !errors.Is(err, ErrSessionRevoked) {
+			t.Fatalf("吊销后旧会话 %s 应被拒绝，实际: %v", jti, err)
+		}
+	}
+	if _, err := s.ValidateSession(8, "other-user"); err != nil {
+		t.Fatalf("其他用户的会话不应被误伤，实际: %v", err)
+	}
+
+	// 同一秒内重新登录
+	mustRegister(t, s, 7, "new-1", versions.current(t, 7))
+	if _, err := s.ValidateSession(7, "new-1"); err != nil {
+		t.Fatalf("吊销后新登录应可用，实际: %v", err)
+	}
+	if _, err := s.ValidateSession(7, "old-1"); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("新登录后旧会话仍应被拒绝，实际: %v", err)
+	}
+}
+
+// TestSession_StaleVersionFromLoginRace 复现登录竞态：
+// 旧密码校验通过（读到版本 v）之后、登记之前发生改密（版本变 v+1），
+// 那么以 v 登记出来的会话必须立刻无效 —— 否则旧凭证换到了可用会话。
+func TestSession_StaleVersionFromLoginRace(t *testing.T) {
+	s, _, versions := newTestStore(t, 7)
+	verAtVerify := versions.current(t, 7)
+
+	versions.bump(7) // 改密在「校验通过」与「登记」之间提交
+
+	if err := s.RegisterSession(7, "race-jti", time.Hour, verAtVerify); err != nil {
+		t.Fatalf("登记本身不该失败（登记的是过期版本，由校验兜住）: %v", err)
+	}
+	if _, err := s.ValidateSession(7, "race-jti"); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("用过期认证版本登记的会话必须被拒绝，实际: %v", err)
+	}
+}
+
+// TestSession_RegisterRejectsMissingVersion 拿不到认证版本的调用方不许登记会话：
+// 版本缺失时不能回退成 0 或「不校验版本」。
+func TestSession_RegisterRejectsMissingVersion(t *testing.T) {
+	s, _, _ := newTestStore(t, 7)
+	for _, bad := range []int64{0, -1} {
+		err := s.RegisterSession(7, "jti-no-version", time.Hour, bad)
+		if !errors.Is(err, ErrSessionStoreUnavailable) {
+			t.Fatalf("认证版本为 %d 时登记应 fail closed，实际: %v", bad, err)
+		}
+	}
+	if _, err := s.ValidateSession(7, "jti-no-version"); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("登记被拒后不应留下可用会话，实际: %v", err)
+	}
+}
+
+// TestSession_MissingVersionInStoredValue 白名单里的值缺少版本段（旧格式残留、
+// 被改写）时按已吊销处理，绝不能当成「版本 0」放行。
+func TestSession_MissingVersionInStoredValue(t *testing.T) {
+	for name, raw := range map[string]string{
+		"只有 uid":  "7",
+		"版本段为空":   "7:",
+		"版本段非数字":  "7:abc",
+		"版本段为 0":  "7:0",
+		"版本段为负":   "7:-1",
+		"uid 段为空": ":1",
+	} {
+		kv := newFakeKV()
+		kv.data[sessionJTIKeyPrefix+"jti-x"] = raw
+		s := NewAuthRedisStoreWith(kv, newFakeAuthVersions(7))
+		if _, err := s.ValidateSession(7, "jti-x"); !errors.Is(err, ErrSessionRevoked) {
+			t.Fatalf("%s（%q）应被拒绝，实际: %v", name, raw, err)
+		}
+	}
+}
+
+// TestSession_SurvivesJTIKeyLossAsRevoked jti 键被淘汰/丢失时结果是「拒绝」，
+// 不是「复活」。吊销版本存在数据库里，Redis 丢数据只会让人重新登录。
+func TestSession_SurvivesJTIKeyLossAsRevoked(t *testing.T) {
+	s, kv, versions := newTestStore(t, 7)
+	mustRegister(t, s, 7, "jti-a", versions.current(t, 7))
+
+	// 模拟 allkeys 淘汰：直接抹掉白名单键
+	delete(kv.data, sessionJTIKeyPrefix+"jti-a")
+
+	if _, err := s.ValidateSession(7, "jti-a"); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("白名单键丢失应被拒绝，实际: %v", err)
+	}
+}
+
+// TestSession_RevokedSessionStaysRevokedAfterRedisFlush Redis 整库清空也不能让
+// 已吊销会话复活：版本自增后即使 KV 被重建，旧会话既没有白名单键、
+// 版本也对不上。
+func TestSession_RevokedSessionStaysRevokedAfterRedisFlush(t *testing.T) {
+	s, kv, versions := newTestStore(t, 7)
+	mustRegister(t, s, 7, "jti-a", versions.current(t, 7))
+	versions.bump(7)
+
+	kv.data = map[string]string{} // flushall
+
+	if _, err := s.ValidateSession(7, "jti-a"); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("Redis 清空后旧会话仍必须被拒绝，实际: %v", err)
+	}
+	// 重新登录仍然可用
+	mustRegister(t, s, 7, "jti-new", versions.current(t, 7))
+	if _, err := s.ValidateSession(7, "jti-new"); err != nil {
+		t.Fatalf("Redis 清空后新登录应可用，实际: %v", err)
+	}
+}
+
+// TestSession_CrossUserJTI 用别人的 jti 冒充自己要被拒绝。
+func TestSession_CrossUserJTI(t *testing.T) {
+	s, _, versions := newTestStore(t, 7, 9)
+	mustRegister(t, s, 7, "jti-a", versions.current(t, 7))
+	if _, err := s.ValidateSession(9, "jti-a"); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("jti 与用户不匹配应被拒绝，实际: %v", err)
+	}
+}
+
+// TestSession_UnknownUserFailsClosed 用户已被硬删除（版本来源返回 0）时拒绝放行。
+func TestSession_UnknownUserFailsClosed(t *testing.T) {
+	kv := newFakeKV()
+	kv.data[sessionJTIKeyPrefix+"jti-a"] = "7:1"
+	s := NewAuthRedisStoreWith(kv, newFakeAuthVersions()) // 版本表里没有 7
+	if _, err := s.ValidateSession(7, "jti-a"); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("查不到用户时应被拒绝，实际: %v", err)
+	}
+}
+
+// TestSession_RedisFailureFailsClosed Redis 故障期间一律拒绝，恢复后恢复正常。
+func TestSession_RedisFailureFailsClosed(t *testing.T) {
+	s, kv, versions := newTestStore(t, 7)
+	mustRegister(t, s, 7, "jti-a", versions.current(t, 7))
+
+	kv.failing = true
+	if _, err := s.ValidateSession(7, "jti-a"); !errors.Is(err, ErrSessionStoreUnavailable) {
+		t.Fatalf("Redis 故障时应返回存储不可用，实际: %v", err)
+	}
+	if _, err := s.ValidateSession(7, "jti-a"); errors.Is(err, ErrSessionRevoked) {
+		t.Fatal("存储故障不能被当成「已吊销」之外的放行信号")
+	}
+	if err := s.RegisterSession(7, "jti-c", time.Hour, versions.current(t, 7)); !errors.Is(err, ErrSessionStoreUnavailable) {
+		t.Fatalf("Redis 故障时登记应失败，实际: %v", err)
+	}
+
+	kv.failing = false
+	if _, err := s.ValidateSession(7, "jti-a"); err != nil {
+		t.Fatalf("Redis 恢复后原有会话应重新可用，实际: %v", err)
+	}
+}
+
+// TestSession_VersionSourceFailureFailsClosed 认证版本来源故障时拒绝请求，
+// 不能退化成「只看白名单」。
+func TestSession_VersionSourceFailureFailsClosed(t *testing.T) {
+	s, _, versions := newTestStore(t, 7)
+	mustRegister(t, s, 7, "jti-a", versions.current(t, 7))
+
+	versions.err = errors.New("db down")
+	if _, err := s.ValidateSession(7, "jti-a"); !errors.Is(err, ErrSessionStoreUnavailable) {
+		t.Fatalf("版本来源故障时应返回存储不可用，实际: %v", err)
+	}
+
+	versions.err = nil
+	if _, err := s.ValidateSession(7, "jti-a"); err != nil {
+		t.Fatalf("版本来源恢复后会话应重新可用，实际: %v", err)
+	}
+}
+
+// TestSession_NoVersionResolverFailsClosed 没注入版本来源时一律拒绝。
+func TestSession_NoVersionResolverFailsClosed(t *testing.T) {
+	kv := newFakeKV()
+	kv.data[sessionJTIKeyPrefix+"jti-a"] = "7:1"
+	s := NewAuthRedisStoreWith(kv, nil) // 也没有包级注入（见 TestSetAuthVersionResolver）
+	if _, err := s.ValidateSession(7, "jti-a"); !errors.Is(err, ErrSessionStoreUnavailable) {
+		t.Fatalf("没有版本来源时应返回存储不可用，实际: %v", err)
+	}
+}
+
+// TestSetAuthVersionResolver 包级注入入口可用（main 靠它打破依赖方向）。
+func TestSetAuthVersionResolver(t *testing.T) {
+	prev := globalAuthVersionResolver()
+	t.Cleanup(func() { SetAuthVersionResolver(prev) })
+
+	versions := newFakeAuthVersions(7)
+	SetAuthVersionResolver(versions)
+
+	kv := newFakeKV()
+	kv.data[sessionJTIKeyPrefix+"jti-a"] = "7:1"
+	s := NewAuthRedisStoreWith(kv, nil) // 实例未指定来源，走包级注入
+	if _, err := s.ValidateSession(7, "jti-a"); err != nil {
+		t.Fatalf("注入后应能正常校验，实际: %v", err)
+	}
+	versions.bump(7)
+	if _, err := s.ValidateSession(7, "jti-a"); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("注入的来源变更后应生效，实际: %v", err)
+	}
+}
+
+// TestSession_NoRedisConfigured 组件容器里没有 Redis 时也必须 fail closed。
+func TestSession_NoRedisConfigured(t *testing.T) {
+	s := NewAuthRedisStore() // 测试进程里 taurus.Container 为 nil
+	if _, err := s.ValidateSession(7, "jti-a"); !errors.Is(err, ErrSessionStoreUnavailable) {
+		t.Fatalf("没有 Redis 时应返回存储不可用，实际: %v", err)
+	}
+	if err := s.RegisterSession(7, "jti-a", time.Hour, 1); !errors.Is(err, ErrSessionStoreUnavailable) {
+		t.Fatalf("没有 Redis 时登记应失败，实际: %v", err)
+	}
+}
+
+// TestSession_RegisterRejectsBadInput 缺少 jti 或无效有效期不能静默成功，
+// 否则会出现「登记失败但请求照常放行」的空洞。
+func TestSession_RegisterRejectsBadInput(t *testing.T) {
+	s, _, _ := newTestStore(t, 7)
+	if err := s.RegisterSession(7, "", time.Hour, 1); err == nil {
+		t.Fatal("空 jti 应登记失败")
+	}
+	if err := s.RegisterSession(7, "jti-a", 0, 1); err == nil {
+		t.Fatal("无效有效期应登记失败")
+	}
+}
+
+// TestSession_CorruptedValue 存储里的值被写坏时按已吊销处理，不放行。
+func TestSession_CorruptedValue(t *testing.T) {
+	kv := newFakeKV()
+	kv.data[sessionJTIKeyPrefix+"jti-x"] = "not-a-session"
+	s := NewAuthRedisStoreWith(kv, newFakeAuthVersions(7))
+	if _, err := s.ValidateSession(7, "jti-x"); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("非法会话值应被拒绝，实际: %v", err)
+	}
+}
+
+func mustRegister(t *testing.T, s *AuthRedisStore, uid uint64, jti string, version int64) {
+	t.Helper()
+	if err := s.RegisterSession(uid, jti, time.Hour, version); err != nil {
+		t.Fatalf("登记会话 %s 失败: %v", jti, err)
+	}
+}

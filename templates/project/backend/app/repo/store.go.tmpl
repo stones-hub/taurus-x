@@ -46,6 +46,16 @@ func NewStore() *Store {
 	return &Store{repoSet{db: defaultDB()}}
 }
 
+// NewStoreWithDB 用显式连接创建工作单元。
+//
+// 生产装配一律走 NewStore()（默认连接池）。这个构造是「需要指定连接」的唯一入口：
+// 行为回归测试要把真实的 GORM 调用链接到一个可断言的连接上（见
+// app/controller/user_admin_guard_test.go 用 sqlmock 验证「判定在写入之前、
+// 拒绝时零写入」），只能从这里拿 Store —— 而不是把 *gorm.DB 散播进 service 层。
+func NewStoreWithDB(db *gorm.DB) *Store {
+	return &Store{repoSet{db: db}}
+}
+
 // StoreSet wire provider set：提供 *Store 工作单元。
 var StoreSet = wire.NewSet(NewStore)
 

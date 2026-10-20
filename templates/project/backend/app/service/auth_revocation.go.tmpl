@@ -1,0 +1,30 @@
+package service
+
+import "errors"
+
+// 会话吊销的唯一判定点。
+//
+// 「改了凭证 / 禁用了账号」与「让已签发的 Token 立刻失效」必须是同一件事。
+// 分成两次独立写（先改 MySQL，再写 Redis）会留下一个窗口：第二步失败或进程
+// 在中间挂掉，密码已经换了，旧 Token 却还在白名单里、照常通过认证。
+//
+// 所以本项目的吊销标记是 admin_users.auth_version（数据库列），而
+// applyRevocableChange 是它与业务变更的绑定点：两步都在**调用方的同一个数据库
+// 事务**里执行，任一失败整笔回滚。Redis 只缓存「某个 jti 登记时的版本」，
+// 丢了就是拒绝，方向安全。
+//
+// 这里刻意保持成一个不碰数据库的纯函数：顺序与失败传播能被确定性地测到，
+// 而「两步在同一事务内」由调用方用 Store.RunInTx 保证（见 auth_service.go /
+// user_service.go，以及 internal/generator 对结构的断言）。
+func applyRevocableChange(change, bumpAuthVersion func() error) error {
+	if change == nil || bumpAuthVersion == nil {
+		return errors.New("吊销会话失败: 变更步骤缺失")
+	}
+	// 先做业务变更：它失败了就什么都没发生，不该白白自增版本把人踢下线。
+	if err := change(); err != nil {
+		return err
+	}
+	// 自增失败必须往上抛，让外层事务回滚掉上面那步业务变更 ——
+	// 绝不允许「凭证已改、吊销没生效」提交出去。
+	return bumpAuthVersion()
+}

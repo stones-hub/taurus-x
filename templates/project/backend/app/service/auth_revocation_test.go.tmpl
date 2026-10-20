@@ -1,0 +1,79 @@
+package service
+
+import (
+	"errors"
+	"testing"
+)
+
+// applyRevocableChange 是「凭证/状态变更」与「吊销已签发 Token」的绑定点。
+// 这些用例都是确定性的行为断言（不依赖数据库、不依赖调度、不 sleep）：
+// 只验证顺序与失败传播，因为正是这两点决定了会不会留下
+// 「密码已改、吊销没生效」的中间态。
+
+func TestApplyRevocableChange_BumpsAfterChange(t *testing.T) {
+	var order []string
+	err := applyRevocableChange(
+		func() error { order = append(order, "change"); return nil },
+		func() error { order = append(order, "bump"); return nil },
+	)
+	if err != nil {
+		t.Fatalf("两步都成功时应返回 nil，实际: %v", err)
+	}
+	if len(order) != 2 || order[0] != "change" || order[1] != "bump" {
+		t.Fatalf("应先变更再自增版本，实际顺序 %v", order)
+	}
+}
+
+// TestApplyRevocableChange_ChangeFailureSkipsBump 业务变更失败时不能自增版本：
+// 什么都没改却把人全部踢下线，是不该付的代价。
+func TestApplyRevocableChange_ChangeFailureSkipsBump(t *testing.T) {
+	changeErr := errors.New("写凭证失败")
+	bumped := false
+	err := applyRevocableChange(
+		func() error { return changeErr },
+		func() error { bumped = true; return nil },
+	)
+	if !errors.Is(err, changeErr) {
+		t.Fatalf("应原样返回变更错误，实际: %v", err)
+	}
+	if bumped {
+		t.Fatal("变更失败时不应自增认证版本")
+	}
+}
+
+// TestApplyRevocableChange_BumpFailurePropagates 自增失败必须往上抛，
+// 让外层 RunInTx 回滚掉已经做过的凭证变更 —— 绝不允许
+// 「凭证已改、吊销没生效」被提交出去（Pi 复现的正是这个状态）。
+func TestApplyRevocableChange_BumpFailurePropagates(t *testing.T) {
+	bumpErr := errors.New("自增认证版本失败")
+	err := applyRevocableChange(
+		func() error { return nil },
+		func() error { return bumpErr },
+	)
+	if !errors.Is(err, bumpErr) {
+		t.Fatalf("自增失败必须向上传播（触发事务回滚），实际: %v", err)
+	}
+}
+
+// TestApplyRevocableChange_MissingStepsFailClosed 少传一步时报错，
+// 不能静默只做一半。
+func TestApplyRevocableChange_MissingStepsFailClosed(t *testing.T) {
+	ok := func() error { return nil }
+	cases := []struct {
+		name   string
+		change func() error
+		bump   func() error
+	}{
+		{"缺变更步骤", nil, ok},
+		{"缺自增步骤", ok, nil},
+		{"两步都缺", nil, nil},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if err := applyRevocableChange(tc.change, tc.bump); err == nil {
+				t.Fatal("步骤缺失时必须报错")
+			}
+		})
+	}
+}

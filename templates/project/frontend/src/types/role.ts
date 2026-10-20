@@ -55,7 +55,6 @@ export interface AddRoleRequest {
     role_code: string
     description: string
     sort_order: number
-    is_system: number
     permission_ids: number[]
 }
 

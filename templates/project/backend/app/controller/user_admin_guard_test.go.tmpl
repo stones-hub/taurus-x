@@ -1,0 +1,1072 @@
+// 用户管理写入的行为回归：**真实调用链**上验证目标账号保护与身份锁协议。
+//
+// 为什么不是只测 service 里的纯守卫：那样只能证明「判定函数会说不」，证不了
+// 「handler 真的调了它」「判定真的在写之前」「拒绝时真的什么都没落库」。
+// 这三条恰好是本次修的那个漏洞的全部内容 —— 原实现把守卫放在三次独立提交的最后一步，
+// 纯守卫单测全绿，超管的密码照样被改掉了。
+//
+// 做法：用 sqlmock 当连接，跑的是真的 GORM + 真的 repo + 真的 service + 真的 handler。
+// sqlmock 默认**按顺序**匹配期望，于是：
+//   - 期望里只登记 SELECT 时，任何 UPDATE/INSERT/DELETE 都会撞上「未预期的语句」而失败
+//     → 这就是「拒绝时零写入」的硬断言；
+//   - 期望的先后顺序本身就是「先锁 → 再当前读 → 才写」的断言；
+//   - 用 WithArgs 钉住每条加锁读的 user_id，于是「锁序」和「同一 ID 只锁一次」
+//     也变成可证的：锁反了序、或多锁一次，第一个对不上的期望就会失败。
+//
+// 期望里的 lockSel / shareSel 要求语句带 FOR UPDATE / FOR SHARE，
+// 把「加锁当前读」而不是「事务快照读」也钉进断言 —— 两者在 Go 代码里看不出区别。
+//
+// 这里不连任何真实数据库。能证明的是语句顺序、加锁子句、绑定参数和「没有写入」；
+// 证不了真实 MySQL 的事务原子性、锁等待与并发交错结果，那些留给真库验收。
+package controller
+
+import (
+	"bytes"
+	"context"
+	"database/sql/driver"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"testing"
+
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+
+	"{{ .Module }}/app/constants"
+	"{{ .Module }}/app/dto"
+	"{{ .Module }}/app/helper"
+	"{{ .Module }}/app/middleware"
+	"{{ .Module }}/app/repo"
+	"{{ .Module }}/app/service"
+)
+
+// 场景里的几个账号与角色
+const (
+	operatorOrdinaryID uint64 = 11 // 普通管理员：有 user/update 等接口权限，但不是超管
+	operatorSuperID    uint64 = 1  // 超管
+	targetSuperID      uint64 = 2  // 目标账号：持有 super_admin
+	targetOrdinaryID   uint64 = 12 // 目标账号：普通用户
+	roleSuperID        uint64 = 1
+	roleOrdinaryID     uint64 = 3
+	roleDisabledID     uint64 = 5   // 已被禁用的普通角色
+	roleMissingID      uint64 = 999 // 不存在的角色 ID
+)
+
+// identity 一个账号的角色事实（测试里用一人一角色足够表达判定）
+type identity struct {
+	roleID   uint64
+	roleCode string
+	isSystem int8
+	status   int8
+}
+
+var (
+	superRole    = identity{roleID: roleSuperID, roleCode: constants.SuperAdminRoleCode, isSystem: 1, status: 1}
+	ordinaryRole = identity{roleID: roleOrdinaryID, roleCode: "ops_admin", isSystem: 0, status: 1}
+	// disabledRole 一个**已被禁用**的普通角色：已经持有它的账号可以继续保留，
+	// 但本次新增它要被拒绝（service.CheckRoleStatusAssignable）。
+	disabledRole = identity{roleID: roleDisabledID, roleCode: "legacy_ops", isSystem: 0, status: 0}
+)
+
+// ---------- 装配 ----------
+
+func newMockDB(t *testing.T) (*gorm.DB, sqlmock.Sqlmock) {
+	t.Helper()
+	sqlDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("创建 sqlmock 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	db, err := gorm.Open(mysql.New(mysql.Config{Conn: sqlDB, SkipInitializeWithVersion: true}), &gorm.Config{
+		Logger:                 logger.Discard,
+		DisableAutomaticPing:   true,
+		SkipDefaultTransaction: true,
+	})
+	if err != nil {
+		t.Fatalf("GORM 挂载 sqlmock 失败: %v", err)
+	}
+	return db, mock
+}
+
+// newUserController 按生产方式装配：Store → service → controller，
+// 唯一的区别是 Store 绑在 sqlmock 连接上（repo.NewStoreWithDB）。
+func newUserController(t *testing.T) (*UserController, sqlmock.Sqlmock) {
+	t.Helper()
+	db, mock := newMockDB(t)
+	store := repo.NewStoreWithDB(db)
+	return &UserController{
+		AuthService: service.NewAuthService(store),
+		UserService: service.NewAdminUserService(store),
+		RoleService: service.NewAdminRoleService(store),
+	}, mock
+}
+
+// newRoleController 角色分配入口（/admin/role/assign）同样按生产方式装配。
+func newRoleController(t *testing.T) (*RoleController, sqlmock.Sqlmock) {
+	t.Helper()
+	db, mock := newMockDB(t)
+	return &RoleController{RoleService: service.NewAdminRoleService(repo.NewStoreWithDB(db))}, mock
+}
+
+// jwtRequest 构造一个「已通过 JWT 中间件」的请求：操作人身份只能从 context 里的
+// claims 来，请求体里给不了。
+func jwtRequest(t *testing.T, operatorID uint64, body interface{}) *http.Request {
+	t.Helper()
+	payload, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("序列化请求体失败: %v", err)
+	}
+	r := httptest.NewRequest(http.MethodPost, "/admin/user/update", bytes.NewReader(payload))
+	claims := middleware.JWTClaims{UID: strconv.FormatUint(operatorID, 10), Username: "operator", JTI: "test-jti"}
+	return r.WithContext(context.WithValue(r.Context(), middleware.JWTTokenClaimsKey, claims))
+}
+
+// rawJSONRequest 同 jwtRequest，但请求体是**原始 JSON 文本**。
+//
+// 「role_ids 字段缺失」「role_ids: null」「role_ids: []」三者的区别只存在于 JSON 文本层面：
+// 用 dto.UpdateUserRequest 结构体当请求体表达不了 —— 缺失与 null 解码后都是 nil 切片，
+// 而结构体序列化出来又永远带着这个字段。所以要测 handler 的解码语义只能自己写 JSON。
+func rawJSONRequest(t *testing.T, operatorID uint64, body string) *http.Request {
+	t.Helper()
+	return jwtRequest(t, operatorID, json.RawMessage(body))
+}
+
+// respCode 取响应体里的业务码。httpx.SendResponse 对 403/500 走的是
+// 「HTTP 200 + body.code」，所以判成功失败只能看 body.code（前端也是这么判的）。
+func respCode(t *testing.T, rec *httptest.ResponseRecorder) int {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("HTTP 状态码应为 200（业务码在 body.code 里），实际 %d", rec.Code)
+	}
+	var resp struct {
+		Code int               `json:"code"`
+		Data map[string]string `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	return resp.Code
+}
+
+// ---------- SQL 期望（只认表名与加锁子句，不绑死 GORM 具体渲染） ----------
+
+func sel(table string) string { return "SELECT .* FROM .?" + table }
+func upd(table string) string { return "UPDATE .?" + table }
+func del(table string) string { return "DELETE FROM .?" + table }
+func ins(table string) string { return "INSERT INTO .?" + table }
+
+// lockSel / shareSel 要求语句带加锁子句：没有它就是一次事务快照读，
+// 并发已提交的身份变更看不见，身份判定依据的是过期事实。
+func lockSel(table string) string  { return "SELECT .* FROM .?" + table + ".* FOR UPDATE" }
+func shareSel(table string) string { return "SELECT .* FROM .?" + table + ".* FOR SHARE" }
+
+// firstArgs 单行加锁读的绑定参数。GORM 把 LIMIT 也绑成参数
+// （clause.Limit 走 AddVar），所以 First 是「条件值 + 1」两个绑定变量。
+func firstArgs(id uint64) []driver.Value { return []driver.Value{id, 1} }
+
+func userRows() *sqlmock.Rows {
+	return sqlmock.NewRows([]string{"user_id", "username", "status", "auth_version"})
+}
+
+func roleRows() *sqlmock.Rows {
+	return sqlmock.NewRows([]string{"role_id", "role_code", "is_system", "status"})
+}
+
+// expectLockUserRow 登记一次「锁定并当前读某个用户行」。
+// 调用顺序即期望的锁序：按 user_id 升序写，锁反了序第一条就对不上。
+func expectLockUserRow(mock sqlmock.Sqlmock, userID uint64, username string) {
+	mock.ExpectQuery(lockSel("admin_users")).WithArgs(firstArgs(userID)...).
+		WillReturnRows(userRows().AddRow(userID, username, 1, 7))
+}
+
+// expectLockUserRowMissing 该用户行不存在（已被删除）。
+func expectLockUserRowMissing(mock sqlmock.Sqlmock, userID uint64) {
+	mock.ExpectQuery(lockSel("admin_users")).WithArgs(firstArgs(userID)...).WillReturnRows(userRows())
+}
+
+// expectRolesOf 登记一次「当前读某个账号持有的角色」：关联表加排他锁 + 角色表加共享锁。
+// 身份只能这样查出来 —— 请求体里的 role_ids 不作为身份依据。
+//
+// 可变参数是为了表达「一个账号多个角色」：currentUserRoles 按关联行的顺序逐个
+// 当前读角色行，所以登记顺序必须和传进来的顺序一致。
+func expectRolesOf(mock sqlmock.Sqlmock, userID uint64, ids ...identity) {
+	rows := sqlmock.NewRows([]string{"id", "user_id", "role_id"})
+	for i, id := range ids {
+		rows.AddRow(i+1, userID, id.roleID)
+	}
+	mock.ExpectQuery(lockSel("admin_user_roles")).WithArgs(userID).WillReturnRows(rows)
+	for _, id := range ids {
+		mock.ExpectQuery(shareSel("admin_roles")).WithArgs(firstArgs(id.roleID)...).
+			WillReturnRows(roleRows().AddRow(id.roleID, id.roleCode, id.isSystem, id.status))
+	}
+}
+
+// expectNoRolesOf 该账号一条角色关联都没有（新建账号、首次赋角色）。
+// 锁锚在用户行上而不是关联行上，所以这种账号同样锁得住。
+func expectNoRolesOf(mock sqlmock.Sqlmock, userID uint64) {
+	mock.ExpectQuery(lockSel("admin_user_roles")).WithArgs(userID).WillReturnRows(
+		sqlmock.NewRows([]string{"id", "user_id", "role_id"}))
+}
+
+// expectRoleCheck 登记一次「校验入参角色 ID」（txRoleFactsByIDs，共享锁当前读）。
+func expectRoleCheck(mock sqlmock.Sqlmock, id identity) {
+	mock.ExpectQuery(shareSel("admin_roles")).WithArgs(firstArgs(id.roleID)...).
+		WillReturnRows(roleRows().AddRow(id.roleID, id.roleCode, id.isSystem, id.status))
+}
+
+// expectRoleCheckMissing 入参里的角色 ID 不存在。
+func expectRoleCheckMissing(mock sqlmock.Sqlmock, roleID uint64) {
+	mock.ExpectQuery(shareSel("admin_roles")).WithArgs(firstArgs(roleID)...).WillReturnRows(roleRows())
+}
+
+// expectReplaceRoles 登记角色关联的整体替换：**按 user_id 条件删**一条 DELETE，
+// 不是「先查关联行再按主键逐行删」—— 后者会漏掉快照之后新增的关联行。
+// WithArgs 钉住 user_id：改回按主键删时绑定参数就不是它了。
+func expectReplaceRoles(mock sqlmock.Sqlmock, userID uint64, inserts int) {
+	mock.ExpectExec(del("admin_user_roles")).WithArgs(userID).WillReturnResult(sqlmock.NewResult(0, 1))
+	for i := 0; i < inserts; i++ {
+		mock.ExpectExec(ins("admin_user_roles")).WillReturnResult(sqlmock.NewResult(int64(7+i), 1))
+	}
+}
+
+func assertNoUnexpectedSQL(t *testing.T, mock sqlmock.Sqlmock) {
+	t.Helper()
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("SQL 期望未满足（多写、少写或顺序不符）: %v", err)
+	}
+}
+
+// ---------- UpdateUser：非超管不得编辑超管账号 ----------
+
+func TestUpdateUser_NonSuperAdminCannotWriteSuperAdminAccount(t *testing.T) {
+	cases := []struct {
+		name string
+		req  dto.UpdateUserRequest
+	}{
+		{
+			// 最关键的一条：原实现到这里资料和密码都已经提交了
+			name: "改资料并重置密码",
+			req: dto.UpdateUserRequest{
+				UserID: targetSuperID, Realname: "改名", Nickname: "nick",
+				Password: "Reset1pwd", RoleIDs: []uint64{roleSuperID},
+			},
+		},
+		{
+			// 角色集合与现状完全一致：CheckRoleAssignmentAllowed 这一关是放行的
+			// （没有增、也没有减受保护角色），所以这条只能靠目标账号保护拦住
+			name: "角色集合与现状相同",
+			req: dto.UpdateUserRequest{
+				UserID: targetSuperID, Realname: "改名", RoleIDs: []uint64{roleSuperID},
+			},
+		},
+		{
+			name: "role_ids 传空",
+			req:  dto.UpdateUserRequest{UserID: targetSuperID, Realname: "改名", RoleIDs: []uint64{}},
+		},
+		{
+			name: "role_ids 未传（nil）",
+			req:  dto.UpdateUserRequest{UserID: targetSuperID, Realname: "改名"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, mock := newUserController(t)
+
+			// 只登记预检要读的东西：往后一个写语句都不许出现
+			mock.ExpectBegin()
+			// 锁序按 user_id 升序：目标 2 在操作人 11 之前
+			expectLockUserRow(mock, targetSuperID, "super")
+			expectLockUserRow(mock, operatorOrdinaryID, "operator")
+			expectRolesOf(mock, operatorOrdinaryID, ordinaryRole) // 操作人：普通管理员
+			expectRolesOf(mock, targetSuperID, superRole)         // 目标：超管
+			mock.ExpectRollback()
+
+			rec := httptest.NewRecorder()
+			c.UpdateUser(rec, jwtRequest(t, operatorOrdinaryID, tc.req))
+
+			if got := respCode(t, rec); got != http.StatusForbidden {
+				t.Errorf("非超管编辑超管账号应回 403，实际 body.code = %d", got)
+			}
+			assertNoUnexpectedSQL(t, mock)
+		})
+	}
+}
+
+// TestUpdateUser_LocksUserRowsInAscendingOrder 加锁顺序必须由 user_id 决定，
+// 不是由「先操作人后目标」这种代码书写顺序决定。
+//
+// 这是死锁的来源：A 改 B 的同时 B 改 A，若各自先锁自己再锁对方，两笔就各持一半
+// 互等。按 user_id 升序之后，两笔要的是同一组锁、同一个顺序，必然一前一后。
+// 两个子用例的操作人与目标 ID 大小关系相反，锁序也跟着反过来 —— 固定「操作人优先」
+// 的实现过不了其中一条。
+func TestUpdateUser_LocksUserRowsInAscendingOrder(t *testing.T) {
+	t.Run("目标 ID 更小时先锁目标", func(t *testing.T) {
+		c, mock := newUserController(t)
+
+		mock.ExpectBegin()
+		expectLockUserRow(mock, targetSuperID, "super")         // 2
+		expectLockUserRow(mock, operatorOrdinaryID, "operator") // 11
+		expectRolesOf(mock, operatorOrdinaryID, ordinaryRole)
+		expectRolesOf(mock, targetSuperID, superRole)
+		mock.ExpectRollback()
+
+		rec := httptest.NewRecorder()
+		c.UpdateUser(rec, jwtRequest(t, operatorOrdinaryID, dto.UpdateUserRequest{
+			UserID: targetSuperID, Realname: "改名",
+		}))
+
+		if got := respCode(t, rec); got != http.StatusForbidden {
+			t.Errorf("非超管编辑超管账号应回 403，实际 body.code = %d", got)
+		}
+		assertNoUnexpectedSQL(t, mock)
+	})
+
+	t.Run("操作人 ID 更小时先锁操作人", func(t *testing.T) {
+		c, mock := newUserController(t)
+
+		mock.ExpectBegin()
+		expectLockUserRow(mock, operatorSuperID, "super")  // 1
+		expectLockUserRow(mock, targetOrdinaryID, "staff") // 12
+		expectRolesOf(mock, operatorSuperID, superRole)
+		expectRolesOf(mock, targetOrdinaryID, ordinaryRole)
+		// 入参角色不存在 → 整笔失败回滚，一个写语句都不该出现
+		expectRoleCheckMissing(mock, roleMissingID)
+		mock.ExpectRollback()
+
+		rec := httptest.NewRecorder()
+		c.UpdateUser(rec, jwtRequest(t, operatorSuperID, dto.UpdateUserRequest{
+			UserID: targetOrdinaryID, Realname: "改名", RoleIDs: []uint64{roleMissingID},
+		}))
+
+		if got := respCode(t, rec); got == http.StatusOK {
+			t.Error("入参角色不存在时不能返回成功")
+		}
+		assertNoUnexpectedSQL(t, mock)
+	})
+}
+
+// TestUpdateUser_SameUserLockedOnce 操作人就是目标时，用户行只锁一次、身份只读一次。
+//
+// 重复锁同一行在同一个事务里不会自锁，但多出来的那次当前读会让「锁了几行」对不上账；
+// 更重要的是这条路径必须照常可用 —— 超管编辑自己的资料不能被自己的守卫挡住。
+// 断言靠 sqlmock 的顺序匹配：若实现重复读了一遍身份，第三条实际语句会是
+// admin_user_roles 的加锁读，而第三条期望是入参角色校验，直接对不上。
+func TestUpdateUser_SameUserLockedOnce(t *testing.T) {
+	c, mock := newUserController(t)
+
+	mock.ExpectBegin()
+	expectLockUserRow(mock, operatorSuperID, "super") // 只有这一条 admin_users 加锁读
+	expectRolesOf(mock, operatorSuperID, superRole)   // 只有这一次身份当前读
+	expectRoleCheck(mock, superRole)                  // 入参角色校验（保留自己的超管角色）
+	mock.ExpectExec(upd("admin_users")).WillReturnResult(sqlmock.NewResult(0, 1))
+	expectReplaceRoles(mock, operatorSuperID, 1)
+	mock.ExpectCommit()
+
+	rec := httptest.NewRecorder()
+	c.UpdateUser(rec, jwtRequest(t, operatorSuperID, dto.UpdateUserRequest{
+		UserID: operatorSuperID, Realname: "超管", RoleIDs: []uint64{roleSuperID},
+	}))
+
+	if got := respCode(t, rec); got != http.StatusOK {
+		t.Errorf("超管编辑自己的资料应成功，实际 body.code = %d，body = %s", got, rec.Body.String())
+	}
+	assertNoUnexpectedSQL(t, mock)
+}
+
+// TestUpdateUser_MissingUserRowFailsClosed 用户行缺失必须拒绝且零写入。
+//
+// 两个方向都要覆盖：操作人账号已被删除（没有身份就没有权力，按越权拒绝），
+// 目标账号已被删除（按用户不存在拒绝）。任一方向上「查不到就继续写」都是错的。
+func TestUpdateUser_MissingUserRowFailsClosed(t *testing.T) {
+	t.Run("操作人账号不存在", func(t *testing.T) {
+		c, mock := newUserController(t)
+
+		mock.ExpectBegin()
+		expectLockUserRow(mock, targetSuperID, "super")
+		expectLockUserRowMissing(mock, operatorOrdinaryID)
+		mock.ExpectRollback()
+
+		rec := httptest.NewRecorder()
+		c.UpdateUser(rec, jwtRequest(t, operatorOrdinaryID, dto.UpdateUserRequest{
+			UserID: targetSuperID, Realname: "改名", Password: "Reset1pwd",
+		}))
+
+		if got := respCode(t, rec); got != http.StatusForbidden {
+			t.Errorf("操作人账号不存在应回 403，实际 body.code = %d", got)
+		}
+		assertNoUnexpectedSQL(t, mock)
+	})
+
+	t.Run("目标账号不存在", func(t *testing.T) {
+		c, mock := newUserController(t)
+
+		mock.ExpectBegin()
+		expectLockUserRow(mock, operatorSuperID, "super")
+		expectLockUserRowMissing(mock, targetOrdinaryID)
+		mock.ExpectRollback()
+
+		rec := httptest.NewRecorder()
+		c.UpdateUser(rec, jwtRequest(t, operatorSuperID, dto.UpdateUserRequest{
+			UserID: targetOrdinaryID, Realname: "改名", Password: "Reset1pwd",
+		}))
+
+		if got := respCode(t, rec); got == http.StatusOK {
+			t.Error("目标账号不存在时不能返回成功")
+		}
+		assertNoUnexpectedSQL(t, mock)
+	})
+}
+
+// TestUpdateUser_IdentityQueryErrorFailsClosed 身份查询出错必须拒绝（fail closed）：
+// 「查不出来就当成普通账号放过去」会让一次数据库抖动变成一次提权。
+//
+// 锁用户行本身也是一次查询，锁等待超时 / 死锁回滚会从这里返回错误 ——
+// 同样必须整笔失败，不做任何隐式重试。
+func TestUpdateUser_IdentityQueryErrorFailsClosed(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(mock sqlmock.Sqlmock)
+	}{
+		{
+			name: "锁用户行出错（含锁等待超时 / 死锁）",
+			setup: func(mock sqlmock.Sqlmock) {
+				mock.ExpectBegin()
+				mock.ExpectQuery(lockSel("admin_users")).WithArgs(firstArgs(targetSuperID)...).
+					WillReturnError(errors.New("Lock wait timeout exceeded"))
+				mock.ExpectRollback()
+			},
+		},
+		{
+			name: "查操作人角色出错",
+			setup: func(mock sqlmock.Sqlmock) {
+				mock.ExpectBegin()
+				expectLockUserRow(mock, targetSuperID, "super")
+				expectLockUserRow(mock, operatorOrdinaryID, "operator")
+				mock.ExpectQuery(lockSel("admin_user_roles")).WillReturnError(errors.New("连接中断"))
+				mock.ExpectRollback()
+			},
+		},
+		{
+			name: "查目标账号角色出错",
+			setup: func(mock sqlmock.Sqlmock) {
+				mock.ExpectBegin()
+				expectLockUserRow(mock, targetSuperID, "super")
+				expectLockUserRow(mock, operatorOrdinaryID, "operator")
+				expectRolesOf(mock, operatorOrdinaryID, ordinaryRole)
+				mock.ExpectQuery(lockSel("admin_user_roles")).WillReturnError(errors.New("连接中断"))
+				mock.ExpectRollback()
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, mock := newUserController(t)
+			tc.setup(mock)
+
+			rec := httptest.NewRecorder()
+			c.UpdateUser(rec, jwtRequest(t, operatorOrdinaryID, dto.UpdateUserRequest{
+				UserID: targetSuperID, Realname: "改名", Password: "Reset1pwd",
+			}))
+
+			if got := respCode(t, rec); got == http.StatusOK {
+				t.Error("身份查询出错时必须拒绝，不能返回成功")
+			}
+			assertNoUnexpectedSQL(t, mock)
+		})
+	}
+}
+
+// TestUpdateUser_SuperAdminManagesOrdinaryUser 合法路径必须照常可用：
+// 超管编辑普通账号，资料 + 密码 + 角色一次事务写完。
+func TestUpdateUser_SuperAdminManagesOrdinaryUser(t *testing.T) {
+	c, mock := newUserController(t)
+
+	mock.ExpectBegin()
+	expectLockUserRow(mock, operatorSuperID, "super")
+	expectLockUserRow(mock, targetOrdinaryID, "staff")
+	expectRolesOf(mock, operatorSuperID, superRole)     // 操作人：超管
+	expectRolesOf(mock, targetOrdinaryID, ordinaryRole) // 目标：普通账号
+	expectRoleCheck(mock, ordinaryRole)                 // 入参角色校验（txRoleFactsByIDs）
+	// ===== 预检之后才是写 =====
+	mock.ExpectExec(upd("admin_users")).WillReturnResult(sqlmock.NewResult(0, 1)) // 资料
+	mock.ExpectQuery(sel("admin_user_logins")).WillReturnRows(
+		sqlmock.NewRows([]string{"login_id", "user_id", "login_type", "login_value"}).
+			AddRow(9, targetOrdinaryID, string(constants.LoginTypeUsername), "staff"))
+	mock.ExpectExec(upd("admin_user_logins")).WillReturnResult(sqlmock.NewResult(0, 1)) // 新凭证
+	mock.ExpectExec(upd("admin_users")).WillReturnResult(sqlmock.NewResult(0, 1))       // auth_version 自增（吊销旧会话）
+	expectReplaceRoles(mock, targetOrdinaryID, 1)
+	mock.ExpectCommit()
+
+	rec := httptest.NewRecorder()
+	c.UpdateUser(rec, jwtRequest(t, operatorSuperID, dto.UpdateUserRequest{
+		UserID: targetOrdinaryID, Realname: "张三", Nickname: "三",
+		Email: "staff@example.com", Password: "Reset1pwd", RoleIDs: []uint64{roleOrdinaryID},
+	}))
+
+	if got := respCode(t, rec); got != http.StatusOK {
+		t.Errorf("超管编辑普通账号应成功，实际 body.code = %d，body = %s", got, rec.Body.String())
+	}
+	assertNoUnexpectedSQL(t, mock)
+}
+
+// TestUpdateUser_OrdinaryAdminManagesOrdinaryUser 普通管理员管理普通账号的既有授权功能
+// 不能被这次加固挡掉（只改资料，不带密码、不动角色）。
+func TestUpdateUser_OrdinaryAdminManagesOrdinaryUser(t *testing.T) {
+	c, mock := newUserController(t)
+
+	mock.ExpectBegin()
+	expectLockUserRow(mock, operatorOrdinaryID, "operator")
+	expectLockUserRow(mock, targetOrdinaryID, "staff")
+	expectRolesOf(mock, operatorOrdinaryID, ordinaryRole) // 操作人：普通管理员
+	expectRolesOf(mock, targetOrdinaryID, ordinaryRole)   // 目标：普通账号
+	expectRoleCheck(mock, ordinaryRole)
+	mock.ExpectExec(upd("admin_users")).WillReturnResult(sqlmock.NewResult(0, 1))
+	expectReplaceRoles(mock, targetOrdinaryID, 1)
+	mock.ExpectCommit()
+
+	rec := httptest.NewRecorder()
+	c.UpdateUser(rec, jwtRequest(t, operatorOrdinaryID, dto.UpdateUserRequest{
+		UserID: targetOrdinaryID, Realname: "李四", RoleIDs: []uint64{roleOrdinaryID},
+	}))
+
+	if got := respCode(t, rec); got != http.StatusOK {
+		t.Errorf("普通管理员管理普通账号应成功，实际 body.code = %d，body = %s", got, rec.Body.String())
+	}
+	assertNoUnexpectedSQL(t, mock)
+}
+
+// TestUpdateUser_WithoutJWTRejected 没有 JWT 的请求直接 401，连库都不碰。
+func TestUpdateUser_WithoutJWTRejected(t *testing.T) {
+	c, mock := newUserController(t)
+
+	payload, err := json.Marshal(dto.UpdateUserRequest{UserID: targetSuperID, Password: "Reset1pwd"})
+	if err != nil {
+		t.Fatalf("序列化请求体失败: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	c.UpdateUser(rec, httptest.NewRequest(http.MethodPost, "/admin/user/update", bytes.NewReader(payload)))
+
+	if got := respCode(t, rec); got != http.StatusUnauthorized {
+		t.Errorf("无 JWT 应回 401，实际 body.code = %d", got)
+	}
+	assertNoUnexpectedSQL(t, mock)
+}
+
+// ---------- UpdateUser：role_ids 的选择性更新语义 ----------
+
+// TestUpdateUser_RoleIDsSelectiveUpdate role_ids 的三种 JSON 形态对应三种行为，
+// 必须在**真实的 handler 解码**上验证：
+//
+//	字段缺失 / null → 完全不碰 admin_user_roles（不校验、不删、不插）
+//	[]             → 清空：一条按 user_id 的 DELETE，零 INSERT
+//	[3]            → 整体替换：先校验角色，再 DELETE + INSERT
+//
+// 这条测试盯着一个真实存在过的缺陷：UpdateUser 无条件调用角色整体替换，于是
+// 「只改昵称」的保存（前端没带 role_ids）会把该账号的角色关联全部删掉。
+// 判定依据只能是切片的 nil 性，不能是长度 —— `len(RoleIDs) == 0` 会把「缺失」
+// 和「显式清空」混成一种，这里的前两个和第三个用例就是用来钉死这个区别的。
+//
+// 同时也是需求 (2) 的证据：四个用例的事务开头都是同一组加锁当前读
+// （操作人 + 目标的用户行、双方身份），「不传 role_ids」并不会少锁一行、
+// 少读一次身份 —— 目标账号保护跟本次改不改角色无关。
+func TestUpdateUser_RoleIDsSelectiveUpdate(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		// rolePrecheck 预检阶段该出现的角色语句（txRoleFactsByIDs）；nil 表示一条都不该有
+		rolePrecheck func(mock sqlmock.Sqlmock)
+		// roleWrite 写入阶段该出现的角色语句（replaceUserRolesTx）；nil 表示一条都不该有
+		roleWrite func(mock sqlmock.Sqlmock)
+	}{
+		{
+			name: "字段缺失：不校验、不替换",
+			body: fmt.Sprintf(`{"user_id":%d,"realname":"张三","nickname":"三"}`, targetOrdinaryID),
+		},
+		{
+			name: "null：同缺失，不清空",
+			body: fmt.Sprintf(`{"user_id":%d,"realname":"张三","role_ids":null}`, targetOrdinaryID),
+		},
+		{
+			name: "空数组：清空（按 user_id 删一次，零 INSERT）",
+			body: fmt.Sprintf(`{"user_id":%d,"realname":"张三","role_ids":[]}`, targetOrdinaryID),
+			roleWrite: func(mock sqlmock.Sqlmock) {
+				expectReplaceRoles(mock, targetOrdinaryID, 0)
+			},
+		},
+		{
+			name: "非空数组：校验后整体替换",
+			body: fmt.Sprintf(`{"user_id":%d,"realname":"张三","role_ids":[%d]}`, targetOrdinaryID, roleOrdinaryID),
+			rolePrecheck: func(mock sqlmock.Sqlmock) {
+				expectRoleCheck(mock, ordinaryRole)
+			},
+			roleWrite: func(mock sqlmock.Sqlmock) {
+				expectReplaceRoles(mock, targetOrdinaryID, 1)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, mock := newUserController(t)
+
+			mock.ExpectBegin()
+			// 不管改不改角色，身份锁与目标账号保护照样跑完
+			expectLockUserRow(mock, operatorSuperID, "super")
+			expectLockUserRow(mock, targetOrdinaryID, "staff")
+			expectRolesOf(mock, operatorSuperID, superRole)
+			expectRolesOf(mock, targetOrdinaryID, ordinaryRole) // 目标现有角色：普通角色
+			if tc.rolePrecheck != nil {
+				tc.rolePrecheck(mock)
+			}
+			// ===== 预检之后才是写 =====
+			mock.ExpectExec(upd("admin_users")).WillReturnResult(sqlmock.NewResult(0, 1)) // 资料
+			if tc.roleWrite != nil {
+				tc.roleWrite(mock)
+			}
+			mock.ExpectCommit()
+
+			rec := httptest.NewRecorder()
+			c.UpdateUser(rec, rawJSONRequest(t, operatorSuperID, tc.body))
+
+			if got := respCode(t, rec); got != http.StatusOK {
+				t.Errorf("编辑应成功，实际 body.code = %d，body = %s", got, rec.Body.String())
+			}
+			// 「缺失 / null」两个用例里期望表中一条角色语句都没登记：
+			// 实现只要碰一次 admin_user_roles 就会撞上未预期的语句而失败
+			assertNoUnexpectedSQL(t, mock)
+		})
+	}
+}
+
+// TestUpdateUser_ResetPasswordWithoutRoleIDs 管理员只重置密码、不传 role_ids：
+// 密码同步 + auth_version 自增照常在同一事务里完成，角色关联一个都不动。
+//
+// 这条把需求里两件事绑在一起看：选择性更新不能把「吊销会话」这段写入一起跳过
+// （否则密码改了而旧 Token 还能用），也不能顺手把角色清空。
+func TestUpdateUser_ResetPasswordWithoutRoleIDs(t *testing.T) {
+	c, mock := newUserController(t)
+
+	mock.ExpectBegin()
+	expectLockUserRow(mock, operatorSuperID, "super")
+	expectLockUserRow(mock, targetOrdinaryID, "staff")
+	expectRolesOf(mock, operatorSuperID, superRole)
+	expectRolesOf(mock, targetOrdinaryID, ordinaryRole)
+	mock.ExpectExec(upd("admin_users")).WillReturnResult(sqlmock.NewResult(0, 1)) // 资料
+	mock.ExpectQuery(sel("admin_user_logins")).WillReturnRows(
+		sqlmock.NewRows([]string{"login_id", "user_id", "login_type", "login_value"}).
+			AddRow(9, targetOrdinaryID, string(constants.LoginTypeUsername), "staff"))
+	mock.ExpectExec(upd("admin_user_logins")).WillReturnResult(sqlmock.NewResult(0, 1)) // 新凭证
+	mock.ExpectExec(upd("admin_users")).WillReturnResult(sqlmock.NewResult(0, 1))       // auth_version 自增
+	// 这里**没有** admin_user_roles 的删/插：没传 role_ids 就不动角色
+	mock.ExpectCommit()
+
+	rec := httptest.NewRecorder()
+	c.UpdateUser(rec, rawJSONRequest(t, operatorSuperID,
+		fmt.Sprintf(`{"user_id":%d,"realname":"张三","password":"Reset1pwd"}`, targetOrdinaryID)))
+
+	if got := respCode(t, rec); got != http.StatusOK {
+		t.Errorf("只重置密码应成功，实际 body.code = %d，body = %s", got, rec.Body.String())
+	}
+	assertNoUnexpectedSQL(t, mock)
+}
+
+// TestUpdateUser_KeepsHeldDisabledRole 目标账号持有的角色后来被禁用了：
+// 编辑页把这条关联原样提交回来，必须存得下去。
+//
+// 原来这里有两道坎：入参角色校验只查启用角色，于是报「角色ID不存在」整笔失败；
+// 即使放过去，编辑页也拿不到这个角色（只列启用角色），回显不勾选 → 整体替换把它删掉。
+// 现在入参校验不过滤 status（FindByRoleIDAnyStatusForShare），
+// 状态策略交给 CheckRoleStatusAssignable：已持有的禁用角色放行。
+func TestUpdateUser_KeepsHeldDisabledRole(t *testing.T) {
+	c, mock := newUserController(t)
+
+	mock.ExpectBegin()
+	expectLockUserRow(mock, operatorSuperID, "super")
+	expectLockUserRow(mock, targetOrdinaryID, "staff")
+	expectRolesOf(mock, operatorSuperID, superRole)
+	expectRolesOf(mock, targetOrdinaryID, disabledRole) // 目标持有的这个角色已被禁用
+	expectRoleCheck(mock, disabledRole)                 // 入参带着它回来，查出来 status = 0
+	mock.ExpectExec(upd("admin_users")).WillReturnResult(sqlmock.NewResult(0, 1))
+	expectReplaceRoles(mock, targetOrdinaryID, 1) // 关联照常重建，不是被丢掉
+	mock.ExpectCommit()
+
+	rec := httptest.NewRecorder()
+	c.UpdateUser(rec, rawJSONRequest(t, operatorSuperID,
+		fmt.Sprintf(`{"user_id":%d,"realname":"张三","role_ids":[%d]}`, targetOrdinaryID, roleDisabledID)))
+
+	if got := respCode(t, rec); got != http.StatusOK {
+		t.Errorf("保留已持有的禁用角色应成功，实际 body.code = %d，body = %s", got, rec.Body.String())
+	}
+	assertNoUnexpectedSQL(t, mock)
+}
+
+// TestUpdateUser_RejectsNewlyAddedDisabledRole 新增一个已禁用的角色必须拒绝，且零写入。
+//
+// 操作人故意用**超管**：这条不是权限大小问题（超管同样不许），而是
+// 「禁用中的角色不该被新赋出去」这个数据正确性约束。要赋它先把角色启用。
+// 这也是上一条（允许保留）不能顺手放宽成「禁用角色随便赋」的边界。
+func TestUpdateUser_RejectsNewlyAddedDisabledRole(t *testing.T) {
+	c, mock := newUserController(t)
+
+	mock.ExpectBegin()
+	expectLockUserRow(mock, operatorSuperID, "super")
+	expectLockUserRow(mock, targetOrdinaryID, "staff")
+	expectRolesOf(mock, operatorSuperID, superRole)
+	expectRolesOf(mock, targetOrdinaryID, ordinaryRole) // 目标**没有**持有那个禁用角色
+	expectRoleCheck(mock, ordinaryRole)
+	expectRoleCheck(mock, disabledRole)
+	// 往后一个写语句都不许出现
+	mock.ExpectRollback()
+
+	rec := httptest.NewRecorder()
+	c.UpdateUser(rec, rawJSONRequest(t, operatorSuperID,
+		fmt.Sprintf(`{"user_id":%d,"realname":"张三","role_ids":[%d,%d]}`,
+			targetOrdinaryID, roleOrdinaryID, roleDisabledID)))
+
+	if got := respCode(t, rec); got == http.StatusOK {
+		t.Error("新增已禁用的角色不能返回成功")
+	}
+	assertNoUnexpectedSQL(t, mock)
+}
+
+// TestUpdateUser_RemovesHeldDisabledRole 目标账号持有一个已禁用的普通角色，
+// 本次**明确提交一个不含它的新集合** —— 必须成功，且这条关联真的被移除。
+//
+// 这是「已持有的禁用角色可以保留」的另一半，少了它那条放行就可能被实现成
+// 「禁用角色一旦挂上就摘不掉」：若实现为了保住它而把它偷偷并回待写集合，
+// 这里的 INSERT 条数就会变成 2，期望表立刻不符。
+//
+// 期望表钉死的三件事：预检只查入参里的那一个角色（不是两个）、
+// 写入是「按 user_id 删一次 + 插一条」、整笔提交。
+func TestUpdateUser_RemovesHeldDisabledRole(t *testing.T) {
+	c, mock := newUserController(t)
+
+	mock.ExpectBegin()
+	expectLockUserRow(mock, operatorSuperID, "super")
+	expectLockUserRow(mock, targetOrdinaryID, "staff")
+	expectRolesOf(mock, operatorSuperID, superRole)
+	// 目标同时持有一个启用角色和一个已禁用角色
+	expectRolesOf(mock, targetOrdinaryID, ordinaryRole, disabledRole)
+	// 入参里只有启用角色：禁用角色这次被摘掉，预检不该再去查它
+	expectRoleCheck(mock, ordinaryRole)
+	mock.ExpectExec(upd("admin_users")).WillReturnResult(sqlmock.NewResult(0, 1))
+	// 删一次 + 插一条：留下的只有启用角色
+	expectReplaceRoles(mock, targetOrdinaryID, 1)
+	mock.ExpectCommit()
+
+	rec := httptest.NewRecorder()
+	c.UpdateUser(rec, rawJSONRequest(t, operatorSuperID,
+		fmt.Sprintf(`{"user_id":%d,"realname":"张三","role_ids":[%d]}`, targetOrdinaryID, roleOrdinaryID)))
+
+	if got := respCode(t, rec); got != http.StatusOK {
+		t.Errorf("明确移除已持有的禁用角色应成功，实际 body.code = %d，body = %s", got, rec.Body.String())
+	}
+	assertNoUnexpectedSQL(t, mock)
+}
+
+// ---------- 禁用 / 删除 ----------
+
+func TestUpdateUserStatus_NonSuperAdminCannotDisableSuperAdmin(t *testing.T) {
+	c, mock := newUserController(t)
+
+	mock.ExpectBegin()
+	expectLockUserRow(mock, targetSuperID, "super")
+	expectLockUserRow(mock, operatorOrdinaryID, "operator")
+	expectRolesOf(mock, operatorOrdinaryID, ordinaryRole)
+	expectRolesOf(mock, targetSuperID, superRole)
+	mock.ExpectRollback()
+
+	rec := httptest.NewRecorder()
+	c.UpdateUserStatus(rec, jwtRequest(t, operatorOrdinaryID, dto.UpdateUserStatusRequest{
+		UserID: targetSuperID, Status: 0,
+	}))
+
+	if got := respCode(t, rec); got != http.StatusForbidden {
+		t.Errorf("非超管禁用超管账号应回 403，实际 body.code = %d", got)
+	}
+	assertNoUnexpectedSQL(t, mock)
+}
+
+func TestDeleteUser_NonSuperAdminCannotDeleteSuperAdmin(t *testing.T) {
+	c, mock := newUserController(t)
+
+	mock.ExpectBegin()
+	expectLockUserRow(mock, targetSuperID, "super")
+	expectLockUserRow(mock, operatorOrdinaryID, "operator")
+	expectRolesOf(mock, operatorOrdinaryID, ordinaryRole)
+	expectRolesOf(mock, targetSuperID, superRole)
+	mock.ExpectRollback()
+
+	rec := httptest.NewRecorder()
+	c.DeleteUser(rec, jwtRequest(t, operatorOrdinaryID, dto.UserIDRequest{UserID: targetSuperID}))
+
+	if got := respCode(t, rec); got != http.StatusForbidden {
+		t.Errorf("非超管删除超管账号应回 403，实际 body.code = %d", got)
+	}
+	assertNoUnexpectedSQL(t, mock)
+}
+
+// TestUpdateUserStatus_OrdinaryAdminDisablesOrdinaryUser 普通管理员禁用普通账号照常可用，
+// 并且禁用仍然连带吊销该账号的会话（第二条 UPDATE 是 auth_version 自增）。
+func TestUpdateUserStatus_OrdinaryAdminDisablesOrdinaryUser(t *testing.T) {
+	c, mock := newUserController(t)
+
+	mock.ExpectBegin()
+	expectLockUserRow(mock, operatorOrdinaryID, "operator")
+	expectLockUserRow(mock, targetOrdinaryID, "staff")
+	expectRolesOf(mock, operatorOrdinaryID, ordinaryRole)
+	expectRolesOf(mock, targetOrdinaryID, ordinaryRole)
+	mock.ExpectExec(upd("admin_users")).WillReturnResult(sqlmock.NewResult(0, 1)) // status
+	mock.ExpectExec(upd("admin_users")).WillReturnResult(sqlmock.NewResult(0, 1)) // auth_version
+	mock.ExpectCommit()
+
+	rec := httptest.NewRecorder()
+	c.UpdateUserStatus(rec, jwtRequest(t, operatorOrdinaryID, dto.UpdateUserStatusRequest{
+		UserID: targetOrdinaryID, Status: 0,
+	}))
+
+	if got := respCode(t, rec); got != http.StatusOK {
+		t.Errorf("普通管理员禁用普通账号应成功，实际 body.code = %d，body = %s", got, rec.Body.String())
+	}
+	assertNoUnexpectedSQL(t, mock)
+}
+
+// ---------- 角色分配 / 撤销入口 ----------
+
+// TestUpdateUserRoles_FirstAssignmentToRolelessTarget 首次赋角色：目标账号一条角色关联都没有。
+//
+// 这是锁锚点必须选在 admin_users 主键行的理由 —— 新建账号（AddUser 只建账号不赋角色）
+// 走的就是这条路径，锁锚在关联行上时「目标没有关联行」等于没锁，
+// 并发授予超管照样能插进来。关联删除也照常执行：条件删在空集合上是合法的 no-op。
+func TestUpdateUserRoles_FirstAssignmentToRolelessTarget(t *testing.T) {
+	c, mock := newRoleController(t)
+
+	mock.ExpectBegin()
+	expectLockUserRow(mock, operatorSuperID, "super")
+	expectLockUserRow(mock, targetOrdinaryID, "staff")
+	expectRolesOf(mock, operatorSuperID, superRole)
+	expectNoRolesOf(mock, targetOrdinaryID) // 目标：零角色
+	expectRoleCheck(mock, ordinaryRole)
+	expectReplaceRoles(mock, targetOrdinaryID, 1)
+	mock.ExpectCommit()
+
+	rec := httptest.NewRecorder()
+	c.UpdateUserRoles(rec, jwtRequest(t, operatorSuperID, dto.AssignUserRolesRequest{
+		UserID: targetOrdinaryID, RoleIDs: []uint64{roleOrdinaryID},
+	}))
+
+	if got := respCode(t, rec); got != http.StatusOK {
+		t.Errorf("超管给零角色账号首次赋角色应成功，实际 body.code = %d，body = %s", got, rec.Body.String())
+	}
+	assertNoUnexpectedSQL(t, mock)
+}
+
+// TestUpdateUserRoles_NonSuperAdminCannotGrantSuperAdmin 非超管不能把超管角色赋给任何人，
+// 包括零角色的新账号（提权最省事的一条路：先建号，再给它超管）。拒绝时零写入。
+func TestUpdateUserRoles_NonSuperAdminCannotGrantSuperAdmin(t *testing.T) {
+	c, mock := newRoleController(t)
+
+	mock.ExpectBegin()
+	expectLockUserRow(mock, operatorOrdinaryID, "operator")
+	expectLockUserRow(mock, targetOrdinaryID, "staff")
+	expectRolesOf(mock, operatorOrdinaryID, ordinaryRole)
+	expectNoRolesOf(mock, targetOrdinaryID)
+	expectRoleCheck(mock, superRole)
+	mock.ExpectRollback()
+
+	rec := httptest.NewRecorder()
+	c.UpdateUserRoles(rec, jwtRequest(t, operatorOrdinaryID, dto.AssignUserRolesRequest{
+		UserID: targetOrdinaryID, RoleIDs: []uint64{roleSuperID},
+	}))
+
+	if got := respCode(t, rec); got != http.StatusForbidden {
+		t.Errorf("非超管赋超管角色应回 403，实际 body.code = %d", got)
+	}
+	assertNoUnexpectedSQL(t, mock)
+}
+
+// TestUpdateUserRoles_NonSuperAdminCannotRevokeSuperAdmin 撤销方向同样要挡：
+// 非超管不能把别人的超管角色摘掉（目标账号保护先拦下来）。
+func TestUpdateUserRoles_NonSuperAdminCannotRevokeSuperAdmin(t *testing.T) {
+	c, mock := newRoleController(t)
+
+	mock.ExpectBegin()
+	expectLockUserRow(mock, targetSuperID, "super")
+	expectLockUserRow(mock, operatorOrdinaryID, "operator")
+	expectRolesOf(mock, operatorOrdinaryID, ordinaryRole)
+	expectRolesOf(mock, targetSuperID, superRole)
+	mock.ExpectRollback()
+
+	rec := httptest.NewRecorder()
+	c.UpdateUserRoles(rec, jwtRequest(t, operatorOrdinaryID, dto.AssignUserRolesRequest{
+		UserID: targetSuperID, RoleIDs: []uint64{roleOrdinaryID},
+	}))
+
+	if got := respCode(t, rec); got != http.StatusForbidden {
+		t.Errorf("非超管撤销超管角色应回 403，实际 body.code = %d", got)
+	}
+	assertNoUnexpectedSQL(t, mock)
+}
+
+// ---------- 自助改密不受用户管理守卫影响 ----------
+
+// TestChangePassword_SuperAdminSelfServiceStillWorks 超管本人改自己的密码不走
+// 用户管理那条链，也不该被目标账号保护挡住（否则超管就改不了自己的密码）；
+// 旧密码仍然必须对。
+//
+// 事务第一条语句是锁本人用户行：自助改密不做身份判定，锁它只为统一全局加锁顺序
+// （先 admin_users 再 admin_user_logins），避免与管理员重置密码互为相反顺序而死锁。
+func TestChangePassword_SuperAdminSelfServiceStillWorks(t *testing.T) {
+	const oldPwd = "Old1pass"
+	salt := helper.GenerateSalt()
+	credential := helper.HashPassword(oldPwd, salt)
+
+	t.Run("旧密码正确则改密并吊销会话", func(t *testing.T) {
+		c, mock := newUserController(t)
+
+		mock.ExpectBegin()
+		expectLockUserRow(mock, operatorSuperID, "super")
+		mock.ExpectQuery(sel("admin_user_logins")).WillReturnRows(
+			sqlmock.NewRows([]string{"login_id", "user_id", "login_type", "login_credential", "salt"}).
+				AddRow(3, operatorSuperID, string(constants.LoginTypeUsername), credential, salt))
+		mock.ExpectExec(upd("admin_user_logins")).WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec(upd("admin_users")).WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectCommit()
+
+		rec := httptest.NewRecorder()
+		c.ChangePassword(rec, jwtRequest(t, operatorSuperID, dto.ChangePasswordRequest{
+			OldPassword: oldPwd, NewPassword: "New1pass",
+		}))
+
+		if got := respCode(t, rec); got != http.StatusOK {
+			t.Errorf("超管自助改密应成功，实际 body.code = %d，body = %s", got, rec.Body.String())
+		}
+		assertNoUnexpectedSQL(t, mock)
+	})
+
+	t.Run("旧密码错误则零写入", func(t *testing.T) {
+		c, mock := newUserController(t)
+
+		mock.ExpectBegin()
+		expectLockUserRow(mock, operatorSuperID, "super")
+		mock.ExpectQuery(sel("admin_user_logins")).WillReturnRows(
+			sqlmock.NewRows([]string{"login_id", "user_id", "login_type", "login_credential", "salt"}).
+				AddRow(3, operatorSuperID, string(constants.LoginTypeUsername), credential, salt))
+		mock.ExpectRollback()
+
+		rec := httptest.NewRecorder()
+		c.ChangePassword(rec, jwtRequest(t, operatorSuperID, dto.ChangePasswordRequest{
+			OldPassword: "Wrong1pass", NewPassword: "New1pass",
+		}))
+
+		if got := respCode(t, rec); got == http.StatusOK {
+			t.Error("旧密码错误时不能改密成功")
+		}
+		assertNoUnexpectedSQL(t, mock)
+	})
+
+	t.Run("本人账号已被删除则拒绝且零写入", func(t *testing.T) {
+		c, mock := newUserController(t)
+
+		mock.ExpectBegin()
+		expectLockUserRowMissing(mock, operatorSuperID)
+		mock.ExpectRollback()
+
+		rec := httptest.NewRecorder()
+		c.ChangePassword(rec, jwtRequest(t, operatorSuperID, dto.ChangePasswordRequest{
+			OldPassword: oldPwd, NewPassword: "New1pass",
+		}))
+
+		if got := respCode(t, rec); got == http.StatusOK {
+			t.Error("账号已不存在时不能改密成功")
+		}
+		assertNoUnexpectedSQL(t, mock)
+	})
+}
+
+// ---------- 编辑页回显：持有中的禁用角色不能丢 ----------
+
+// TestGetUserInfo_IncludesHeldDisabledRole 用户详情（编辑页的数据来源）必须把
+// 「该账号真实持有、但已被禁用」的角色一并带出来并标记为已选中。
+//
+// 不带出来的后果不是「少显示一行」：编辑页按返回的 checked 构造 role_ids，
+// 这条关联不在里面，一次「改昵称」的整体替换就把它静默删掉了。所以这里的事实
+// 来源必须是库里的 admin_user_roles 关联表，而不是「启用角色列表」，
+// 也不是前端回传的 role_ids。
+//
+// 期望里第二条 admin_roles 查询就是这个补查（按 role_id、不过滤 status）：
+// 实现要是只用启用列表，这条期望不会被用到而测试失败。
+func TestGetUserInfo_IncludesHeldDisabledRole(t *testing.T) {
+	c, mock := newUserController(t)
+
+	// GetUserInfo：取用户行
+	mock.ExpectQuery(sel("admin_users")).WithArgs(firstArgs(targetOrdinaryID)...).
+		WillReturnRows(sqlmock.NewRows([]string{"user_id", "username", "status"}).
+			AddRow(targetOrdinaryID, "staff", 1))
+	// 启用角色列表里没有那个被禁用的角色
+	mock.ExpectQuery(sel("admin_roles")).WillReturnRows(
+		roleRows().AddRow(roleOrdinaryID, ordinaryRole.roleCode, ordinaryRole.isSystem, ordinaryRole.status))
+	// 但该账号真实持有两条关联：一个启用、一个已被禁用
+	mock.ExpectQuery(sel("admin_user_roles")).WithArgs(targetOrdinaryID).WillReturnRows(
+		sqlmock.NewRows([]string{"id", "user_id", "role_id"}).
+			AddRow(1, targetOrdinaryID, roleOrdinaryID).
+			AddRow(2, targetOrdinaryID, roleDisabledID))
+	// 持有但没列出来的那个，按 role_id 单独补查（不过滤 status）
+	mock.ExpectQuery(sel("admin_roles")).WithArgs(firstArgs(roleDisabledID)...).WillReturnRows(
+		roleRows().AddRow(roleDisabledID, disabledRole.roleCode, disabledRole.isSystem, disabledRole.status))
+	// 两个勾选中的角色各查一次权限关联（返回空：权限内容不是这条测试的关注点）
+	mock.ExpectQuery(sel("admin_role_permissions")).WithArgs(roleOrdinaryID).WillReturnRows(
+		sqlmock.NewRows([]string{"id", "role_id", "permission_id"}))
+	mock.ExpectQuery(sel("admin_role_permissions")).WithArgs(roleDisabledID).WillReturnRows(
+		sqlmock.NewRows([]string{"id", "role_id", "permission_id"}))
+
+	rec := httptest.NewRecorder()
+	c.GetUserInfo(rec, jwtRequest(t, operatorSuperID, dto.UserIDRequest{UserID: targetOrdinaryID}))
+
+	var resp struct {
+		Code int `json:"code"`
+		Data struct {
+			Permissions struct {
+				Roles []struct {
+					Role struct {
+						RoleID uint64 `json:"role_id"`
+						Status int8   `json:"status"`
+					} `json:"role"`
+					Checked bool `json:"checked"`
+				} `json:"roles"`
+			} `json:"permissions"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v，body = %s", err, rec.Body.String())
+	}
+	if resp.Code != http.StatusOK {
+		t.Fatalf("取用户详情应成功，实际 body.code = %d，body = %s", resp.Code, rec.Body.String())
+	}
+
+	var found bool
+	for _, item := range resp.Data.Permissions.Roles {
+		if item.Role.RoleID != roleDisabledID {
+			continue
+		}
+		found = true
+		if !item.Checked {
+			t.Error("持有中的禁用角色必须回显为已选中，否则保存资料时这条关联会被删掉")
+		}
+		if item.Role.Status != 0 {
+			t.Errorf("禁用角色的 status 必须按库里的事实返回（0），实际 %d", item.Role.Status)
+		}
+	}
+	if !found {
+		t.Errorf("返回的角色列表里必须包含持有中的禁用角色 %d，实际 = %s", roleDisabledID, rec.Body.String())
+	}
+	assertNoUnexpectedSQL(t, mock)
+}

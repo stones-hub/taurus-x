@@ -8,8 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/stones-hub/taurus-pro-common/pkg/util/tnet"
-
 	"{{ .Module }}/app/helper"
 	"{{ .Module }}/app/model"
 	"{{ .Module }}/app/repo"
@@ -68,6 +66,11 @@ func OperationLogMiddleware() func(next http.Handler) http.Handler {
 				result = "失败"
 			}
 
+			// 先脱敏再截断：改密、设密码、绑定手机号都走操作日志，body 里有明文口令与验证码
+			ip := ClientIP(r)
+			requestBody := redactBody(r.Header.Get("Content-Type"), string(body))
+			responseBody := redactBody(rec.Header().Get("Content-Type"), rec.body())
+
 			go func() {
 				entry := &model.OperationLog{
 					UserID:       userID,
@@ -75,10 +78,10 @@ func OperationLogMiddleware() func(next http.Handler) http.Handler {
 					Path:         r.URL.Path,
 					Action:       inferAction(method, r.URL.Path),
 					Resource:     inferResource(r.URL.Path),
-					IP:           tnet.GetRemoteIP(r),
+					IP:           ip,
 					StatusCode:   rec.status,
-					RequestBody:  truncate(string(body), 4096),
-					ResponseBody: truncate(rec.body(), maxBodyLogSize),
+					RequestBody:  truncate(requestBody, 4096),
+					ResponseBody: truncate(responseBody, maxBodyLogSize),
 					Result:       result,
 					ErrorMsg:     "",
 					CreatedAt:    time.Now(),
@@ -109,7 +112,7 @@ func inferAction(method, path string) string {
 	case "add", "save", "create", "add-user", "assign", "bind":
 		return "add"
 	case "update", "edit", "edit-info", "update-profile", "update-status", "update-is-system",
-		"batch-update-user", "update-user", "set-password", "change-password":
+		"batch-update-user", "update-user", "change-password":
 		return "update"
 	case "delete", "remove-user":
 		return "delete"

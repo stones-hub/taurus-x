@@ -17,6 +17,10 @@ const isEdit = computed(() => Boolean(route.query.user_id))
 const submitLoading = ref(false)
 const roles = ref<RoleListResponseItem[]>([])
 const checkedRoleIds = ref<number[]>([])
+// 进入编辑页时目标账号真实持有的角色（后端给的，不是当前勾选状态）。
+// 用来区分「已经持有的禁用角色」和「想新增的禁用角色」：前者允许保留和取消，
+// 后者前端直接不可勾选，服务端也会拒（CheckRoleStatusAssignable）。
+const heldRoleIds = ref<number[]>([])
 
 const form = reactive({
   user_id: 0,
@@ -31,10 +35,16 @@ const form = reactive({
   birthday: '',
 })
 
-// 加载所有启用的角色（分页取足够多）
+// 加载角色列表（含已禁用：目标账号可能持有某个后来被禁用的角色，
+// 不列出来就会在保存时把这条关联静默删掉）
 async function loadRoles() {
   const res = await apiGetRoleList({ page_no: 1, page_size: 200, role_name: '', status: QUERY_ALL })
   roles.value = res.list ?? []
+}
+
+// 禁用角色只有「已经持有」时才可勾选（即只能保留或取消，不能新增）
+function roleSelectable(role: RoleListResponseItem): boolean {
+  return role.status === 1 || heldRoleIds.value.includes(role.role_id)
 }
 
 // 加载编辑数据
@@ -51,12 +61,33 @@ async function loadEditData() {
   form.email = u.email ?? ''
   form.gender = u.gender
   form.birthday = u.birthday
-  // 回显已选角色（permissions.roles 里 checked 的）
+  // 回显已选角色（permissions.roles 里 checked 的；后端会把持有中的禁用角色一并带上）
   const checked: number[] = []
+  const known = new Map<number, RoleListResponseItem>()
+  for (const r of roles.value) known.set(r.role_id, r)
   for (const r of res.permissions?.roles ?? []) {
-    if (r.checked) checked.push(r.role.role_id)
+    if (!r.checked) continue
+    checked.push(r.role.role_id)
+    // 角色列表接口分页取 200 条，极端情况下可能没覆盖到这个角色，补进来保证可见
+    if (!known.has(r.role.role_id)) {
+      roles.value = [
+        ...roles.value,
+        {
+          role_id: r.role.role_id,
+          role_name: r.role.role_name,
+          role_code: r.role.role_code,
+          description: r.role.description,
+          sort_order: r.role.sort_order,
+          status: r.role.status,
+          is_system: r.role.is_system,
+          update_time: r.role.updated_at,
+          add_time: r.role.created_at,
+        },
+      ]
+    }
   }
-  checkedRoleIds.value = checked
+  heldRoleIds.value = checked
+  checkedRoleIds.value = [...checked]
 }
 
 function onRoleToggle(roleId: number, checked: boolean) {
@@ -215,13 +246,18 @@ onMounted(async () => {
                   v-for="role in roles"
                   :key="role.role_id"
                   :model-value="checkedRoleIds.includes(role.role_id)"
+                  :disabled="!roleSelectable(role)"
                   class="role-item"
                   @change="(v: boolean) => onRoleToggle(role.role_id, v)"
                 >
                   {{ role.role_name }}
+                  <el-tag v-if="role.status !== 1" size="small" type="warning">已禁用</el-tag>
                 </el-checkbox>
               </div>
               <div v-if="roles.length === 0" class="empty-tip">暂无可用角色</div>
+              <div class="tip">
+                已禁用的角色只保留目标账号现有的关联，可以取消，但不能新增。
+              </div>
             </el-form-item>
           </el-col>
         </el-row>

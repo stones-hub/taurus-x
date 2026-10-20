@@ -12,7 +12,6 @@
 
 # Go 编译缓存与产物
 backend/logs
-backend/downloads
 backend/*.local
 backend/build
 

@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1
 
 # ============ 阶段 1：构建前端 ============
-FROM node:22-alpine AS frontend-builder
+# --platform=$BUILDPLATFORM：构建机原生跑 node（dist 是 JS，与目标架构无关），
+# 跨架构构建时不走 QEMU 模拟，省掉大半构建时间。
+FROM --platform=$BUILDPLATFORM node:22-alpine AS frontend-builder
 WORKDIR /build/frontend
 # 先装依赖（利用缓存）再拷源码
 COPY frontend/package.json frontend/pnpm-lock.yaml* ./
@@ -11,8 +13,14 @@ COPY frontend/ ./
 RUN pnpm build
 
 # ============ 阶段 2：编译后端（纯静态） ============
-FROM golang:1.25-alpine AS backend-builder
+# 同样原生跑编译器，用 Go 自带的交叉编译出目标架构的二进制。
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS backend-builder
 WORKDIR /build/backend
+# BuildKit 自动注入的目标平台变量（不要给 TARGETARCH 写死默认值，
+# 否则 BuildKit 被关掉时会悄悄编出错架构的二进制；留空等于「构建机原生架构」，
+# 与此时唯一能产出的那个架构一致）。
+ARG TARGETOS
+ARG TARGETARCH
 # 先拷 go.mod/go.sum 拉依赖（缓存）
 COPY backend/go.mod backend/go.sum ./
 ARG GOPROXY=https://goproxy.cn,direct
@@ -20,11 +28,14 @@ ENV GOPROXY=${GOPROXY}
 RUN go mod download
 COPY backend/ ./
 # 纯静态编译（CGO_ENABLED=0）。如果后续引入需要 cgo 的驱动（如 sqlite3），
-# 要么改用纯 Go 实现，要么去掉 CGO_ENABLED=0 并换成带 libc 的运行时镜像。
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+# 要么改用纯 Go 实现，要么去掉 CGO_ENABLED=0 并换成带 libc 的运行时镜像
+# （带 cgo 还会一并失去这里的免模拟交叉编译）。
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w" -o {{ .ProjectName }} ./bin/main.go
 
 # ============ 阶段 3：运行时 ============
+# 运行时阶段不加 --platform，跟随构建的目标平台（默认即宿主架构），
+# 这样二进制与 rootfs 架构始终一致；不要在 docker-compose.yml 里写死 platform。
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates tzdata \
     && addgroup -g 1000 app && adduser -S -u 1000 -G app app

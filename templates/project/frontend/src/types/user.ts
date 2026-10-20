@@ -29,14 +29,10 @@ export interface UpdateProfileRequest {
     birthday: string
 }
 
-/** 修改密码请求（对应后端 dto.ChangePasswordRequest） */
+/** 修改密码请求（对应后端 dto.ChangePasswordRequest）。
+ *  自助改密唯一入口，必须带旧密码；管理员重置他人密码用 UpdateUserRequest.password。 */
 export interface ChangePasswordRequest {
     old_password: string
-    new_password: string
-}
-
-/** 设置/重置密码请求（对应后端 dto.SetPasswordRequest） */
-export interface SetPasswordRequest {
     new_password: string
 }
 
@@ -98,7 +94,11 @@ export interface UpdateUserRequest {
     gender: number
     birthday: string
     email: string
-    role_ids: number[]
+    /**
+     * 角色关联：不传（或 undefined）表示本次不改角色，`[]` 表示清空。
+     * 不要为了「不改角色」传 `[]`，那会把该账号的角色全部撤销。
+     */
+    role_ids?: number[]
 }
 
 /** 更新用户状态请求（对应后端 dto.UpdateUserStatusRequest） */

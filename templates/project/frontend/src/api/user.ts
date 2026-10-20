@@ -4,7 +4,6 @@ import type {
   BindMobileRequest,
   ChangePasswordRequest,
   SendCodeRequest,
-  SetPasswordRequest,
   UnbindMobileRequest,
   UpdateProfileRequest,
   UserInfo,
@@ -20,14 +19,10 @@ export function apiUpdateProfile(data: UpdateProfileRequest) {
   return request<{ status: string }>({ url: '/admin/user/update-profile', method: 'post', data })
 }
 
-// 修改密码
+// 修改密码（自助改密唯一入口，必须带旧密码；
+// 管理员重置他人密码走用户管理的 apiUpdateUser，带 password 字段）
 export function apiChangePassword(data: ChangePasswordRequest) {
   return request<{ status: string }>({ url: '/admin/user/change-password', method: 'post', data })
-}
-
-// 设置/重置密码
-export function apiSetPassword(data: SetPasswordRequest) {
-  return request<{ status: string }>({ url: '/admin/user/set-password', method: 'post', data })
 }
 
 // 绑定手机号

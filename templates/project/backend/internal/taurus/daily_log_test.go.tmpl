@@ -1,0 +1,197 @@
+package taurus
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+)
+
+// 合成敏感标记：只要它出现在日志文件里，就说明 SQL 参数或原始错误被落盘了。
+// 这里用的全是编造值，不是任何真实凭证。
+const (
+	markerInSQL = "MARKER-IN-SQL-9f3a2b"
+	markerInErr = "MARKER-IN-ERR-7c1b4d"
+)
+
+// fakeSQL 模拟 GORM 回调返回的「已插值」SQL：绑定参数直接拼在语句里。
+func fakeSQL(verb string) func() (string, int64) {
+	return func() (string, int64) {
+		return fmt.Sprintf("%s `admin_user_logins` SET `login_credential`='%s',`salt`='%s' WHERE `login_id` = 3",
+			verb, markerInSQL, markerInSQL), 1
+	}
+}
+
+// newTraceLogger 建一个写临时目录的 logger，返回它和「读回当天日志内容」的函数。
+func newTraceLogger(t *testing.T, level logger.LogLevel) (*DailyGormLogger, func() string) {
+	t.Helper()
+	dir := t.TempDir()
+	l := NewDailyGormLogger(dir, "db_test", level)
+	return l, func() string {
+		t.Helper()
+		path := filepath.Join(dir, fmt.Sprintf("db_test-%s.log", time.Now().Format("2006-01-02")))
+		b, err := os.ReadFile(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return ""
+			}
+			t.Fatalf("读取日志文件失败: %v", err)
+		}
+		return string(b)
+	}
+}
+
+func assertNoLeak(t *testing.T, content string) {
+	t.Helper()
+	for _, marker := range []string{markerInSQL, markerInErr} {
+		if strings.Contains(content, marker) {
+			t.Fatalf("日志里出现了敏感标记 %s，说明 SQL 参数/原始错误被写进日志", marker)
+		}
+	}
+	// 语句原文的结构片段同样不该出现
+	for _, frag := range []string{"login_credential", "SET `", "WHERE"} {
+		if strings.Contains(content, frag) {
+			t.Fatalf("日志里出现了 SQL 语句片段 %q，说明语句原文被写进日志", frag)
+		}
+	}
+}
+
+// TestTrace_ErrorBranchKeepsDiagnosticsWithoutLeaking 错误分支：
+// 保留耗时/行数/语句类型/错误号，但不写 SQL 与原始错误。
+func TestTrace_ErrorBranchKeepsDiagnosticsWithoutLeaking(t *testing.T) {
+	l, read := newTraceLogger(t, logger.Error)
+	dbErr := fmt.Errorf("Error 1062 (23000): Duplicate entry '%s' for key 'uk_email'", markerInErr)
+
+	l.Trace(context.Background(), time.Now(), fakeSQL("UPDATE"), dbErr)
+
+	content := read()
+	if content == "" {
+		t.Fatal("错误分支应当写日志（排障信息不能一起丢掉）")
+	}
+	assertNoLeak(t, content)
+	for _, want := range []string{"ERROR", "[rows:1]", "[op:UPDATE]", "error=mysql_errno_1062", "ms]"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("错误日志缺少排障信息 %q，实际: %s", want, content)
+		}
+	}
+}
+
+// TestTrace_SlowBranchDoesNotLeak 慢 SQL 分支（用「过去的 begin」确定性触发，不 sleep）。
+func TestTrace_SlowBranchDoesNotLeak(t *testing.T) {
+	l, read := newTraceLogger(t, logger.Warn)
+	begin := time.Now().Add(-(slowSQLThreshold + 300*time.Millisecond))
+
+	l.Trace(context.Background(), begin, fakeSQL("SELECT"), nil)
+
+	content := read()
+	if !strings.Contains(content, "slow sql") {
+		t.Fatalf("超过阈值应记为慢 SQL，实际: %s", content)
+	}
+	assertNoLeak(t, content)
+	if !strings.Contains(content, "[op:SELECT]") {
+		t.Errorf("慢 SQL 日志应保留语句类型，实际: %s", content)
+	}
+}
+
+// TestTrace_InfoBranchDoesNotLeak info 级别是泄漏风险最高的一档：也不能输出 SQL。
+func TestTrace_InfoBranchDoesNotLeak(t *testing.T) {
+	l, read := newTraceLogger(t, logger.Info)
+
+	l.Trace(context.Background(), time.Now(), fakeSQL("INSERT"), nil)
+
+	content := read()
+	if content == "" {
+		t.Fatal("info 级别应记录一条执行日志")
+	}
+	assertNoLeak(t, content)
+	if !strings.Contains(content, "[op:INSERT]") || !strings.Contains(content, "[rows:1]") {
+		t.Errorf("info 日志应保留语句类型与行数，实际: %s", content)
+	}
+}
+
+// TestTrace_InfoBranchDoesNotLeakOnError info 级别 + 有错误时仍走错误分支，同样不泄漏。
+func TestTrace_InfoBranchDoesNotLeakOnError(t *testing.T) {
+	l, read := newTraceLogger(t, logger.Info)
+
+	l.Trace(context.Background(), time.Now(), fakeSQL("DELETE"), errors.New(markerInErr))
+
+	content := read()
+	assertNoLeak(t, content)
+	if !strings.Contains(content, "[op:DELETE]") {
+		t.Errorf("应保留语句类型，实际: %s", content)
+	}
+	if !strings.Contains(content, "error=db_error(") {
+		t.Errorf("无法归类的错误应只输出类型名，实际: %s", content)
+	}
+}
+
+// TestTrace_SilentWritesNothing Silent 级别不写任何内容。
+func TestTrace_SilentWritesNothing(t *testing.T) {
+	l, read := newTraceLogger(t, logger.Silent)
+	l.Trace(context.Background(), time.Now().Add(-time.Second), fakeSQL("SELECT"), errors.New(markerInErr))
+	if content := read(); content != "" {
+		t.Fatalf("Silent 级别不应写日志，实际: %s", content)
+	}
+}
+
+// TestSQLVerb 语句类型识别只返回白名单值，识别不了就是 OTHER。
+func TestSQLVerb(t *testing.T) {
+	cases := []struct{ stmt, want string }{
+		{"SELECT * FROM admin_users WHERE mobile = '13800000000'", "SELECT"},
+		{"  \n\tinsert into admin_users (`mobile`) values ('13800000000')", "INSERT"},
+		{"(SELECT 1)", "SELECT"},
+		{"UPDATE admin_users SET mobile='x'", "UPDATE"},
+		{"DELETE FROM admin_users", "DELETE"},
+		{"BEGIN", "BEGIN"},
+		{"SET autocommit=0", "SET"},
+		{"SELECTED_AT = 1", "OTHER"},     // 不能把列名误判成 SELECT
+		{"/* hint */ SELECT 1", "OTHER"}, // 认不出来就不猜
+		{"", "OTHER"},
+		{markerInSQL, "OTHER"},
+	}
+	for _, c := range cases {
+		if got := sqlVerb(c.stmt); got != c.want {
+			t.Errorf("sqlVerb(%q) = %q, 期望 %q", c.stmt, got, c.want)
+		}
+	}
+}
+
+// TestSafeDBErrorClass 错误分类不得包含原始错误文本。
+func TestSafeDBErrorClass(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"nil", nil, ""},
+		{"record not found", gorm.ErrRecordNotFound, "record_not_found"},
+		{"wrapped record not found", fmt.Errorf("查询失败: %w", gorm.ErrRecordNotFound), "record_not_found"},
+		{"duplicated key", gorm.ErrDuplicatedKey, "duplicated_key"},
+		{"context canceled", context.Canceled, "context_canceled"},
+		{"deadline", context.DeadlineExceeded, "context_deadline_exceeded"},
+		{"tx done", sql.ErrTxDone, "tx_done"},
+		{"mysql errno", fmt.Errorf("Error 1452 (23000): Cannot add or update a child row '%s'", markerInErr), "mysql_errno_1452"},
+	}
+	for _, c := range cases {
+		if got := safeDBErrorClass(c.err); got != c.want {
+			t.Errorf("%s: safeDBErrorClass = %q, 期望 %q", c.name, got, c.want)
+		}
+	}
+
+	// 兜底分支：任意错误都只输出类型名，绝不输出 Error() 内容
+	got := safeDBErrorClass(errors.New("password=" + markerInErr))
+	if strings.Contains(got, markerInErr) {
+		t.Fatalf("错误分类里带出了原始错误文本: %s", got)
+	}
+	if !strings.HasPrefix(got, "db_error(") {
+		t.Errorf("未归类错误应输出类型名，实际: %s", got)
+	}
+}

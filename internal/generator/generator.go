@@ -76,7 +76,8 @@ type Result struct {
 	Components []string
 	// AdminUsername 初始管理员账号。
 	AdminUsername string
-	// AdminPassword 初始管理员默认密码（明文，仅用于提示用户首次登录）。
+	// AdminPassword 初始管理员随机密码明文。
+	// 只用于在终端提示一次，不写进任何生成文件（见 buildTemplateData）。
 	AdminPassword string
 }
 
@@ -99,14 +100,12 @@ type templateData struct {
 
 	// AdminUsername 初始管理员账号。
 	AdminUsername string
-	// AdminPassword 初始管理员默认密码明文，写进 README 提示。
+	// AdminPassword 初始管理员随机密码明文，仅用于计算散列，不渲染进任何模板。
 	AdminPassword string
 	// AdminPasswordSalt 初始管理员密码 salt。
 	AdminPasswordSalt string
 	// AdminPasswordHash 初始管理员密码散列，写进 init.sql。
 	AdminPasswordHash string
-	// JWTSecret 每次生成随机产生的 JWT 密钥，写进 .env.example 占位。
-	JWTSecret string
 }
 
 // Generate 按 opts 生成项目。
@@ -264,13 +263,14 @@ func buildTemplateData(opts Options, selected []string) (*templateData, error) {
 	if err != nil {
 		return nil, err
 	}
-	jwtSecret, err := randomHex(32)
+
+	// 初始管理员密码每次生成都不同：固定密码一旦写进文档/仓库，
+	// 等于所有用 taurus-x 生成的项目共用一个已知口令。
+	const adminUsername = "admin"
+	adminPassword, err := randomPassword(16)
 	if err != nil {
 		return nil, err
 	}
-
-	const adminUsername = "admin"
-	const adminPassword = "Taurus@2026"
 
 	return &templateData{
 		ProjectName:       opts.ProjectName,
@@ -285,7 +285,6 @@ func buildTemplateData(opts Options, selected []string) (*templateData, error) {
 		AdminPassword:     adminPassword,
 		AdminPasswordSalt: salt,
 		AdminPasswordHash: passwordHash(adminPassword, salt),
-		JWTSecret:         jwtSecret,
 	}, nil
 }
 

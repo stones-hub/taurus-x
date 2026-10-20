@@ -39,12 +39,13 @@ type RoleListResponseItem struct {
 }
 
 // AddRoleRequest 新增角色请求
+// 没有 IsSystem 字段：系统角色只能由初始化 SQL 定义，不接受接口入参，
+// 否则调用方可以自己造一个「不可删改」的角色。
 type AddRoleRequest struct {
 	RoleName      string   `json:"role_name"`
 	RoleCode      string   `json:"role_code"`
 	Description   string   `json:"description"`
 	SortOrder     int      `json:"sort_order"`
-	IsSystem      int      `json:"is_system"`
 	PermissionIDs []uint64 `json:"permission_ids"`
 }
 

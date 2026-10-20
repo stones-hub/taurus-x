@@ -6,9 +6,9 @@ import type {
   DeptListRequest,
   DeptListResponse,
   DeptOptionItem,
-  DeptUserListResponse,
   EditDeptInfoResponse,
   UpdateDeptRequest,
+  UserOptionListResponse,
 } from '../types'
 
 // 获取部门列表
@@ -50,9 +50,10 @@ export function apiDeleteDept(dept_id: number) {
   return request<{ status: string }>({ url: '/admin/dept/delete', method: 'post', data: { dept_id } })
 }
 
-// 获取部门员工列表
-export function apiGetDeptUserList(dept_id: number, page_no = 1, page_size = 100) {
-  return request<DeptUserListResponse>({
+// 获取部门员工选项（最小字段：user_id / username / realname）。
+// 选项接口不做接口权限校验，后端刻意不返回手机号等敏感字段。
+export function apiGetDeptUserOptions(dept_id: number, page_no = 1, page_size = 100) {
+  return request<UserOptionListResponse>({
     url: '/admin/option/dept-users',
     method: 'post',
     data: { dept_id, page_no, page_size },

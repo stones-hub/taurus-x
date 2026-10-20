@@ -14,9 +14,11 @@ func BuildComponents(configPath, env string) (func(), error) {
 
 	// build Components（注意：用 = 而非 := 避免遮蔽包级 Container）
 	Container, cleanup, err = buildComponents(&ConfigOptions{
-		ConfigPath:  configPath,
-		Env:         env,
-		PrintEnable: true,
+		ConfigPath: configPath,
+		Env:        env,
+		// 不打印配置明文：配置里含 DSN、Redis 口令、JWT 密钥等敏感值，
+		// 打印出来会进启动日志。排查配置问题请直接看配置文件与环境变量。
+		PrintEnable: false,
 	})
 	if err != nil {
 		return nil, err

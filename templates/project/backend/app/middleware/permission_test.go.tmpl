@@ -1,0 +1,194 @@
+package middleware
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+// 接口权限中间件是「没配权限的人访问不到接口」这条要求的实现点。
+// 这里断言的是行为：给定权限检查结果 → 放行 / 拒绝，并且拒绝时**不进入下游 handler**。
+//
+// 注意：httpx.SendResponse 对 401/403/500 这类码以 HTTP 200 + body.code 返回，
+// 所以断言取响应体里的 code（与 session_validator_test.go 同一套路）。
+
+// fakePermissionChecker 可控的权限检查器，覆盖「有权限 / 无权限 / 检查出错」三种分支。
+type fakePermissionChecker struct {
+	allowPaths map[string]bool
+	err        error
+
+	gotUserID uint64
+	gotPath   string
+	calls     int
+}
+
+func (f *fakePermissionChecker) CheckAPIPermission(_ context.Context, userID uint64, apiPath string) (bool, error) {
+	f.calls++
+	f.gotUserID, f.gotPath = userID, apiPath
+	if f.err != nil {
+		return false, f.err
+	}
+	return f.allowPaths[apiPath], nil
+}
+
+// withPermissionChecker 安装假检查器并在用例结束后还原（包级变量，必须复位）。
+func withPermissionChecker(t *testing.T, checker PermissionChecker) {
+	t.Helper()
+	prev := permissionChecker
+	permissionChecker = checker
+	t.Cleanup(func() { permissionChecker = prev })
+}
+
+// runPermission 把带 claims 的请求过一遍权限中间件，返回响应体里的业务 code。
+func runPermission(t *testing.T, path string, claims *JWTClaims) (code int, reachedNext bool) {
+	t.Helper()
+
+	reached := false
+	handler := PermissionMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached = true
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"code":200}`))
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, path, nil)
+	if claims != nil {
+		req = req.WithContext(context.WithValue(req.Context(), JWTTokenClaimsKey, *claims))
+	}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	var body struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("响应体不是 JSON: %v (%s)", err, rec.Body.String())
+	}
+	return body.Code, reached
+}
+
+// TestPermission_AllowsPermittedPath 配了权限的接口放行，并且传给检查器的是
+// JWT 里的 uid 和请求的真实 path（权限数据按 path 精确匹配）。
+func TestPermission_AllowsPermittedPath(t *testing.T) {
+	checker := &fakePermissionChecker{allowPaths: map[string]bool{"/admin/user/list": true}}
+	withPermissionChecker(t, checker)
+
+	code, reached := runPermission(t, "/admin/user/list", &JWTClaims{UID: "7", Username: "someuser", JTI: "jti-1"})
+	if code != http.StatusOK || !reached {
+		t.Fatalf("有权限时应放行，code=%d reachedNext=%v", code, reached)
+	}
+	if checker.gotUserID != 7 {
+		t.Errorf("应把 JWT 里的 uid 传给检查器，期望 7，实际 %d", checker.gotUserID)
+	}
+	if checker.gotPath != "/admin/user/list" {
+		t.Errorf("应把请求 path 原样传给检查器，实际 %q", checker.gotPath)
+	}
+}
+
+// TestPermission_DeniesUnpermittedPath 没配权限 → 403 且不进入 handler。
+// 这是越权拒绝的核心用例：只返回 403 但照样执行业务，等于没拦。
+func TestPermission_DeniesUnpermittedPath(t *testing.T) {
+	checker := &fakePermissionChecker{allowPaths: map[string]bool{"/admin/user/list": true}}
+	withPermissionChecker(t, checker)
+
+	code, reached := runPermission(t, "/admin/user/delete", &JWTClaims{UID: "7", JTI: "jti-1"})
+	if code != http.StatusForbidden {
+		t.Errorf("无权限应返回 403，实际 %d", code)
+	}
+	if reached {
+		t.Error("无权限的请求不应进入 handler")
+	}
+}
+
+// TestPermission_PathIsExactMatch 权限按 path 精确匹配：
+// 配了 /admin/user/list 不等于放行 /admin/user/list/extra 或大小写变体。
+func TestPermission_PathIsExactMatch(t *testing.T) {
+	checker := &fakePermissionChecker{allowPaths: map[string]bool{"/admin/user/list": true}}
+	withPermissionChecker(t, checker)
+
+	for _, path := range []string{"/admin/user/list/extra", "/admin/User/list", "/admin/user/list2"} {
+		code, reached := runPermission(t, path, &JWTClaims{UID: "7", JTI: "jti-1"})
+		if code != http.StatusForbidden || reached {
+			t.Errorf("path %q 不应被放行，code=%d reachedNext=%v", path, code, reached)
+		}
+	}
+}
+
+// TestPermission_CheckErrorFailsClosed 权限检查出错（数据库/Redis 故障）时必须拒绝，
+// 不能因为「查不出来」就放过去。
+func TestPermission_CheckErrorFailsClosed(t *testing.T) {
+	checker := &fakePermissionChecker{err: errors.New("synthetic datastore failure")}
+	withPermissionChecker(t, checker)
+
+	code, reached := runPermission(t, "/admin/user/list", &JWTClaims{UID: "7", JTI: "jti-1"})
+	if code == http.StatusOK {
+		t.Error("权限检查出错时不能放行")
+	}
+	if code != http.StatusInternalServerError {
+		t.Errorf("权限检查出错应返回 500，实际 %d", code)
+	}
+	if reached {
+		t.Error("权限检查出错时不应进入 handler")
+	}
+}
+
+// TestPermission_MissingOrBadUserID 没有 JWT claims、uid 为空或格式非法时一律 401，
+// 且不应该去问权限检查器（问了也只能得到一个无意义的 userID）。
+func TestPermission_MissingOrBadUserID(t *testing.T) {
+	cases := []struct {
+		name   string
+		claims *JWTClaims
+	}{
+		{name: "没有 claims（未过 JWT 中间件）", claims: nil},
+		{name: "uid 为空", claims: &JWTClaims{UID: "", JTI: "jti-1"}},
+		{name: "uid 非数字", claims: &JWTClaims{UID: "not-a-number", JTI: "jti-1"}},
+		{name: "uid 为负数", claims: &JWTClaims{UID: "-1", JTI: "jti-1"}},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			checker := &fakePermissionChecker{allowPaths: map[string]bool{"/admin/user/list": true}}
+			withPermissionChecker(t, checker)
+
+			code, reached := runPermission(t, "/admin/user/list", tc.claims)
+			if code != http.StatusUnauthorized {
+				t.Errorf("应返回 401，实际 %d", code)
+			}
+			if reached {
+				t.Error("不应进入 handler")
+			}
+			if checker.calls != 0 {
+				t.Errorf("不应调用权限检查器，实际调用 %d 次", checker.calls)
+			}
+		})
+	}
+}
+
+// TestPermission_CheckerNotInitialized 检查器没注入时拒绝而不是放行：
+// 注入漏了属于部署事故，放行会让所有接口权限直接失效。
+func TestPermission_CheckerNotInitialized(t *testing.T) {
+	withPermissionChecker(t, nil)
+
+	code, reached := runPermission(t, "/admin/user/list", &JWTClaims{UID: "7", JTI: "jti-1"})
+	if code == http.StatusOK || reached {
+		t.Fatalf("检查器未初始化时必须拒绝，code=%d reachedNext=%v", code, reached)
+	}
+	if code != http.StatusInternalServerError {
+		t.Errorf("期望 500，实际 %d", code)
+	}
+}
+
+// TestSetPermissionChecker 注入入口可用（main 靠它打破循环依赖）。
+func TestSetPermissionChecker(t *testing.T) {
+	prev := permissionChecker
+	t.Cleanup(func() { permissionChecker = prev })
+
+	checker := &fakePermissionChecker{}
+	SetPermissionChecker(checker)
+	if permissionChecker != PermissionChecker(checker) {
+		t.Error("SetPermissionChecker 未生效")
+	}
+}

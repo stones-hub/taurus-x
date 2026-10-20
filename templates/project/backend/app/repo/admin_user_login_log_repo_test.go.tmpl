@@ -1,0 +1,190 @@
+package repo
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+
+	"{{ .Module }}/app/model"
+)
+
+// 登录失败（login_status=0）必须真的以 0 落库。
+//
+// 曾经的线上故障：model 上写了 `gorm:"default:1"`，GORM 看到字段是零值就认为
+// 「调用方没赋值」，于是用 tag 里的默认值替换它 —— 1 被写进 INSERT 的绑定变量
+// （模型字段也一起被改写）。于是所有登录失败都被记成登录成功，审计日志整段失真，
+// 而接口返回仍是 401，光测接口测不出来。（默认值若是 CURRENT_TIMESTAMP 这类非字面量，
+// GORM 换成整列略过、交给数据库默认值，结果同样是 0 丢失。）
+//
+// 所以这里不查 tag 字符串、也不只测 RecordLogin 的入参，而是真的跑一遍 GORM 的
+// Create 回调链，断言生成的 INSERT 语句里 login_status 列在场、绑定变量就是 0/1。
+// 用真实的 MySQL dialector（和生产同一套 SQL 构建与默认值语义），靠 DryRun 让
+// 语句只构建不执行，因此既不连数据库，也不引入 SQLite 这种语义不同的替身。
+
+// newDryRunDB 返回一个只构建 SQL、不执行、不连数据库的 *gorm.DB。
+func newDryRunDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	db, err := gorm.Open(
+		// DSN 只需能被解析：DryRun 不执行语句，driver 不会真的去拨号；
+		// SkipInitializeWithVersion 同时省掉连接后的 SELECT VERSION()。
+		mysql.New(mysql.Config{DSN: "/dryrun", SkipInitializeWithVersion: true}),
+		&gorm.Config{
+			DryRun:                 true,
+			DisableAutomaticPing:   true,
+			SkipDefaultTransaction: true,
+			Logger:                 logger.Discard,
+		},
+	)
+	if err != nil {
+		t.Fatalf("构建 DryRun 连接失败: %v", err)
+	}
+	return db
+}
+
+// captureCreate 走真实仓储的 Create，返回 GORM 实际构建出的语句。
+func captureCreate(t *testing.T, rec *model.AdminUserLoginLog) *gorm.Statement {
+	t.Helper()
+	db := newDryRunDB(t)
+
+	var captured *gorm.Statement
+	if err := db.Callback().Create().After("gorm:create").Register("test:capture_create", func(tx *gorm.DB) {
+		captured = tx.Statement
+	}); err != nil {
+		t.Fatalf("注册 create 回调失败: %v", err)
+	}
+
+	if err := NewAdminUserLoginLogRepositoryWithDB(db).Create(context.Background(), rec); err != nil {
+		t.Fatalf("仓储 Create 失败: %v", err)
+	}
+	if captured == nil || captured.SQL.Len() == 0 {
+		t.Fatal("没有捕获到 INSERT 语句：Create 没有走到 gorm:create 回调")
+	}
+	return captured
+}
+
+// insertColumnVars 把 INSERT 的列清单与绑定变量对齐成 column -> value。
+func insertColumnVars(t *testing.T, stmt *gorm.Statement) (map[string]interface{}, string) {
+	t.Helper()
+	sql := stmt.SQL.String()
+	open := strings.Index(sql, "(")
+	if open < 0 {
+		t.Fatalf("INSERT 语句里找不到列清单: %s", sql)
+	}
+	end := strings.Index(sql[open:], ")")
+	if end < 0 {
+		t.Fatalf("INSERT 语句的列清单没有闭合: %s", sql)
+	}
+	cols := strings.Split(sql[open+1:open+end], ",")
+	if len(cols) != len(stmt.Vars) {
+		t.Fatalf("列数 %d 与绑定变量数 %d 不一致: %s", len(cols), len(stmt.Vars), sql)
+	}
+	out := make(map[string]interface{}, len(cols))
+	for i, c := range cols {
+		out[strings.Trim(strings.TrimSpace(c), "`")] = stmt.Vars[i]
+	}
+	return out, sql
+}
+
+// boundInt 读取绑定变量的整数值（GORM 绑的是字段原类型，这里是 int8）。
+func boundInt(t *testing.T, v interface{}) int64 {
+	t.Helper()
+	switch n := v.(type) {
+	case int8:
+		return int64(n)
+	case int16:
+		return int64(n)
+	case int32:
+		return int64(n)
+	case int64:
+		return n
+	case int:
+		return int64(n)
+	default:
+		t.Fatalf("绑定变量不是整数类型: %T(%v)", v, v)
+		return 0
+	}
+}
+
+func TestLoginLogCreate_PersistsStatusVerbatim(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int8
+		reason string
+	}{
+		{name: "失败写 0", status: 0, reason: "密码错误"},
+		{name: "成功写 1", status: 1, reason: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &model.AdminUserLoginLog{
+				UserID:        42,
+				LoginType:     "password",
+				LoginIP:       "10.0.0.1",
+				UserAgent:     "curl/8",
+				LoginStatus:   tc.status,
+				FailureReason: tc.reason,
+				LoginTime:     time.Date(2024, 5, 6, 7, 8, 9, 0, time.UTC),
+			}
+
+			stmt := captureCreate(t, rec)
+			cols, sql := insertColumnVars(t, stmt)
+
+			got, ok := cols["login_status"]
+			if !ok {
+				t.Fatalf("INSERT 语句里没有 login_status 列：零值被当成「未赋值」略过了，"+
+					"数据库默认值会接管，登录失败会被记成成功。SQL: %s", sql)
+			}
+			if boundInt(t, got) != int64(tc.status) {
+				t.Errorf("login_status 绑定值 = %v，期望 %d。SQL: %s", got, tc.status, sql)
+			}
+
+			// 落库后模型字段本身也不能被改写（上层可能还要用它继续判断/打日志）。
+			if rec.LoginStatus != tc.status {
+				t.Errorf("Create 之后模型 LoginStatus = %d，期望 %d", rec.LoginStatus, tc.status)
+			}
+		})
+	}
+}
+
+// 失败日志必须同时带得上原因，否则库里只剩一个 0，查不出失败在哪。
+func TestLoginLogCreate_FailureKeepsReason(t *testing.T) {
+	rec := &model.AdminUserLoginLog{
+		UserID:        0, // 账号不存在的失败场景
+		LoginType:     "password",
+		LoginStatus:   0,
+		FailureReason: "用户不存在",
+		LoginTime:     time.Now(),
+	}
+	stmt := captureCreate(t, rec)
+	cols, sql := insertColumnVars(t, stmt)
+
+	if got, ok := cols["login_status"]; !ok || boundInt(t, got) != 0 {
+		t.Fatalf("失败日志的 login_status 没有以 0 落库（present=%v, value=%v）。SQL: %s", ok, cols["login_status"], sql)
+	}
+	if got, ok := cols["failure_reason"]; !ok || fmt.Sprint(got) != "用户不存在" {
+		t.Errorf("failure_reason 没有原样落库（present=%v, value=%v）。SQL: %s", ok, got, sql)
+	}
+}
+
+// 直接锁死契约本身：login_status 这一列不允许带 gorm 默认值。
+// 带了就会重新触发「零值被默认值替换」，而上面的断言只覆盖已知的 0/1 两种取值。
+func TestLoginLogSchema_StatusHasNoGormDefault(t *testing.T) {
+	db := newDryRunDB(t)
+	stmt := &gorm.Statement{DB: db}
+	if err := stmt.Parse(&model.AdminUserLoginLog{}); err != nil {
+		t.Fatalf("解析 model 失败: %v", err)
+	}
+	field := stmt.Schema.LookUpField("login_status")
+	if field == nil {
+		t.Fatal("model 里找不到 login_status 字段")
+	}
+	if field.HasDefaultValue {
+		t.Errorf("login_status 带了 gorm 默认值 %q：GORM 会把零值（失败）当成未赋值并用它替换，"+
+			"登录失败会被记成成功", field.DefaultValue)
+	}
+}

@@ -3,13 +3,13 @@ package controller
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/google/wire"
-	"github.com/stones-hub/taurus-pro-http/pkg/httpx"
 
+	"{{ .Module }}/app/constants"
 	"{{ .Module }}/app/dto"
 	"{{ .Module }}/app/middleware"
 	"{{ .Module }}/app/service"
@@ -17,7 +17,8 @@ import (
 
 // AuthController 认证控制器
 type AuthController struct {
-	AuthService *service.AuthService
+	AuthService     *service.AuthService
+	LoginLogService *service.AdminLoginLogService
 }
 
 // AuthControllerSet wire provider set
@@ -41,21 +42,30 @@ func (c *AuthController) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Username == "" || req.Password == "" {
+		c.recordLogin(r, 0, service.LoginStatusFailure, "用户名或密码为空")
 		Fail(w, http.StatusBadRequest, "用户名和密码不能为空")
 		return
 	}
 
-	user, err := c.AuthService.PasswordLogin(r.Context(), req.Username, req.Password)
+	user, authVersion, err := c.AuthService.PasswordLogin(r.Context(), req.Username, req.Password)
 	if err != nil {
+		// 账号不存在时归属到 user_id=0，日志仍然要留：
+		// 「某个 IP 在猜不存在的账号」本身就是要观测的信号。
+		c.recordLogin(r, c.AuthService.LookupUserIDByUsername(r.Context(), req.Username), service.LoginStatusFailure, err.Error())
 		Fail(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
-	token, err := middleware.GenerateJWTToken(fmt.Sprintf("%d", user.UserID), user.Username)
+	// authVersion 必须是校验凭证那一刻的值，原样传下去：
+	// 让签发侧现查当前版本会给「旧密码并发登录」留出可用会话。
+	token, err := middleware.GenerateJWTToken(fmt.Sprintf("%d", user.UserID), user.Username, authVersion)
 	if err != nil {
+		c.recordLogin(r, user.UserID, service.LoginStatusFailure, "生成令牌失败")
 		Fail(w, http.StatusInternalServerError, "生成令牌失败: "+err.Error())
 		return
 	}
+
+	c.recordLogin(r, user.UserID, service.LoginStatusSuccess, "")
 
 	expiresAt := time.Now().Add(24 * time.Hour)
 	response := dto.LoginResponse{Token: token, User: dto.ToUserInfo(user), ExpiresAt: expiresAt}
@@ -74,53 +84,27 @@ func (c *AuthController) Login(w http.ResponseWriter, r *http.Request) {
 	OK(w, response)
 }
 
-// Register 用户注册
-func (c *AuthController) Register(w http.ResponseWriter, r *http.Request) {
-	var req dto.RegisterRequest
-	if r.Header.Get("Content-Type") == "application/json" {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			Fail(w, http.StatusBadRequest, "请求参数解析失败: "+err.Error())
-			return
-		}
-	} else {
-		if err := r.ParseForm(); err != nil {
-			Fail(w, http.StatusBadRequest, "请求参数解析失败: "+err.Error())
-			return
-		}
-		req.Username = r.FormValue("username")
-		req.Password = r.FormValue("password")
-		req.Email = r.FormValue("email")
-	}
-
-	if req.Username == "" || req.Password == "" {
-		Fail(w, http.StatusBadRequest, "用户名和密码不能为空")
-		return
-	}
-
-	user, err := c.AuthService.Register(r.Context(), req.Username, req.Password)
-	if err != nil {
-		Fail(w, http.StatusConflict, err.Error())
-		return
-	}
-
-	token, err := middleware.GenerateJWTToken(fmt.Sprintf("%d", user.UserID), user.Username)
-	if err != nil {
-		Fail(w, http.StatusInternalServerError, "生成令牌失败: "+err.Error())
-		return
-	}
-
-	expiresAt := time.Now().Add(24 * time.Hour)
-	response := dto.LoginResponse{Token: token, User: dto.ToUserInfo(user), ExpiresAt: expiresAt}
-	http.SetCookie(w, &http.Cookie{
-		Name: "jwt_token", Value: token, Expires: expiresAt, Path: "/",
-		HttpOnly: true, Secure: false, SameSite: http.SameSiteLaxMode,
-	})
-	setCSRFCookie(w)
-	httpx.SendResponse(w, http.StatusCreated, response, nil)
-}
-
 // Logout 用户登出
-func (c *AuthController) Logout(w http.ResponseWriter, _ *http.Request) {
+//
+// 除了清 Cookie，还必须把当前 Token 的 jti 从会话白名单里删掉：
+// 不吊销的话，登出只是「浏览器忘记了 Token」，Token 本身到期前仍然可用。
+//
+// Token 的提取统一走 middleware.GetJWTToken —— 认证中间件用的就是它。
+// controller 自己再写一套优先级（旧实现 Authorization 优先）会导致同时带
+// Cookie 和 Bearer 时「认证用的是 Cookie，登出吊销的却是 Bearer」，
+// 结果请求真正在用的那个会话毫发无伤。
+func (c *AuthController) Logout(w http.ResponseWriter, r *http.Request) {
+	// Token 解析不出来（缺失/过期/签名不对）时无需吊销：这种 Token 本来就过不了认证。
+	if token := middleware.GetJWTToken(r); token != "" {
+		if claims, _, err := middleware.ValidateJWTToken(token); err == nil && claims.JTI != "" {
+			if err := middleware.AuthSessionStore().RevokeSession(claims.JTI); err != nil {
+				// 吊销失败不能报成功：客户端以为登出了，服务端其实还认这个 Token。
+				Fail(w, http.StatusInternalServerError, "登出失败，请重试: "+err.Error())
+				return
+			}
+		}
+	}
+
 	http.SetCookie(w, &http.Cookie{
 		Name: "jwt_token", Value: "", Expires: time.Now().Add(-1 * time.Hour), Path: "/",
 		HttpOnly: true, Secure: false, SameSite: http.SameSiteLaxMode,
@@ -131,7 +115,7 @@ func (c *AuthController) Logout(w http.ResponseWriter, _ *http.Request) {
 
 // RefreshToken 刷新 JWT 令牌
 func (c *AuthController) RefreshToken(w http.ResponseWriter, r *http.Request) {
-	token := extractJWTTokenFromRequest(r)
+	token := middleware.GetJWTToken(r)
 	if token == "" {
 		Fail(w, http.StatusUnauthorized, "缺少JWT令牌")
 		return
@@ -150,6 +134,18 @@ func (c *AuthController) RefreshToken(w http.ResponseWriter, r *http.Request) {
 	OK(w, response)
 }
 
+// recordLogin 写一条登录日志（成功或失败）。
+//
+// 日志写失败不影响登录结果，只打印到服务端日志：
+// 不能因为日志表出问题就把所有人挡在门外。
+func (c *AuthController) recordLogin(r *http.Request, userID uint64, status int8, failureReason string) {
+	err := c.LoginLogService.RecordLogin(r.Context(), userID, string(constants.LoginTypeUsername),
+		middleware.ClientIP(r), r.UserAgent(), status, failureReason)
+	if err != nil {
+		log.Printf("登录日志写入失败: %v\n", err)
+	}
+}
+
 // setCSRFCookie 下发 CSRF Token Cookie（供受 CSRF 保护的写请求使用）
 func setCSRFCookie(w http.ResponseWriter) {
 	csrfToken, err := middleware.GenerateCSRFToken()
@@ -157,18 +153,4 @@ func setCSRFCookie(w http.ResponseWriter) {
 		return
 	}
 	middleware.SetCSRFToken(w, csrfToken)
-}
-
-// extractJWTTokenFromRequest 从请求中提取 JWT 令牌
-func extractJWTTokenFromRequest(r *http.Request) string {
-	if ah := r.Header.Get("Authorization"); ah != "" {
-		if strings.HasPrefix(ah, "Bearer ") {
-			return strings.TrimPrefix(ah, "Bearer ")
-		}
-		return ah
-	}
-	if c, err := r.Cookie("jwt_token"); err == nil {
-		return c.Value
-	}
-	return r.URL.Query().Get("token")
 }

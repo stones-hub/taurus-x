@@ -1,0 +1,156 @@
+package middleware
+
+import "testing"
+
+// ClientIP 的结果同时作为限流键和日志里的来源 IP。
+// 如果客户端能用自带的 X-Real-IP / X-Forwarded-For 改掉它，
+// 限流就能被无限绕过（换个头就是新配额），日志里的来源也不可信。
+//
+// 规则：只有直连对端本身在可信代理名单里时才采信转发头。
+
+func TestClientIPFrom_UntrustedPeerIgnoresForwardHeaders(t *testing.T) {
+	cases := []struct {
+		name          string
+		remoteAddr    string
+		xForwardedFor string
+		xRealIP       string
+		trusted       []string
+		want          string
+	}{
+		{
+			name:          "名单为空（直连部署）：伪造的转发头一律忽略",
+			remoteAddr:    "203.0.113.10:51515",
+			xForwardedFor: "1.2.3.4",
+			xRealIP:       "5.6.7.8",
+			trusted:       nil,
+			want:          "203.0.113.10",
+		},
+		{
+			name:          "对端不在名单里：转发头忽略",
+			remoteAddr:    "203.0.113.10:51515",
+			xForwardedFor: "1.2.3.4",
+			xRealIP:       "5.6.7.8",
+			trusted:       []string{"127.0.0.1"},
+			want:          "203.0.113.10",
+		},
+		{
+			name:       "IPv6 直连",
+			remoteAddr: "[2001:db8::1]:51515",
+			xRealIP:    "5.6.7.8",
+			trusted:    nil,
+			want:       "2001:db8::1",
+		},
+		{
+			name:       "RemoteAddr 不带端口",
+			remoteAddr: "203.0.113.10",
+			xRealIP:    "5.6.7.8",
+			trusted:    nil,
+			want:       "203.0.113.10",
+		},
+		{
+			name:       "RemoteAddr 非法：返回空串，不回退到可伪造的头",
+			remoteAddr: "not-an-ip",
+			xRealIP:    "5.6.7.8",
+			trusted:    nil,
+			want:       "",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got := clientIPFrom(tc.remoteAddr, tc.xForwardedFor, tc.xRealIP, tc.trusted)
+			if got != tc.want {
+				t.Errorf("期望 %q，实际 %q", tc.want, got)
+			}
+		})
+	}
+}
+
+func TestClientIPFrom_TrustedProxy(t *testing.T) {
+	cases := []struct {
+		name          string
+		remoteAddr    string
+		xForwardedFor string
+		xRealIP       string
+		trusted       []string
+		want          string
+	}{
+		{
+			name:          "可信代理：采信 X-Forwarded-For 最右侧的非可信地址",
+			remoteAddr:    "10.0.0.1:443",
+			xForwardedFor: "1.2.3.4, 203.0.113.9, 10.0.0.1",
+			trusted:       []string{"10.0.0.1"},
+			want:          "203.0.113.9",
+		},
+		{
+			name:          "可信代理 + 没有 XFF：退回 X-Real-IP",
+			remoteAddr:    "10.0.0.1:443",
+			xForwardedFor: "",
+			xRealIP:       "203.0.113.9",
+			trusted:       []string{"10.0.0.1"},
+			want:          "203.0.113.9",
+		},
+		{
+			name:       "可信代理 + 两个头都没有：用对端地址",
+			remoteAddr: "10.0.0.1:443",
+			trusted:    []string{"10.0.0.1"},
+			want:       "10.0.0.1",
+		},
+		{
+			name:          "CIDR 名单",
+			remoteAddr:    "10.0.5.7:443",
+			xForwardedFor: "203.0.113.9, 10.0.5.7",
+			trusted:       []string{"10.0.0.0/8"},
+			want:          "203.0.113.9",
+		},
+		{
+			name:          "XFF 全是可信代理：没有外部候选，退回对端地址",
+			remoteAddr:    "10.0.0.1:443",
+			xForwardedFor: "10.0.0.2, 10.0.0.1",
+			trusted:       []string{"10.0.0.0/8"},
+			want:          "10.0.0.1",
+		},
+		{
+			name:          "XFF 里有垃圾值：跳过，不当成 IP",
+			remoteAddr:    "10.0.0.1:443",
+			xForwardedFor: "garbage, 203.0.113.9, 10.0.0.1",
+			trusted:       []string{"10.0.0.1"},
+			want:          "203.0.113.9",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got := clientIPFrom(tc.remoteAddr, tc.xForwardedFor, tc.xRealIP, tc.trusted)
+			if got != tc.want {
+				t.Errorf("期望 %q，实际 %q", tc.want, got)
+			}
+		})
+	}
+}
+
+// TestParseTrustedProxies 非法配置必须被丢掉而不是被当成可信条目：
+// 一条垃圾值被误当成可信代理，转发头就重新可伪造了。
+func TestParseTrustedProxies(t *testing.T) {
+	got := parseTrustedProxies(" 10.0.0.1 , 192.168.0.0/16 , none , , 300.300.300.300 , 10.0.0.0/99 ")
+	want := []string{"10.0.0.1", "192.168.0.0/16"}
+
+	if len(got) != len(want) {
+		t.Fatalf("期望 %v，实际 %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("第 %d 项期望 %q，实际 %q", i, want[i], got[i])
+		}
+	}
+
+	if list := parseTrustedProxies(""); len(list) != 0 {
+		t.Errorf("空配置应得到空名单，实际 %v", list)
+	}
+	// 默认配置里的占位值不能变成可信代理
+	if list := parseTrustedProxies("none"); len(list) != 0 {
+		t.Errorf("占位值 none 不应被当成可信代理，实际 %v", list)
+	}
+}

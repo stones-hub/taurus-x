@@ -3,7 +3,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { apiBatchUpdateDeptUser, apiGetDeptUserList } from '../../api/dept'
+import { apiBatchUpdateDeptUser, apiGetDeptUserOptions } from '../../api/dept'
 import { apiGetUserList } from '../../api/user-manage'
 import { QUERY_ALL } from '../../types'
 
@@ -35,7 +35,7 @@ async function loadData() {
       key: u.user_id,
     }))
     // 右：部门已有员工
-    const deptUsers = await apiGetDeptUserList(deptId.value, 1, 1000)
+    const deptUsers = await apiGetDeptUserOptions(deptId.value, 1, 1000)
     selectedKeys.value = (deptUsers.list ?? []).map((d) => d.user_id)
   } finally {
     loading.value = false

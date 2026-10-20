@@ -1,0 +1,285 @@
+// 目标账号保护 + 身份锁协议：谁能对某个账号执行「管理写入」
+// （改资料 / 重置密码 / 禁用 / 删除 / 改角色）。
+//
+// 为什么单独一层：接口权限（`userProtectedChain` 的 Permission 中间件）只回答
+// 「这个人能不能调 /admin/user/update」，不回答「这个人能不能动**这个**账号」。
+// 两者混为一谈的后果是：任何配了 user/update、update-status、delete 权限的普通
+// 管理员都能改超管的资料、重置超管的密码、把超管禁用或删掉 —— 等于绕过超管。
+//
+// 四条硬规则（违反其一就是可被利用的提权路径）：
+//
+//  1. 操作人身份只认 JWT 带上来的 user_id，目标身份只认库里的关联表。
+//     入参里的 role_ids / is_system 是调用方给的，用它判定目标身份等于让攻击者自证清白。
+//
+//  2. 判定必须排在**任何写入之前**，且与写入在**同一个事务**里。
+//
+//  3. 判定依据必须是「锁之后的当前事实」，不是事务快照。
+//     「在同一个事务里读」不等于「读到的是当前值」：MySQL 默认 REPEATABLE READ，
+//     事务里第一次普通 SELECT 建立快照，之后的普通 SELECT 都读那份快照，
+//     期间别的事务提交的「授予目标超管角色」根本看不到；而且普通读不加锁，
+//     读完到写之间仍然可以被改。所以本文件的协议是：
+//
+//     锁稳定用户行（FOR UPDATE） → 当前读身份事实（FOR UPDATE / FOR SHARE） → 才写。
+//
+//  4. 查不到 / 查出错一律拒绝（fail closed）。「查身份失败就放行」会让一次数据库
+//     抖动变成一次提权。
+//
+// 锁协议的三个要点（实现见 lockUserRowsAscending）：
+//   - 锚点是 admin_users 的主键行，不是角色关联行：账号可能一条关联行都没有
+//     （新建账号、首次赋角色），锚在关联行上时「没有关联行」就等于没锁；
+//   - 锁操作人**和**目标两行，因为两边身份都参与判定（目标是否受保护、
+//     操作人是否还是超管），只锁目标挡不住「操作人的超管角色正在被撤销」；
+//   - 固定按 user_id 升序、同一 ID 只锁一次，避免交叉管理（A 改 B 的同时 B 改 A）
+//     各持一半互等。两笔请求要的是同一组锁、同一个顺序，所以必然一前一后。
+//
+// 覆盖范围（所有会改账号或账号角色的入口都走同一套协议）：
+//   - AdminUserService.UpdateUser（资料 / 重置密码 / 角色）
+//   - AdminUserService.UpdateUserStatus、DeleteUser（禁用 / 软删）
+//   - AdminRoleService.UpdateUserRoles（角色分配与撤销，也是「新增用户后赋角色」走的入口）
+//   - AuthService.ChangePassword 走 lockSelfUserRow：自助改密不做身份判定，
+//     锁本人用户行只为统一「先用户行、再凭证行」的加锁顺序（见该函数注释）。
+//
+// 边界（必须如实说清，不要把协议说成「已验证的并发安全」）：
+// 这些都是代码层面的锁协议与顺序约束，单元测试能证明「语句顺序、加锁子句、
+// 拒绝时零写入」，证不了真实 MySQL 下的并发结果。真实并发交错（含锁等待超时、
+// 死锁回滚）仍需在真库上验证。死锁/超时的语义是整笔失败并整笔回滚，
+// 这里不做任何隐式重试。
+package service
+
+import (
+	"context"
+	"errors"
+	"sort"
+
+	"{{ .Module }}/app/constants"
+	"{{ .Module }}/app/model"
+	"{{ .Module }}/app/repo"
+)
+
+// errUserNotFound 目标账号的用户行不存在（含被删除）。
+var errUserNotFound = errors.New("用户不存在")
+
+// HoldsSuperAdminRole 判断一组角色事实里是否含超管角色。
+//
+// 故意**不看角色状态**：已禁用的 super_admin 角色随时可能被重新启用，
+// 普通管理员也不该趁它禁用期间去改这个账号的密码。
+// 与 IsUserSuperAdmin（判定操作人**有没有**超管权力，要求角色启用中）方向相反：
+// 判定「谁受保护」时放宽，判定「谁有权力」时收紧，两边都偏安全。
+func HoldsSuperAdminRole(facts []RoleFact) bool {
+	for _, f := range facts {
+		if f.RoleCode == constants.SuperAdminRoleCode {
+			return true
+		}
+	}
+	return false
+}
+
+// CheckTargetUserManageable 判断操作人能否对目标账号执行管理写入。
+//
+// 纯函数：事实由调用方在事务内锁定后当前读出来传进来。
+// 超管不受限（超管管理普通账号、超管之间互管都照常）；非超管一旦碰到持有
+// 超管角色的目标，直接拒绝 —— 资料、密码、状态、角色一个都不许动。
+func CheckTargetUserManageable(operatorIsSuperAdmin bool, targetFacts []RoleFact) error {
+	if operatorIsSuperAdmin {
+		return nil
+	}
+	if HoldsSuperAdminRole(targetFacts) {
+		return ErrForbidden
+	}
+	return nil
+}
+
+// userWriteGuard guardUserWrite 的结果：**锁定之后当前读到**的那份事实。
+//
+// 调用方必须用这里的字段继续往下走，不要自己再查一遍 —— 自己查的那遍大概率是
+// 普通读（事务快照），等于把刚刚锁出来的当前事实换回旧快照。
+type userWriteGuard struct {
+	// Target 目标账号被锁定后读到的用户行（已确认存在）
+	Target *model.AdminUser
+	// OperatorIsSuperAdmin 操作人此刻是否持有启用中的超管角色
+	OperatorIsSuperAdmin bool
+	// TargetRoleFacts 目标账号此刻的角色事实，供调用方接着做角色变更判定
+	// （CheckRoleAssignmentAllowed），避免同一事务里重复查两遍
+	TargetRoleFacts []RoleFact
+}
+
+// guardUserWrite 用户管理写入的统一前置检查，**必须在任何写入之前调用**，
+// 且必须传入执行写入的那个事务。
+//
+// 顺序是协议的一部分，不能调换：
+//
+//	锁操作人与目标的用户行（升序、去重、FOR UPDATE）
+//	  → 当前读操作人身份 → 当前读目标身份 → 判定 → 返回给调用方去写
+//
+// 调用方拿到的 Target 也是锁定之后读的，所以后续写入用的用户名、状态等字段
+// 不是加锁前的旧快照。
+func guardUserWrite(ctx context.Context, tx *repo.Tx, operatorID, targetID uint64) (*userWriteGuard, error) {
+	// 没有操作人（请求里没有合法 JWT）就没有可判定的权力来源：拒绝，
+	// 不是「当成无角色用户」继续往下走。
+	if operatorID == 0 {
+		return nil, ErrForbidden
+	}
+	if targetID == 0 {
+		return nil, errUserNotFound
+	}
+
+	locked, err := lockUserRowsAscending(ctx, tx, operatorID, targetID)
+	if err != nil {
+		return nil, err
+	}
+	// 操作人账号本身不存在（已被删除）时 fail closed：没有身份就没有权力
+	if locked[operatorID] == nil {
+		return nil, ErrForbidden
+	}
+	target := locked[targetID]
+	if target == nil {
+		return nil, errUserNotFound
+	}
+
+	operatorRoles, err := currentUserRoles(ctx, tx, operatorID)
+	if err != nil {
+		return nil, err
+	}
+	operatorIsSuperAdmin := holdsEnabledSuperAdmin(operatorRoles)
+
+	// 操作自己时不再读第二遍：同一个账号只有一份身份事实，
+	// 重复一次当前读既无意义，也会让「同一 ID 只处理一次」名不副实。
+	targetRoles := operatorRoles
+	if targetID != operatorID {
+		targetRoles, err = currentUserRoles(ctx, tx, targetID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	targetFacts := roleFactsOf(targetRoles)
+
+	if err := CheckTargetUserManageable(operatorIsSuperAdmin, targetFacts); err != nil {
+		return nil, err
+	}
+	return &userWriteGuard{
+		Target:               target,
+		OperatorIsSuperAdmin: operatorIsSuperAdmin,
+		TargetRoleFacts:      targetFacts,
+	}, nil
+}
+
+// lockUserRowsAscending 按 user_id 升序、去重锁定这些账号的用户行（SELECT ... FOR UPDATE）。
+//
+// 全项目**唯一**的身份加锁入口，顺序与去重都只在这里保证：
+//  1. 固定升序：交叉管理（A 改 B 的同时 B 改 A）两笔请求要的是同一组锁、
+//     同一个顺序，不会各持一半互等；
+//  2. 去重：操作自己时只锁一次 —— 同一个事务重复锁同一行不会自锁，
+//     但多一次无用的当前读，也会掩盖「到底锁了几行」；
+//  3. 存在性：返回值只包含真实存在的行，缺谁由调用方决定怎么拒绝
+//     （操作人缺 → 越权；目标缺 → 用户不存在），这里不替调用方判断。
+//
+// 锁等待超时、死锁被 MySQL 选中回滚都从 err 返回：整笔失败、整笔回滚，
+// 这里不重试 —— 隐式重试会把一次冲突放大成一串重复写入。
+func lockUserRowsAscending(ctx context.Context, tx *repo.Tx, userIDs ...uint64) (map[uint64]*model.AdminUser, error) {
+	ordered := sortedUniqueUserIDs(userIDs)
+	locked := make(map[uint64]*model.AdminUser, len(ordered))
+	for _, userID := range ordered {
+		user, err := tx.User().LockByUserID(ctx, userID)
+		if err != nil {
+			return nil, err
+		}
+		if user == nil {
+			continue
+		}
+		locked[userID] = user
+	}
+	return locked, nil
+}
+
+// sortedUniqueUserIDs 丢掉 0 与重复项并升序排列，是「固定锁序」的实现。
+func sortedUniqueUserIDs(userIDs []uint64) []uint64 {
+	seen := make(map[uint64]bool, len(userIDs))
+	ordered := make([]uint64, 0, len(userIDs))
+	for _, userID := range userIDs {
+		if userID == 0 || seen[userID] {
+			continue
+		}
+		seen[userID] = true
+		ordered = append(ordered, userID)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	return ordered
+}
+
+// lockSelfUserRow 自助写入（改密）在事务开头锁定本人的用户行。
+//
+// 自助入口不做身份判定，本来并不需要身份锁。锁它是为了让加锁顺序在全项目一致：
+// 管理员重置密码走的是「锁 admin_users 行 → 改 admin_user_logins → 自增 auth_version」，
+// 自助改密若反过来先改凭证行再碰用户行，两条路径就是一对相反的加锁顺序，
+// 同一账号上并发时会死锁。这是可用性问题而不是安全问题，但顺序统一了就不必解释它。
+//
+// 用户行不存在时拒绝：改一个已被删除账号的凭证没有意义。
+func lockSelfUserRow(ctx context.Context, tx *repo.Tx, userID uint64) error {
+	if userID == 0 {
+		return errUserNotFound
+	}
+	locked, err := lockUserRowsAscending(ctx, tx, userID)
+	if err != nil {
+		return err
+	}
+	if locked[userID] == nil {
+		return errUserNotFound
+	}
+	return nil
+}
+
+// currentUserRoles 读某个账号**此刻**持有的全部角色（含已禁用角色），全程加锁当前读。
+//
+// 两段都必须是当前读，少一段协议就不成立：
+//   - 关联表 admin_user_roles 决定「这个账号有哪些角色」—— 用 FOR UPDATE，
+//     既当前读，又在本事务结束前挡住别人改这个账号的角色（user_id 上有索引，
+//     命中的是该 user_id 的索引区间，所以空集合也挡得住并发插入）；
+//   - 角色表 admin_roles 决定「这些角色是什么」—— 用 FOR SHARE，这里不写角色行，
+//     拿排他锁会无谓地挡住角色管理，也会把死锁面扩大到角色模块。
+//
+// 关联表里挂着已被删除的角色时跳过该行，不当成错误：悬空关联不授予任何权限。
+// 注意锁协议保证的是「锁定期间这些行不被改」，不是「身份永远不变」——
+// 事务提交之后身份当然还可以变，那是下一笔请求的事。
+func currentUserRoles(ctx context.Context, tx *repo.Tx, userID uint64) ([]model.AdminRole, error) {
+	userRoles, err := tx.UserRole().LockByUserID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	roles := make([]model.AdminRole, 0, len(userRoles))
+	for _, ur := range userRoles {
+		role, err := tx.Role().FindByRoleIDAnyStatusForShare(ctx, ur.RoleID)
+		if err != nil {
+			return nil, err
+		}
+		if role == nil {
+			continue
+		}
+		roles = append(roles, *role)
+	}
+	return roles, nil
+}
+
+// holdsEnabledSuperAdmin 判断这组角色里有没有**启用中**的超管角色。
+// 判定「操作人有没有超管权力」用它（与 IsUserSuperAdmin 同一条口径）。
+//
+// 配套保护：super_admin 角色自身是系统角色（is_system=1）且编码是保留值，
+// CheckRoleMutable 不允许通过接口改名、改状态或删除它，所以「把 super_admin 禁用掉
+// 让超管失去权力」这条路在角色侧已经堵住；role_code 也没有任何接口可以修改。
+// 真正能改变一个账号身份的只有用户角色关联，而那些入口全部走本文件的锁协议。
+func holdsEnabledSuperAdmin(roles []model.AdminRole) bool {
+	for i := range roles {
+		if roles[i].RoleCode == constants.SuperAdminRoleCode && roles[i].Status == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// roleFactsOf 批量取角色判定要素。
+func roleFactsOf(roles []model.AdminRole) []RoleFact {
+	facts := make([]RoleFact, 0, len(roles))
+	for i := range roles {
+		facts = append(facts, RoleFactOf(&roles[i]))
+	}
+	return facts
+}

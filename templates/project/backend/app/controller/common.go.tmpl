@@ -2,9 +2,12 @@ package controller
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/stones-hub/taurus-pro-http/pkg/httpx"
+
+	"{{ .Module }}/app/service"
 )
 
 // 本文件收敛 controller 层的统一响应 boilerplate（deep helper）。
@@ -35,4 +38,15 @@ func OK(w http.ResponseWriter, data interface{}) {
 // 前端按 body.code 判定并弹 message。
 func Fail(w http.ResponseWriter, code int, message string) {
 	httpx.SendResponse(w, code, map[string]string{"message": message}, nil)
+}
+
+// FailByError 按 error 类型选择响应码：
+// 越权（service.ErrForbidden）必须回 403，不能和普通业务错误一样混在 500 里 ——
+// 前端要能区分「操作被拒绝」和「服务出错」，审计也要能把越权尝试挑出来。
+func FailByError(w http.ResponseWriter, err error) {
+	if errors.Is(err, service.ErrForbidden) {
+		Fail(w, http.StatusForbidden, err.Error())
+		return
+	}
+	Fail(w, http.StatusInternalServerError, err.Error())
 }

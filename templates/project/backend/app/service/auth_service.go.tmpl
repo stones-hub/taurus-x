@@ -10,7 +10,6 @@ import (
 	"{{ .Module }}/app/constants"
 	"{{ .Module }}/app/dto"
 	"{{ .Module }}/app/helper"
-	authstore "{{ .Module }}/app/helper/store"
 	"{{ .Module }}/app/model"
 	"{{ .Module }}/app/repo"
 )
@@ -20,7 +19,6 @@ type AuthService struct {
 	userRepo         *repo.AdminUserRepository
 	loginRepo        *repo.AdminUserLoginRepository
 	verificationCode *helper.VerificationCodeManager
-	authStore        *authstore.AuthRedisStore
 	store            *repo.Store
 }
 
@@ -33,63 +31,79 @@ func NewAuthService(store *repo.Store) *AuthService {
 		userRepo:         store.User(),
 		loginRepo:        store.UserLogin(),
 		verificationCode: helper.NewVerificationCodeManager(),
-		authStore:        authstore.NewAuthRedisStore(),
 		store:            store,
 	}
 }
 
-// PasswordLogin 账号密码登录（SHA-256 加盐）
-func (s *AuthService) PasswordLogin(ctx context.Context, account, password string) (*model.AdminUser, error) {
-	user, err := s.userRepo.FindByUsername(ctx, account)
+// PasswordLogin 账号密码登录（SHA-256 加盐）。
+//
+// 第二个返回值是**本次凭证校验所依据的那个数据库快照里的认证版本**，调用方必须
+// 原样传给 middleware.GenerateJWTToken，不能让签发侧自己再查一遍当前版本。
+//
+// 之所以把校验和读版本放进同一个事务（即同一个一致性快照）：
+//   - 改密事务在本快照之前提交 → 本快照读到的是新凭证，旧密码过不了校验；
+//   - 改密事务在本快照之后提交 → 版本已变，本次登记的旧版本立刻失配，会话无效。
+//
+// 两种情况都不存在「旧凭证换到一个可用会话」的窗口。若改成登记时现读版本，
+// 第二种情况就会把旧凭证的登录登记到新版本上 —— 这正是「只把自增提前到
+// 凭证 SQL 之前」解决不了的那个竞态。
+func (s *AuthService) PasswordLogin(ctx context.Context, account, password string) (*model.AdminUser, int64, error) {
+	var (
+		user        *model.AdminUser
+		authVersion int64
+	)
+	err := s.store.RunInTx(ctx, func(tx *repo.Tx) error {
+		u, err := tx.User().FindByUsername(ctx, account)
+		if err != nil {
+			return err
+		}
+		if u == nil {
+			return errors.New("用户名或密码错误")
+		}
+
+		login, err := tx.UserLogin().FindByUserIDAndLoginTypeAnyStatus(ctx, u.UserID, string(constants.LoginTypeUsername))
+		if err != nil {
+			return err
+		}
+		if login == nil {
+			return errors.New("请用其他方式登录后设置密码")
+		}
+
+		if login.Status != constants.LoginMethodStatusEnabled || u.Status != constants.UserStatusEnabled {
+			return errors.New("账号状态非法")
+		}
+
+		if !helper.VerifyPassword(password, login.LoginCredential, login.Salt) {
+			return errors.New("用户名或密码错误")
+		}
+
+		// auth_version 列的默认值是 1，读到 <=0 说明数据被改坏或列缺失：
+		// 这种情况下签出来的会话无法被吊销，宁可拒绝登录（fail closed）。
+		if u.AuthVersion <= 0 {
+			return errors.New("账号认证状态异常，请联系管理员")
+		}
+
+		user, authVersion = u, u.AuthVersion
+		return nil
+	})
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	if user == nil {
-		return nil, errors.New("用户名或密码错误")
-	}
-
-	login, err := s.loginRepo.FindByUserIDAndLoginTypeAnyStatus(ctx, user.UserID, string(constants.LoginTypeUsername))
-	if err != nil {
-		return nil, err
-	}
-	if login == nil {
-		return nil, errors.New("请用其他方式登录后设置密码")
-	}
-
-	if login.Status != constants.LoginMethodStatusEnabled || user.Status != constants.UserStatusEnabled {
-		return nil, errors.New("账号状态非法")
-	}
-
-	if !helper.VerifyPassword(password, login.LoginCredential, login.Salt) {
-		return nil, errors.New("用户名或密码错误")
-	}
-
-	return user, nil
+	return user, authVersion, nil
 }
 
-// Register 注册（创建 admin_users + username 登录方式，SHA-256 加盐存密码）
-func (s *AuthService) Register(ctx context.Context, username, password string) (*model.AdminUser, error) {
-	existing, err := s.userRepo.FindByUsername(ctx, username)
-	if err != nil {
-		return nil, err
+// LookupUserIDByUsername 按账号查 user_id，查不到或出错返回 0。
+// 只用于登录失败日志的归属：失败日志不能因为「账号不存在」就丢掉，
+// 但也不该把调用方输入的账号串原样写进日志（可能是误填的口令）。
+func (s *AuthService) LookupUserIDByUsername(ctx context.Context, account string) uint64 {
+	if account == "" {
+		return 0
 	}
-	if existing != nil {
-		return nil, errors.New("用户名已存在")
+	user, err := s.userRepo.FindByUsername(ctx, account)
+	if err != nil || user == nil {
+		return 0
 	}
-
-	user := &model.AdminUser{
-		Username:   username,
-		Status:     constants.UserStatusEnabled,
-		UserSource: constants.UserSourceSelfRegistered,
-	}
-	if err := s.userRepo.Create(ctx, user); err != nil {
-		return nil, err
-	}
-
-	if err := s.loginRepo.SyncPassword(ctx, user.UserID, username, password); err != nil {
-		return nil, err
-	}
-	return user, nil
+	return user.UserID
 }
 
 // GetUserByID 根据用户 ID 查找用户
@@ -144,7 +158,16 @@ func (s *AuthService) UpdateProfile(ctx context.Context, userID uint64, req *dto
 	return s.userRepo.UpdateByID(ctx, userID, updateData)
 }
 
-// ChangePassword 修改密码（校验旧密码 + 更新密码 + 使旧 token 失效）
+// ChangePassword 修改密码（校验旧密码 + 更新密码 + 使该用户已签发的 Token 全部失效）。
+//
+// 校验旧密码、写新凭证、自增认证版本三步都在同一个事务里：
+// 旧密码校验和改写之间不留窗口，更不会出现「密码已改、吊销没生效」。
+//
+// 事务第一件事是锁本人的用户行（lockSelfUserRow）。自助改密不做身份判定，
+// 锁它不是为了鉴权，而是为了加锁顺序统一：管理员重置密码的路径是
+// 「锁 admin_users 行 → 改 admin_user_logins → 自增 auth_version」，
+// 自助改密若先碰凭证行再碰用户行（最后那步 BumpAuthVersion 必然会碰），
+// 两条路径就是一对相反的加锁顺序，同一账号上并发时互等成死锁。
 func (s *AuthService) ChangePassword(ctx context.Context, userID uint64, req *dto.ChangePasswordRequest) error {
 	if req == nil || req.OldPassword == "" || req.NewPassword == "" {
 		return errors.New("原密码和新密码不能为空")
@@ -153,57 +176,37 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID uint64, req *dt
 		return err
 	}
 
-	// 校验旧密码（通过 username 登录方式）
-	login, err := s.loginRepo.FindByUserIDAndLoginTypeAnyStatus(ctx, userID, string(constants.LoginTypeUsername))
-	if err != nil {
-		return err
-	}
-	if login == nil {
-		return errors.New("未设置密码登录方式")
-	}
-	if !helper.VerifyPassword(req.OldPassword, login.LoginCredential, login.Salt) {
-		return errors.New("原密码错误")
-	}
+	return s.store.RunInTx(ctx, func(tx *repo.Tx) error {
+		// 先锁本人用户行，统一全局加锁顺序（账号不存在直接拒绝）
+		if err := lockSelfUserRow(ctx, tx, userID); err != nil {
+			return err
+		}
 
-	// 更新密码 hash + 盐
-	salt := helper.GenerateSalt()
-	hashed := helper.HashPassword(req.NewPassword, salt)
-	if err := s.loginRepo.UpdateByID(ctx, login.LoginID, map[string]interface{}{
-		"login_credential": hashed,
-		"salt":             salt,
-	}); err != nil {
-		return err
-	}
+		// 校验旧密码（通过 username 登录方式）
+		login, err := tx.UserLogin().FindByUserIDAndLoginTypeAnyStatus(ctx, userID, string(constants.LoginTypeUsername))
+		if err != nil {
+			return err
+		}
+		if login == nil {
+			return errors.New("未设置密码登录方式")
+		}
+		if !helper.VerifyPassword(req.OldPassword, login.LoginCredential, login.Salt) {
+			return errors.New("原密码错误")
+		}
 
-	// 使旧 token 失效
-	return s.authStore.InvalidateUserSessions(userID)
-}
-
-// SetPassword 设置/重置密码（覆盖式，无需旧密码；/admin/user/set-password）
-func (s *AuthService) SetPassword(ctx context.Context, userID uint64, req *dto.SetPasswordRequest) error {
-	if req == nil || req.NewPassword == "" {
-		return errors.New("新密码不能为空")
-	}
-	if err := helper.ValidatePasswordStrength(req.NewPassword); err != nil {
-		return err
-	}
-
-	// 校验用户是否存在且状态合法
-	user, err := s.userRepo.FindByUserID(ctx, userID)
-	if err != nil {
-		return err
-	}
-	if user == nil || user.Status != 1 {
-		return errors.New("用户不存在或状态非法")
-	}
-
-	// 覆盖式更新用户名密码登录方式（无则创建、有则更新）
-	if err := s.loginRepo.SyncPassword(ctx, userID, user.Username, req.NewPassword); err != nil {
-		return err
-	}
-
-	// 使旧 token 失效
-	return s.authStore.InvalidateUserSessions(userID)
+		// 更新密码 hash + 盐，并在同一事务内自增认证版本
+		salt := helper.GenerateSalt()
+		hashed := helper.HashPassword(req.NewPassword, salt)
+		return applyRevocableChange(
+			func() error {
+				return tx.UserLogin().UpdateByID(ctx, login.LoginID, map[string]interface{}{
+					"login_credential": hashed,
+					"salt":             salt,
+				})
+			},
+			func() error { return tx.User().BumpAuthVersion(ctx, userID) },
+		)
+	})
 }
 
 // BindMobile 绑定手机号（校验验证码 + 占用检查 + 启用/创建 sms 登录方式）
@@ -310,17 +313,8 @@ func (s *AuthService) SendSMSCode(ctx context.Context, mobile string) error {
 	return err
 }
 
-// UpdateUserPassword 更新用户密码（覆盖式）
-func (s *AuthService) UpdateUserPassword(ctx context.Context, userID uint64, newPassword string) error {
-	user, err := s.userRepo.FindByUserID(ctx, userID)
-	if err != nil {
-		return err
-	}
-	if user == nil {
-		return errors.New("用户不存在")
-	}
-	if err := helper.ValidatePasswordStrength(newPassword); err != nil {
-		return err
-	}
-	return s.loginRepo.SyncPassword(ctx, userID, user.Username, newPassword)
-}
+// 这里原来还有一个 UpdateUserPassword（覆盖式重置他人密码，只收 userID + 新密码）。
+// 它已被删除：没有操作人、没有目标账号保护，谁调谁就能把任意账号（包括超管）的密码
+// 换掉。管理员重置他人密码现在只有一个入口 —— AdminUserService.UpdateUser，
+// 在同一个事务里先做身份判定再写（见 app/service/user_guard.go）。
+// 本人自助改密走上面的 ChangePassword（必须带旧密码），与用户管理权限无关。

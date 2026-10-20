@@ -8,7 +8,6 @@ import (
 	"{{ .Module }}/app/dto"
 	tmid "{{ .Module }}/app/middleware"
 	"{{ .Module }}/app/service"
-	"github.com/stones-hub/taurus-pro-common/pkg/util/tnet"
 )
 
 // LogController 系统日志控制器
@@ -76,7 +75,7 @@ func (c *LogController) ReportFrontError(w http.ResponseWriter, r *http.Request)
 		userID = uid
 	}
 
-	if err := c.LogService.ReportFrontError(r.Context(), &req, userID, tnet.GetRemoteIP(r), r.UserAgent()); err != nil {
+	if err := c.LogService.ReportFrontError(r.Context(), &req, userID, tmid.ClientIP(r), r.UserAgent()); err != nil {
 		// 错误上报兜底失败：不打日志会静默吞掉，这里降级记录但不影响对前端的 200 响应
 		Fail(w, http.StatusInternalServerError, "前端错误上报失败")
 		return

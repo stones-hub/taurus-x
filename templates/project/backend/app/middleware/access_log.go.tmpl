@@ -7,8 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/stones-hub/taurus-pro-common/pkg/util/tnet"
-
 	"{{ .Module }}/app/helper"
 	"{{ .Module }}/app/model"
 	"{{ .Module }}/app/repo"
@@ -56,7 +54,14 @@ func AccessLogMiddleware() func(next http.Handler) http.Handler {
 
 			duration := time.Since(start).Milliseconds()
 			userID, _ := CurrentUserIDFromJWT(r)
-			ip := tnet.GetRemoteIP(r)
+			ip := ClientIP(r)
+
+			// 先脱敏再截断：截断后的 JSON 解析不了，只能整体打掉，信息量更低。
+			// 登录、改密、绑定手机号这些接口的 body 里有明文口令与验证码，必须在落库前处理。
+			contentType := r.Header.Get("Content-Type")
+			query := redactQuery(r.URL.RawQuery)
+			requestBody := redactBody(contentType, string(reqBody))
+			responseBody := redactBody(rec.Header().Get("Content-Type"), rec.body())
 
 			// 异步落库 + 落文件，使用独立 context 避免请求结束后被取消
 			go func() {
@@ -68,9 +73,9 @@ func AccessLogMiddleware() func(next http.Handler) http.Handler {
 					IP:           ip,
 					UserAgent:    r.UserAgent(),
 					DurationMs:   duration,
-					Query:        truncate(r.URL.RawQuery, 500),
-					RequestBody:  truncate(string(reqBody), 4096),
-					ResponseBody: truncate(rec.body(), maxBodyLogSize),
+					Query:        truncate(query, 500),
+					RequestBody:  truncate(requestBody, 4096),
+					ResponseBody: truncate(responseBody, maxBodyLogSize),
 				}
 				_ = getAccessLogRepo().Create(context.Background(), entry)
 				accessLogFile.Write(formatAccessLine(entry))

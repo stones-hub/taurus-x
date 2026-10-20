@@ -6,10 +6,10 @@ import (
 	"time"
 
 	"github.com/google/wire"
+
 	"{{ .Module }}/app/constants"
 	"{{ .Module }}/app/dto"
 	"{{ .Module }}/app/helper"
-	authstore "{{ .Module }}/app/helper/store"
 	"{{ .Module }}/app/model"
 	"{{ .Module }}/app/repo"
 )
@@ -19,7 +19,6 @@ type AdminUserService struct {
 	userRepo         *repo.AdminUserRepository
 	loginRepo        *repo.AdminUserLoginRepository
 	verificationCode *helper.VerificationCodeManager
-	authStore        *authstore.AuthRedisStore
 	store            *repo.Store
 }
 
@@ -32,7 +31,6 @@ func NewAdminUserService(store *repo.Store) *AdminUserService {
 		userRepo:         store.User(),
 		loginRepo:        store.UserLogin(),
 		verificationCode: helper.NewVerificationCodeManager(),
-		authStore:        authstore.NewAuthRedisStore(),
 		store:            store,
 	}
 }
@@ -51,6 +49,33 @@ func (s *AdminUserService) GetUserList(ctx context.Context, page, pageSize int, 
 		items = append(items, dto.ToUserInfo(&users[i]))
 	}
 	return &dto.UserListResponse{
+		PageNo:      page,
+		PageSize:    pageSize,
+		ResultTotal: total,
+		List:        items,
+	}, nil
+}
+
+// GetUserOptions 分页查询用户选项（/admin/option/users 专用）。
+//
+// 与 GetUserList 的区别只有一个：返回字段最小化。
+// 选项接口不做接口权限校验，任何登录用户都能调，所以绝不能把
+// 手机号、邮箱、最后登录 IP 这些字段带出去。
+func (s *AdminUserService) GetUserOptions(ctx context.Context, page, pageSize int, keyword string, status int) (*dto.UserOptionListResponse, error) {
+	users, total, err := s.userRepo.ListByKeyword(ctx, page, pageSize, keyword, status)
+	if err != nil {
+		return nil, err
+	}
+
+	items := make([]*dto.UserOptionItem, 0, len(users))
+	for i := range users {
+		items = append(items, &dto.UserOptionItem{
+			UserID:   users[i].UserID,
+			Username: users[i].Username,
+			Realname: users[i].Realname,
+		})
+	}
+	return &dto.UserOptionListResponse{
 		PageNo:      page,
 		PageSize:    pageSize,
 		ResultTotal: total,
@@ -127,6 +152,9 @@ func (s *AdminUserService) AddUser(ctx context.Context, req *dto.AddUserRequest)
 		Birthday:   birthday,
 		Status:     constants.UserStatusEnabled,
 		UserSource: userSource,
+		// 显式写 1 而不是依赖列默认值：auth_version 为 0 会被会话校验当成
+		// 「查不到用户」而拒绝，新建的账号会一登录就被拒。
+		AuthVersion: 1,
 	}
 	if err := s.userRepo.Create(ctx, user); err != nil {
 		return 0, err
@@ -139,15 +167,93 @@ func (s *AdminUserService) AddUser(ctx context.Context, req *dto.AddUserRequest)
 	return user.UserID, nil
 }
 
-// UpdateUser 更新用户基本信息（密码/角色由调用方分别处理）
-func (s *AdminUserService) UpdateUser(ctx context.Context, req *dto.UpdateUserRequest) error {
-	user, err := s.userRepo.FindByUserID(ctx, req.UserID)
-	if err != nil {
-		return err
+// UpdateUser 管理员编辑用户：资料 +（可选）重置密码 + 角色，**一个事务一次提交**。
+//
+// operatorID 必须是 JWT 里的操作人。整个编辑在同一个事务里，顺序是
+// 「加锁 → 当前读事实 → 判定 → 才开始写」：
+//
+//  1. 锁定操作人与目标的用户行、当前读身份、目标存在性（guardUserWrite，
+//     非超管不得编辑超管账号）；
+//  2. 若本次要改角色（req.RolesProvided()），再校验角色变更许可
+//     （CheckRoleAssignmentAllowed：非超管不得增删受保护角色）与角色状态
+//     （CheckRoleStatusAssignable：不得新增已禁用角色，已持有的可保留）；
+//  3. 以上全过，才写资料 / 密码 / 角色。
+//
+// 角色是**选择性更新**：`role_ids` 缺失或为 null 时完全不碰 admin_user_roles
+// （见 dto.UpdateUserRequest.RolesProvided）。注意这只影响角色这一段 ——
+// 目标账号保护、身份锁、auth_version 原子变更与是否改角色无关，始终执行，
+// 所以「不传 role_ids」不是绕过账号保护的口子。
+//
+// 原来的实现是「UserService 提交资料 → AuthService 提交密码 → 最后 RoleService 才查
+// 角色保护」三次独立提交：非超管只要有本接口权限，就能把超管的密码重置掉，
+// 之后那个 403 只是个返回值，密码早已落库、会话也早已被踢。所以这里的关键不是
+// 多加一次检查，而是**检查必须在写之前、写必须在一个事务里**：任何一步拒绝，
+// 资料、密码、角色都保持原样。
+//
+// 注意这里**没有**在 guardUserWrite 之前单独查一次目标用户。原先那次普通读会成为
+// 本事务的第一条 SELECT，在 REPEATABLE READ 下就此把一致性快照钉死，后面即使加锁
+// 当前读到了新身份，拿旧快照里的字段继续写也等于用了过期事实。现在目标用户行由
+// guardUserWrite 加锁后当前读返回（g.Target）。
+func (s *AdminUserService) UpdateUser(ctx context.Context, operatorID uint64, req *dto.UpdateUserRequest) error {
+	if req == nil {
+		return errors.New("请求参数不能为空")
 	}
-	if user == nil {
-		return errors.New("用户不存在")
+	if req.UserID == 0 {
+		return errors.New("用户ID不能为空")
 	}
+	// 密码强度是纯校验，先挡掉，不占着事务
+	if req.Password != "" {
+		if err := helper.ValidatePasswordStrength(req.Password); err != nil {
+			return err
+		}
+	}
+
+	return s.store.RunInTx(ctx, func(tx *repo.Tx) error {
+		// 目标账号保护与身份锁始终执行，跟本次改不改角色无关
+		g, err := guardUserWrite(ctx, tx, operatorID, req.UserID)
+		if err != nil {
+			return err
+		}
+		updateRoles := req.RolesProvided()
+		if updateRoles {
+			nextFacts, err := txRoleFactsByIDs(ctx, tx, req.RoleIDs)
+			if err != nil {
+				return err
+			}
+			if err := CheckRoleAssignmentAllowed(g.OperatorIsSuperAdmin, g.TargetRoleFacts, nextFacts); err != nil {
+				return err
+			}
+			if err := CheckRoleStatusAssignable(g.TargetRoleFacts, nextFacts); err != nil {
+				return err
+			}
+		}
+
+		// ===== 预检全部通过，以下才是写入 =====
+		if err := tx.User().UpdateByID(ctx, req.UserID, userProfileUpdates(req)); err != nil {
+			return err
+		}
+		if req.Password != "" {
+			// 重置他人密码必须连带吊销该用户所有在线会话，否则「密码已被重置」
+			// 而偷到旧 Token 的人还能继续用。两步同事务，不留中间态。
+			if err := applyRevocableChange(
+				func() error {
+					return tx.UserLogin().SyncPassword(ctx, req.UserID, g.Target.Username, req.Password)
+				},
+				func() error { return tx.User().BumpAuthVersion(ctx, req.UserID) },
+			); err != nil {
+				return err
+			}
+		}
+		if !updateRoles {
+			return nil
+		}
+		return replaceUserRolesTx(ctx, tx, req.UserID, req.RoleIDs)
+	})
+}
+
+// userProfileUpdates 组装资料更新字段（纯函数，便于直接断言落库前的字段集合）。
+// 邮箱/生日为空表示「不更新」，与原行为一致。
+func userProfileUpdates(req *dto.UpdateUserRequest) map[string]interface{} {
 	updateData := map[string]interface{}{
 		"realname": req.Realname,
 		"nickname": req.Nickname,
@@ -161,25 +267,44 @@ func (s *AdminUserService) UpdateUser(ctx context.Context, req *dto.UpdateUserRe
 			updateData["birthday"] = &t
 		}
 	}
-	return s.userRepo.UpdateByID(ctx, req.UserID, updateData)
+	return updateData
 }
 
-// UpdateUserStatus 更新用户状态（1启用/0禁用/-1删除）
-func (s *AdminUserService) UpdateUserStatus(ctx context.Context, userID uint64, status int) error {
+// UpdateUserStatus 更新用户状态（1启用/0禁用/-1删除）。
+//
+// operatorID 必须是 JWT 里的操作人：有 update-status / delete 接口权限不等于
+// 可以禁用或删除超管账号，所以目标账号保护和状态写入放在同一个事务里，
+// 先加锁当前读再判定再写（guardUserWrite，它也负责「目标不存在就拒绝」）。
+//
+// 禁用/删除之后必须吊销该用户所有在线会话。只改 status 不吊销的话，已经发出去的
+// Token 在过期前依然畅通无阻，「禁用用户」就只是个数据库标记。
+// 状态更新与认证版本自增放在同一个事务里：否则一旦第二步失败，就会留下
+// 「库里已禁用、旧 Token 仍可用」的状态。
+func (s *AdminUserService) UpdateUserStatus(ctx context.Context, operatorID, userID uint64, status int) error {
 	if status != int(constants.UserStatusEnabled) && status != int(constants.UserStatusDisabled) && status != -1 {
 		return errors.New("状态值必须为0(禁用)、1(启用)或-1(删除)")
 	}
-	user, err := s.userRepo.FindByUserID(ctx, userID)
-	if err != nil {
-		return err
-	}
-	if user == nil {
-		return errors.New("用户不存在")
-	}
-	return s.userRepo.UpdateByID(ctx, userID, map[string]interface{}{"status": status})
+	return s.store.RunInTx(ctx, func(tx *repo.Tx) error {
+		// 不在这之前单独查一次用户：那条普通读会先钉死事务快照，
+		// 身份判定就又变成读旧快照（见 UpdateUser 注释）。
+		if _, err := guardUserWrite(ctx, tx, operatorID, userID); err != nil {
+			return err
+		}
+		updateStatus := func() error {
+			return tx.User().UpdateByID(ctx, userID, map[string]interface{}{"status": status})
+		}
+		// 启用不需要吊销：它不缩小任何人的权限
+		if status == int(constants.UserStatusEnabled) {
+			return updateStatus()
+		}
+		return applyRevocableChange(
+			updateStatus,
+			func() error { return tx.User().BumpAuthVersion(ctx, userID) },
+		)
+	})
 }
 
-// DeleteUser 删除用户（软删：状态置 -1）
-func (s *AdminUserService) DeleteUser(ctx context.Context, userID uint64) error {
-	return s.UpdateUserStatus(ctx, userID, -1)
+// DeleteUser 删除用户（软删：状态置 -1）。operatorID 同 UpdateUserStatus。
+func (s *AdminUserService) DeleteUser(ctx context.Context, operatorID, userID uint64) error {
+	return s.UpdateUserStatus(ctx, operatorID, userID, -1)
 }

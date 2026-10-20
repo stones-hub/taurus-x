@@ -10,5 +10,5 @@ databases:
       max_retries: 10                         # 最大重试次数
       retry_delay: 15                         # 重试延迟时间 秒
       log_path: "./logs/db_{{ .ProjectName }}.log"          # 日志路径（按天分割，实际生成 db_{{ .ProjectName }}-YYYY-MM-DD.log；已由 internal/taurus 按天 logger 接管）
-      log_level: "info"                       # 日志级别 info warn error silent
+      log_level: "${DB_LOG_LEVEL:warn}"       # 日志级别 info warn error silent；info 会打印完整 SQL（含密码散列、手机号等参数），默认 warn
       log_formatter: "default"                # 日志格式 json/default

@@ -1,0 +1,80 @@
+package middleware
+
+import (
+	"errors"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/stones-hub/taurus-pro-http/pkg/httpx"
+
+	"{{ .Module }}/app/helper/store"
+)
+
+// SessionStore 会话白名单能力。声明在 middleware 侧是为了方便测试替换实现，
+// 运行时由 app/helper/store 的 Redis 实现满足。
+//
+// RegisterSession 的 authVersion 必须由调用方从「校验凭证/状态的那次读取」带入，
+// ValidateSession 回传会话登记时的版本，供刷新 Token 原样沿用（见 rotateSession）。
+type SessionStore interface {
+	RegisterSession(userID uint64, jti string, ttl time.Duration, authVersion int64) error
+	ValidateSession(userID uint64, jti string) (int64, error)
+	RevokeSession(jti string) error
+}
+
+// 默认用 Redis 实现；实例内部惰性解析组件容器，所以这里可以在 init 阶段构造。
+var authSessionStore SessionStore = store.NewAuthRedisStore()
+
+// SetAuthSessionStore 替换会话存储实现（测试用）。
+func SetAuthSessionStore(s SessionStore) {
+	if s == nil {
+		return
+	}
+	authSessionStore = s
+}
+
+// AuthSessionStore 当前会话存储实现。
+func AuthSessionStore() SessionStore {
+	return authSessionStore
+}
+
+// SessionValidatorMiddleware 会话有效性校验（切面）。
+//
+// 登出、本人改密、管理员重置密码、禁用/删除用户都会让对应 Token 立刻失效。
+// 与旧的「改密时间戳 + claims.IssuedAt 比较」方案不同，这里做三件事：
+//  1. 用 jti 白名单 + 数据库里的认证版本精确判断，不受秒级时间戳精度影响
+//     （同一秒内改密也能吊销），也不受 Redis 淘汰影响（键丢了只会被拒）；
+//  2. 拿不到 claims / jti 时直接拒绝，而不是放行；
+//  3. Redis 或认证版本来源不可用时返回 503 拒绝请求（fail closed），
+//     不会退化成「谁都能过」。
+//
+// 注意：需在 JWTMiddleware 之后使用（依赖 JWT 中间件注入的 claims）。
+func SessionValidatorMiddleware() func(next http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			claims := GetJWTClaims(r)
+			if claims == nil || claims.JTI == "" {
+				httpx.SendResponse(w, http.StatusUnauthorized, "会话无效，请重新登录", nil)
+				return
+			}
+
+			userID, err := strconv.ParseUint(claims.UID, 10, 64)
+			if err != nil {
+				httpx.SendResponse(w, http.StatusUnauthorized, "会话无效，请重新登录", nil)
+				return
+			}
+
+			if _, err := AuthSessionStore().ValidateSession(userID, claims.JTI); err != nil {
+				if errors.Is(err, store.ErrSessionStoreUnavailable) {
+					// 认证依赖不可用时拒绝请求，恢复后自动恢复正常
+					httpx.SendResponse(w, http.StatusServiceUnavailable, "认证服务暂时不可用，请稍后重试", nil)
+					return
+				}
+				httpx.SendResponse(w, http.StatusUnauthorized, "会话已失效，请重新登录", nil)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}

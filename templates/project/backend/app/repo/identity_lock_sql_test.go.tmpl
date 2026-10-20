@@ -1,0 +1,220 @@
+package repo
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"gorm.io/gorm"
+)
+
+// 身份锁协议的 SQL 形状测试。
+//
+// 为什么要测 SQL 本身：授权判定的正确性依赖「这条读是当前读而不是快照读」。
+// MySQL 默认 REPEATABLE READ，事务里的普通 SELECT 读的是事务开始时的一致性快照，
+// 别的事务刚提交的「授予超管」看不见；只有 FOR UPDATE / FOR SHARE 才是当前读，
+// 并且顺带持锁挡住判定到写入之间的改动。这个差别在 Go 代码层面看不出来 ——
+// FindByUserID 和 LockByUserID 的签名、返回值完全一样，只有生成的 SQL 不同。
+// 所以这里断言的是语句文本：少了 FOR UPDATE，上层所有「先锁后判」的注释就都是空话。
+//
+// 关联删除同理：按 user_id 条件删一条 DELETE，和「先查出来再按主键逐行删」在
+// 单线程下结果相同，并发下后者会漏掉快照之后插入的关联行。两者的差别也只在 SQL 里。
+//
+// 用真实的 MySQL dialector + DryRun：和生产同一套 SQL 构建（包含 FOR UPDATE /
+// FOR SHARE 的方言渲染），语句只构建不执行，既不连数据库，也不拿 SQLite 当替身
+// —— SQLite 根本没有这两个子句，用它测等于什么都没测。
+//
+// 边界：这里证明的是「生成的语句带了加锁子句、删除用的是条件删」。
+// 真实 MySQL 下的并发结果（锁等待、死锁回滚、可见性）不在本测试范围内，
+// 需要在真库上验证。
+
+// captureSQL 跑一遍真实仓储方法，返回 GORM 实际构建出的语句文本。
+//
+// 覆盖 Query / Delete 两条回调链：加锁读走 Query，关联删除走 Delete。
+// DryRun 下两者都只构建不执行，但回调照常触发，所以拿得到 SQL。
+func captureSQL(t *testing.T, run func(db *gorm.DB) error) string {
+	t.Helper()
+	db := newDryRunDB(t)
+
+	var captured string
+	record := func(tx *gorm.DB) {
+		if tx.Statement != nil && tx.Statement.SQL.Len() > 0 {
+			captured = tx.Statement.SQL.String()
+		}
+	}
+	if err := db.Callback().Query().After("gorm:query").Register("test:capture_query", record); err != nil {
+		t.Fatalf("注册 query 回调失败: %v", err)
+	}
+	if err := db.Callback().Delete().After("gorm:delete").Register("test:capture_delete", record); err != nil {
+		t.Fatalf("注册 delete 回调失败: %v", err)
+	}
+
+	if err := run(db); err != nil {
+		t.Fatalf("仓储方法执行失败: %v", err)
+	}
+	if captured == "" {
+		t.Fatal("没有捕获到任何语句：仓储方法没有走到 GORM 回调")
+	}
+	return captured
+}
+
+// TestIdentityLockSQL_LockingReadsCarryLockClause 身份锁协议用到的每一条读都必须是加锁当前读。
+func TestIdentityLockSQL_LockingReadsCarryLockClause(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name    string
+		table   string
+		clause  string
+		run     func(db *gorm.DB) error
+		purpose string
+	}{
+		{
+			name:   "用户行排他锁",
+			table:  "admin_users",
+			clause: "FOR UPDATE",
+			run: func(db *gorm.DB) error {
+				_, err := NewAdminUserRepositoryWithDB(db).LockByUserID(ctx, 7)
+				return err
+			},
+			purpose: "锁协议的锚点：账号唯一稳定存在的那一行，空角色账号也锁得住",
+		},
+		{
+			name:   "角色关联排他锁",
+			table:  "admin_user_roles",
+			clause: "FOR UPDATE",
+			run: func(db *gorm.DB) error {
+				_, err := NewAdminUserRoleRepositoryWithDB(db).LockByUserID(ctx, 7)
+				return err
+			},
+			purpose: "身份事实的来源，必须当前读，并挡住并发改这个账号的角色",
+		},
+		{
+			name:   "启用角色共享锁",
+			table:  "admin_roles",
+			clause: "FOR SHARE",
+			run: func(db *gorm.DB) error {
+				_, err := NewAdminRoleRepositoryWithDB(db).FindByRoleIDForShare(ctx, 3)
+				return err
+			},
+			purpose: "角色是否受保护决定能不能赋，只读不写所以用共享锁",
+		},
+		{
+			name:   "任意状态角色共享锁",
+			table:  "admin_roles",
+			clause: "FOR SHARE",
+			run: func(db *gorm.DB) error {
+				_, err := NewAdminRoleRepositoryWithDB(db).FindByRoleIDAnyStatusForShare(ctx, 3)
+				return err
+			},
+			purpose: "已禁用的 super_admin 同样是超管身份的证据，判定不能过滤状态",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sql := captureSQL(t, tc.run)
+			if !strings.Contains(sql, tc.table) {
+				t.Fatalf("语句没有落在 %s 上。SQL: %s", tc.table, sql)
+			}
+			if !strings.Contains(sql, tc.clause) {
+				t.Errorf("语句缺少 %s：这是一次快照读而不是当前读，%s。SQL: %s", tc.clause, tc.purpose, sql)
+			}
+		})
+	}
+}
+
+// TestIdentityLockSQL_LockStrengthsAreNotInterchangeable 两种锁强度不能互换。
+//
+// 把用户行的 FOR UPDATE 写成 FOR SHARE，两个管理请求就能同时持共享锁、
+// 各自判定通过再各自写入，锁协议的互斥性没了；把角色表的 FOR SHARE 写成
+// FOR UPDATE 则会无谓地挡住角色管理，并把死锁面扩大到角色模块。
+func TestIdentityLockSQL_LockStrengthsAreNotInterchangeable(t *testing.T) {
+	ctx := context.Background()
+
+	userSQL := captureSQL(t, func(db *gorm.DB) error {
+		_, err := NewAdminUserRepositoryWithDB(db).LockByUserID(ctx, 7)
+		return err
+	})
+	if strings.Contains(userSQL, "FOR SHARE") {
+		t.Errorf("用户行用了共享锁：并发的两笔管理请求可以同时通过判定。SQL: %s", userSQL)
+	}
+
+	roleSQL := captureSQL(t, func(db *gorm.DB) error {
+		_, err := NewAdminRoleRepositoryWithDB(db).FindByRoleIDAnyStatusForShare(ctx, 3)
+		return err
+	})
+	if strings.Contains(roleSQL, "FOR UPDATE") {
+		t.Errorf("角色行用了排他锁：身份判定只读角色，不该独占它。SQL: %s", roleSQL)
+	}
+}
+
+// TestIdentityLockSQL_PlainReadsStayUnlocked 普通读必须保持不加锁。
+//
+// 列表、详情这些只读场景不该因为引入锁协议而开始持锁 —— 那是另一种事故
+// （查询互相阻塞）。也借此证明上面的 FOR UPDATE 确实来自 LockByUserID，
+// 不是所有查询都被加上了锁子句。
+func TestIdentityLockSQL_PlainReadsStayUnlocked(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name string
+		run  func(db *gorm.DB) error
+	}{
+		{
+			name: "用户详情",
+			run: func(db *gorm.DB) error {
+				_, err := NewAdminUserRepositoryWithDB(db).FindByUserID(ctx, 7)
+				return err
+			},
+		},
+		{
+			name: "角色关联列表",
+			run: func(db *gorm.DB) error {
+				_, err := NewAdminUserRoleRepositoryWithDB(db).FindByUserID(ctx, 7)
+				return err
+			},
+		},
+		{
+			name: "角色详情",
+			run: func(db *gorm.DB) error {
+				_, err := NewAdminRoleRepositoryWithDB(db).FindByRoleIDAnyStatus(ctx, 3)
+				return err
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sql := captureSQL(t, tc.run)
+			if strings.Contains(sql, "FOR UPDATE") || strings.Contains(sql, "FOR SHARE") {
+				t.Errorf("普通读带上了加锁子句，只读查询会互相阻塞。SQL: %s", sql)
+			}
+		})
+	}
+}
+
+// TestIdentityLockSQL_DeleteRolesByUserIDCondition 角色关联整体替换必须按 user_id 条件删。
+//
+// 「先查出关联行、再按主键逐行删」在并发下会漏：快照之后新插入的关联行不在那份
+// 主键清单里，替换完就多出一个本次没打算赋的角色 —— 如果多出来的那个是超管，
+// 这就是一次提权。所以断言条件列是 user_id，且语句里没有按 id 删的痕迹。
+func TestIdentityLockSQL_DeleteRolesByUserIDCondition(t *testing.T) {
+	sql := captureSQL(t, func(db *gorm.DB) error {
+		return NewAdminUserRoleRepositoryWithDB(db).DeleteByUserID(context.Background(), 7)
+	})
+
+	if !strings.HasPrefix(strings.ToUpper(sql), "DELETE") {
+		t.Fatalf("不是 DELETE 语句（模型若带软删会变成 UPDATE，关联行就删不掉）。SQL: %s", sql)
+	}
+	if !strings.Contains(sql, "admin_user_roles") {
+		t.Fatalf("删除没有落在 admin_user_roles 上。SQL: %s", sql)
+	}
+	if !strings.Contains(sql, "user_id") {
+		t.Errorf("删除条件里没有 user_id：按主键逐行删会漏掉快照之外新增的关联行。SQL: %s", sql)
+	}
+	// 兜底：防止将来被改回「WHERE id IN (...)」或「WHERE id = ?」
+	if strings.Contains(sql, "`id`") {
+		t.Errorf("删除条件用上了主键 id，又变成了按快照主键删。SQL: %s", sql)
+	}
+	// 没有 WHERE 会删空整张表
+	if !strings.Contains(strings.ToUpper(sql), "WHERE") {
+		t.Errorf("DELETE 没有 WHERE，会清空整张关联表。SQL: %s", sql)
+	}
+}

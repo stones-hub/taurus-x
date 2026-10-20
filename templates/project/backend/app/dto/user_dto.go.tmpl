@@ -70,14 +70,12 @@ type UpdateProfileRequest struct {
 	Birthday string `json:"birthday"`
 }
 
-// ChangePasswordRequest 修改密码请求（需校验旧密码）
+// ChangePasswordRequest 修改密码请求（需校验旧密码）。
+//
+// 自助改密是**唯一**的「用户改自己密码」入口：必须带旧密码。
+// 管理员重置他人密码走 /admin/user/update 的 password 字段（受接口权限校验）。
 type ChangePasswordRequest struct {
 	OldPassword string `json:"old_password"`
-	NewPassword string `json:"new_password"`
-}
-
-// SetPasswordRequest 设置/重置密码请求（覆盖式，无需旧密码）
-type SetPasswordRequest struct {
 	NewPassword string `json:"new_password"`
 }
 
@@ -131,7 +129,11 @@ type AddUserRequest struct {
 	RoleIDs    []uint64 `json:"role_ids"`
 }
 
-// UpdateUserRequest 更新用户请求（密码、角色可空，空则不更新）
+// UpdateUserRequest 更新用户请求。
+//
+// Password 为空表示不改密码；Email / Birthday 为空表示不更新该字段。
+// RoleIDs 的语义见 RolesProvided —— 它区分「字段缺失」和「显式空数组」，
+// 所以**不要**把它换成别的类型或在解码前预置默认值。
 type UpdateUserRequest struct {
 	UserID   uint64   `json:"user_id"`
 	Realname string   `json:"realname"`
@@ -141,6 +143,24 @@ type UpdateUserRequest struct {
 	Birthday string   `json:"birthday"`
 	Email    string   `json:"email"`
 	RoleIDs  []uint64 `json:"role_ids"`
+}
+
+// RolesProvided 本次请求是否显式给出了 role_ids（即是否要改角色关联）。
+//
+// 语义与 encoding/json 的解码行为一一对应：
+//
+//	字段缺失            → RoleIDs == nil   → false → 不校验、不替换角色关联
+//	"role_ids": null    → RoleIDs == nil   → false → 同「缺失」，**不清空**
+//	"role_ids": []      → 非 nil 的空切片  → true  → 清空该用户的角色关联
+//	"role_ids": [1,2]   → 非 nil           → true  → 按安全校验整体替换
+//
+// null 刻意与「缺失」一致：调用方漏传、或者前端把未加载到的角色列表序列化成 null 时，
+// 不应该变成一次静默的「撤销全部角色」。要清空必须明确写成 `[]`。
+//
+// 这里依赖的是「nil 切片 ≠ 空切片」，不是长度判断：`len(RoleIDs) == 0` 把
+// 缺失和 `[]` 混成一种，正是本方法要避免的。
+func (r *UpdateUserRequest) RolesProvided() bool {
+	return r != nil && r.RoleIDs != nil
 }
 
 // UpdateUserStatusRequest 更新用户状态请求

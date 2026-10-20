@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -67,13 +68,982 @@ func TestGenerate_Combinations(t *testing.T) {
 			assertComponents(t, result.Components, tc.optional)
 			assertNoBusinessLeftovers(t, outDir)
 			assertNoCredentials(t, outDir)
+			assertInitialSecrets(t, outDir, result)
+			assertSelfServicePassword(t, outDir)
+			assertNoDuplicateSetPasswordEntry(t, outDir)
+			assertSessionRevocationWiring(t, outDir)
+			assertUserManageGuardWiring(t, outDir)
+			assertStartupSelfCheckWiring(t, outDir)
+			assertSQLLogNoLeak(t, outDir)
+			assertLoginAuditStatus(t, outDir)
+			assertNoDeadRegisterFlow(t, outDir)
 			assertUnselectedAbsent(t, outDir, result.Components)
+			assertDockerCrossPlatform(t, outDir)
+			assertComposeNoFixedPlatform(t, outDir)
 			assertBaseline(t, outDir, tc.project)
 
 			backend := filepath.Join(outDir, "backend")
 			runGo(t, backend, "build", "./...")
 			runGo(t, backend, "vet", "./...")
+			runGo(t, backend, "test", "./...")
 		})
+	}
+}
+
+// adminLoginInsertPattern 从生成的 init.sql 里取出初始管理员的散列与 salt。
+var adminLoginInsertPattern = regexp.MustCompile(`\(1, 'username', '[^']*', '([0-9a-f]{64})', '([0-9a-f]{32})', 1\)`)
+
+// assertInitialSecrets 初始凭证相关的硬要求：
+//
+//  1. init.sql 里的散列确实是 CLI 打印的那个随机密码算出来的（否则用户照提示登不进去）；
+//  2. 明文初始密码不出现在任何生成文件里（只在终端打印一次）；
+//  3. .env.example 不带可直接用的 JWT 密钥，且留空（该文件会进使用者的版本库）。
+func assertInitialSecrets(t *testing.T, outDir string, result *Result) {
+	t.Helper()
+
+	if result.AdminPassword == "" {
+		t.Fatal("生成结果未返回初始管理员密码")
+	}
+
+	// 1. init.sql 的散列 / salt 与随机密码一致
+	sql := readFile(t, filepath.Join(outDir, "scripts", "sql", "init.sql"))
+	m := adminLoginInsertPattern.FindStringSubmatch(sql)
+	if m == nil {
+		t.Fatal("init.sql 里找不到形如 (1, 'username', ..., <64位散列>, <32位salt>, 1) 的初始管理员登录记录")
+	}
+	gotHash, gotSalt := m[1], m[2]
+	if want := passwordHash(result.AdminPassword, gotSalt); gotHash != want {
+		t.Error("init.sql 里的散列与返回的初始密码不一致：按提示登录会失败")
+	}
+
+	// 2. 明文密码不能出现在生成产物里（含 README / SQL / .env.example）
+	assertNoMatch(t, outDir, result.AdminPassword)
+
+	// 3. .env.example 里 JWT_SECRET 必须留空
+	envExample := readFile(t, filepath.Join(outDir, "backend", ".env.example"))
+	if !strings.Contains(envExample, "\nJWT_SECRET=\n") && !strings.HasSuffix(envExample, "\nJWT_SECRET=") {
+		t.Error(".env.example 的 JWT_SECRET 必须留空（该文件进版本库，不能带现成签名密钥）")
+	}
+	// 注意要锚到行首：文件里的注释示例（# 对的：JWT_SECRET=xxx）不算带值
+	if regexp.MustCompile(`(?m)^\s*JWT_SECRET=\S`).MatchString(envExample) {
+		t.Error(".env.example 的 JWT_SECRET 带了值")
+	}
+
+	// 弱默认值只能作为「没配置」的哨兵留在配置文件里，启动自检会拒绝它
+	httpYAML := readFile(t, filepath.Join(outDir, "backend", "config", "autoload", "http", "http.yaml"))
+	if !strings.Contains(httpYAML, "${JWT_SECRET:") {
+		t.Error("http.yaml 的 jwt secret 应从 JWT_SECRET 环境变量取值")
+	}
+}
+
+// assertSelfServicePassword 「已登录普通用户能改自己的密码」这条要求有两半，
+// 中间件行为那半由生成项目的 app/middleware/permission_test.go 覆盖，
+// 这里只校验布线那半（权限数据与路由链的一致性）：
+//
+//  1. 权限数据里不能再有 change-password 的接口权限行，否则没配该权限的普通角色
+//     仍然会被 PermissionMiddleware 挡掉；
+//  2. 路由上 /change-password 必须挂在 userSelfServiceChain 上，
+//     而该链不含 PermissionMiddleware。
+//
+// 两者只要有一边回退，普通用户就又改不了自己的密码了。
+func assertSelfServicePassword(t *testing.T, outDir string) {
+	t.Helper()
+
+	sql := readFile(t, filepath.Join(outDir, "scripts", "sql", "init.sql"))
+	for _, forbidden := range []string{"'/admin/user/change-password'", "api.admin.user.change-password"} {
+		if strings.Contains(sql, forbidden) {
+			t.Errorf("init.sql 仍有 change-password 的接口权限（%s）：普通用户会被权限中间件挡住", forbidden)
+		}
+	}
+	// 自助改密唯一入口是 change-password，必须带旧密码；
+	// 管理员重置他人密码走 /admin/user/update（下面单独断言它仍受接口权限保护）。
+	dtoSrc := readFile(t, filepath.Join(outDir, "backend", "app", "dto", "user_dto.go"))
+	if !strings.Contains(dtoSrc, "OldPassword string `json:\"old_password\"`") {
+		t.Error("dto.ChangePasswordRequest 必须收 old_password：自助改密不能没有旧密码校验")
+	}
+	changePassword := funcBody(
+		readFile(t, filepath.Join(outDir, "backend", "app", "service", "auth_service.go")),
+		"func (s *AuthService) ChangePassword(")
+	if !strings.Contains(changePassword, "helper.VerifyPassword(req.OldPassword") {
+		t.Error("AuthService.ChangePassword 必须校验旧密码")
+	}
+
+	routes := readFile(t, filepath.Join(outDir, "backend", "app", "routes", "routes.go"))
+
+	selfServiceChain := blockAfter(routes, "userSelfServiceChain := []router.MiddlewareFunc{")
+	if selfServiceChain == "" {
+		t.Fatal("routes.go 找不到 userSelfServiceChain 定义")
+	}
+	if strings.Contains(selfServiceChain, "PermissionMiddleware") {
+		t.Error("userSelfServiceChain 不应挂 PermissionMiddleware")
+	}
+	for _, must := range []string{"JWTMiddleware", "SessionValidatorMiddleware", "OperationLogMiddleware", "CSRFMiddleware"} {
+		if !strings.Contains(selfServiceChain, must) {
+			t.Errorf("userSelfServiceChain 缺少 %s：自助写操作仍要登录/会话/CSRF 校验与操作留痕", must)
+		}
+	}
+
+	group := groupContaining(routes, "/change-password")
+	if group == "" {
+		t.Fatal("routes.go 找不到注册 /change-password 的路由组")
+	}
+	if !strings.Contains(group, "Middleware: userSelfServiceChain") {
+		t.Error("/change-password 应挂在 userSelfServiceChain 上")
+	}
+
+	// 管理员重置他人密码的入口是 /admin/user/update（password 字段），
+	// 它必须留在受接口权限校验的链上 —— 删掉重复的自助入口不能顺带放开它。
+	updateGroup := groupContaining(routes, "Handler: http.HandlerFunc(app.Core.UserController.UpdateUser)")
+	if updateGroup == "" {
+		t.Fatal("routes.go 找不到注册 UserController.UpdateUser 的路由组")
+	}
+	if !strings.Contains(updateGroup, "Middleware: userProtectedChain") {
+		t.Error("/admin/user/update（管理员重置他人密码）必须留在 userProtectedChain 上")
+	}
+	if !strings.Contains(sql, "'/admin/user/update'") {
+		t.Error("init.sql 缺少 /admin/user/update 的接口权限：管理员重置他人密码不应无权限校验")
+	}
+}
+
+// assertNoDuplicateSetPasswordEntry 「无需旧密码的自助改密入口」必须整条链路都不存在。
+//
+// 这个入口曾经从 JWT 取本人 ID、DTO 只收 new_password，等于「拿到一个有效 Token
+// 就能静默改掉密码」，和个人中心需要旧密码的 change-password 重复且更弱。
+// 这里逐层断言残留：路由 / controller / service / DTO / 权限行 / 前端页面 / API / 类型 / 路由表。
+func assertNoDuplicateSetPasswordEntry(t *testing.T, outDir string) {
+	t.Helper()
+
+	backend := filepath.Join(outDir, "backend")
+	for _, tc := range []struct {
+		path      string
+		forbidden string
+		why       string
+	}{
+		{filepath.Join(backend, "app", "routes", "routes.go"), "/set-password", "路由仍注册了无需旧密码的改密入口"},
+		{filepath.Join(backend, "app", "controller", "user_controller.go"), "func (c *UserController) SetPassword(", "controller 仍有 SetPassword"},
+		{filepath.Join(backend, "app", "service", "auth_service.go"), "func (s *AuthService) SetPassword(", "service 仍有 SetPassword"},
+		{filepath.Join(backend, "app", "dto", "user_dto.go"), "SetPasswordRequest", "DTO 仍有 SetPasswordRequest"},
+		{filepath.Join(outDir, "scripts", "sql", "init.sql"), "/admin/user/set-password", "权限数据里仍有该接口权限行"},
+		{filepath.Join(outDir, "scripts", "sql", "init.sql"), "api.admin.user.set-password", "权限数据里仍有该接口权限编码"},
+		{filepath.Join(outDir, "frontend", "src", "router", "index.ts"), "set-password", "前端路由仍指向已删除的页面（死链接）"},
+		{filepath.Join(outDir, "frontend", "src", "api", "user.ts"), "apiSetPassword", "前端 API 仍保留 apiSetPassword"},
+		{filepath.Join(outDir, "frontend", "src", "types", "user.ts"), "SetPasswordRequest", "前端类型仍保留 SetPasswordRequest"},
+	} {
+		if strings.Contains(readFile(t, tc.path), tc.forbidden) {
+			t.Errorf("%s：%s（命中 %q）", tc.path, tc.why, tc.forbidden)
+		}
+	}
+
+	if _, err := os.Stat(filepath.Join(outDir, "frontend", "src", "views", "profile", "set-password.vue")); !os.IsNotExist(err) {
+		t.Error("frontend/src/views/profile/set-password.vue 仍存在：重复改密页面应已删除")
+	}
+
+	// 删掉重复入口不能把个人中心的改密也删了：页面仍要调自助改密接口
+	profile := readFile(t, filepath.Join(outDir, "frontend", "src", "views", "profile", "index.vue"))
+	for _, must := range []string{"apiChangePassword", "old_password"} {
+		if !strings.Contains(profile, must) {
+			t.Errorf("profile/index.vue 缺少 %s：个人中心的旧密码+新密码改密流程必须保留可用", must)
+		}
+	}
+}
+
+// assertSessionRevocationWiring 会话吊销的权威标记必须是数据库列 auth_version，
+// 而且凭证/状态变更与版本自增必须在同一个事务里。
+//
+// 这条是 Pi 在生成项目上实测复现过的阻断（Redis 计数丢失 → 旧会话复活；
+// MySQL 已改、Redis 吊销写失败恢复后旧 Token 仍可用）的结构性兜底：
+// 行为由生成项目的单测覆盖，但「两步在一个事务里」只能在源码结构上断言
+// —— 不接数据库的单测无法观察事务边界，这个限制是明确的。
+func assertSessionRevocationWiring(t *testing.T, outDir string) {
+	t.Helper()
+
+	backend := filepath.Join(outDir, "backend")
+
+	// 1. 底座列：NOT NULL DEFAULT 1（0 不是合法版本，用来表示「查不到用户」）
+	sql := readFile(t, filepath.Join(outDir, "scripts", "sql", "init.sql"))
+	authVersionCol := regexp.MustCompile("`auth_version`\\s+BIGINT UNSIGNED NOT NULL DEFAULT 1")
+	if !authVersionCol.MatchString(sql) {
+		t.Error("admin_users 缺少 `auth_version` BIGINT UNSIGNED NOT NULL DEFAULT 1：吊销标记必须在库里，Redis 丢了会让旧会话复活")
+	}
+	if !strings.Contains(sql, "`user_source`, `auth_version`") {
+		t.Error("初始管理员的 INSERT 未写入 auth_version：首次登录会因版本非法被拒")
+	}
+
+	// 2. 模型字段不能序列化给前端（认证内部状态）
+	user := readFile(t, filepath.Join(backend, "app", "model", "admin_user.go"))
+	if !regexp.MustCompile(`AuthVersion\s+int64\s+` + "`" + `json:"-"`).MatchString(user) {
+		t.Error("model.AdminUser.AuthVersion 必须存在且 json:\"-\"（不下发给前端）")
+	}
+
+	// 3. 会话存储里不能再有「版本缺失就回退成 0 继续用」的路径
+	store := readFile(t, filepath.Join(backend, "app", "helper", "store", "auth_redis_store.go"))
+	for _, forbidden := range []string{"InvalidateUserSessions", "sessionEpochKeyPrefix", "CurrentEpoch"} {
+		if strings.Contains(store, forbidden) {
+			t.Errorf("auth_redis_store.go 仍残留 Redis 计数吊销的 %s：计数被淘汰后已吊销会话会复活", forbidden)
+		}
+	}
+	if !strings.Contains(store, "AuthVersionResolver") {
+		t.Error("auth_redis_store.go 应通过 AuthVersionResolver 读数据库里的权威版本")
+	}
+
+	// 4. 凭证/状态变更与版本自增同事务：每个吊销点都要落在 RunInTx 的闭包里
+	for _, tc := range []struct {
+		file string
+		fn   string
+	}{
+		{filepath.Join("app", "service", "auth_service.go"), "func (s *AuthService) ChangePassword("},
+		// 管理员重置他人密码的唯一入口（原来在 AuthService.UpdateUserPassword，
+		// 那个无操作人、无目标账号保护的函数已删除）
+		{filepath.Join("app", "service", "user_service.go"), "func (s *AdminUserService) UpdateUser("},
+		{filepath.Join("app", "service", "user_service.go"), "func (s *AdminUserService) UpdateUserStatus("},
+	} {
+		body := funcBody(readFile(t, filepath.Join(backend, tc.file)), tc.fn)
+		if body == "" {
+			t.Errorf("%s 找不到 %s", tc.file, tc.fn)
+			continue
+		}
+		if !strings.Contains(body, "s.store.RunInTx(") {
+			t.Errorf("%s%s 必须在 RunInTx 内完成变更：分两次写会留下「已改凭证、未吊销」的窗口", tc.file, tc.fn)
+		}
+		if !strings.Contains(body, "BumpAuthVersion(") {
+			t.Errorf("%s%s 未自增认证版本：已签发的 Token 不会失效", tc.file, tc.fn)
+		}
+		if strings.Contains(body, "authStore") {
+			t.Errorf("%s%s 仍在用 Redis 侧吊销（authStore）", tc.file, tc.fn)
+		}
+	}
+
+	// 5. 登录必须把「校验凭证那一刻的版本」交给签发侧，签发侧不许自己现读
+	login := funcBody(readFile(t, filepath.Join(backend, "app", "service", "auth_service.go")),
+		"func (s *AuthService) PasswordLogin(")
+	if !strings.Contains(login, "s.store.RunInTx(") {
+		t.Error("PasswordLogin 必须在同一事务（同一快照）内校验凭证并读取认证版本")
+	}
+	if !strings.Contains(login, "u.AuthVersion <= 0") {
+		t.Error("PasswordLogin 读到非法认证版本时必须拒绝登录（fail closed）")
+	}
+
+	// 新建用户必须显式带上初始版本，否则 0 会被当成「查不到用户」，一登录就被拒
+	addUser := funcBody(readFile(t, filepath.Join(backend, "app", "service", "user_service.go")),
+		"func (s *AdminUserService) AddUser(")
+	if !strings.Contains(addUser, "AuthVersion: 1") {
+		t.Error("AddUser 应显式设置 AuthVersion: 1，不要依赖列默认值")
+	}
+
+	jwt := readFile(t, filepath.Join(backend, "app", "middleware", "jwt.go"))
+	if !strings.Contains(jwt, "func GenerateJWTToken(uid, username string, authVersion int64)") {
+		t.Error("GenerateJWTToken 必须由调用方传入 authVersion，不能自己现读当前版本")
+	}
+	rotate := funcBody(jwt, "func rotateSession(")
+	if rotate == "" {
+		t.Fatal("jwt.go 找不到 rotateSession")
+	}
+	// 刷新必须沿用 ValidateSession 返回的旧版本；现读当前版本会让刷新
+	// 变成绕过改密/禁用吊销的后门。
+	if !strings.Contains(rotate, "RegisterSession(userID, newJTI, ttl, authVersion)") {
+		t.Error("rotateSession 必须以旧会话校验时拿到的版本登记新会话")
+	}
+	if strings.Contains(rotate, "CurrentAuthVersion") {
+		t.Error("rotateSession 不得重新读取当前认证版本")
+	}
+
+	// 6. 权威来源要在启动时注入；没注入时会话校验 fail closed，所以必须有这步
+	main := readFile(t, filepath.Join(backend, "bin", "main.go"))
+	if !strings.Contains(main, "SetAuthVersionResolver(app.Core.Store.User())") {
+		t.Error("main.go 未注入认证版本权威来源：会话校验会全量 fail closed")
+	}
+}
+
+// assertUserManageGuardWiring 目标账号保护的布线契约：
+// 有 user/update、update-status、delete 接口权限不等于可以动超管账号。
+//
+// 这里只断结构（判定是否在写之前、是否在同一事务里、handler 是否把 JWT 操作人传下去）；
+// 行为由生成项目里的 app/controller/user_admin_guard_test.go 用 sqlmock 在**真实调用链**
+// 上验证「拒绝时零写入」，两者缺一不可：
+// 原来的漏洞恰恰是「纯守卫单测全绿，但守卫排在三次独立提交的最后一步」。
+func assertUserManageGuardWiring(t *testing.T, outDir string) {
+	t.Helper()
+
+	backend := filepath.Join(outDir, "backend")
+
+	// 1. 统一守卫存在，且操作人/目标事实都在锁定之后当前读
+	guard := readFile(t, filepath.Join(backend, "app", "service", "user_guard.go"))
+	for _, want := range []string{
+		"func guardUserWrite(ctx context.Context, tx *repo.Tx, operatorID, targetID uint64) (*userWriteGuard, error)",
+		"func CheckTargetUserManageable(operatorIsSuperAdmin bool, targetFacts []RoleFact) error",
+		"func lockUserRowsAscending(ctx context.Context, tx *repo.Tx, userIDs ...uint64)",
+		"func sortedUniqueUserIDs(userIDs []uint64) []uint64",
+		"func lockSelfUserRow(ctx context.Context, tx *repo.Tx, userID uint64) error",
+		"func currentUserRoles(ctx context.Context, tx *repo.Tx, userID uint64)",
+	} {
+		if !strings.Contains(guard, want) {
+			t.Errorf("user_guard.go 缺少 %s", want)
+		}
+	}
+
+	// 1b. 身份锁协议的顺序：先锁稳定用户行，再当前读身份。
+	// 反过来（先读身份再锁）等于判定依据仍是加锁前那份事实，锁加得再对也没用。
+	guardBody := funcBody(guard, "func guardUserWrite(")
+	if guardBody == "" {
+		t.Error("user_guard.go 找不到 guardUserWrite 函数体")
+	} else {
+		lockAt := strings.Index(guardBody, "lockUserRowsAscending(ctx, tx,")
+		readAt := strings.Index(guardBody, "currentUserRoles(ctx, tx,")
+		switch {
+		case lockAt < 0:
+			t.Error("guardUserWrite 未调用 lockUserRowsAscending：没有锁住稳定用户行，并发改身份挡不住")
+		case readAt < 0:
+			t.Error("guardUserWrite 未调用 currentUserRoles：身份读不是加锁当前读，拿到的是事务快照")
+		case readAt < lockAt:
+			t.Error("guardUserWrite 在加锁之前就读了身份：判定依据仍是加锁前的旧事实")
+		}
+	}
+	// 目标用户行必须由锁定读提供，不能再出现「锁前先普通读一遍目标」——
+	// 那条普通读会成为事务第一条 SELECT，在 REPEATABLE READ 下就此钉死快照。
+	if !strings.Contains(guard, "tx.User().LockByUserID(") {
+		t.Error("lockUserRowsAscending 未走 LockByUserID：用户行没有被 FOR UPDATE 锁住")
+	}
+
+	// 1c. 仓储层：加锁读必须真的渲染出 FOR UPDATE / FOR SHARE，
+	// 并且角色关联的整体替换按 user_id 条件删（逐行按主键删会漏掉快照外新增的行）。
+	base := readFile(t, filepath.Join(backend, "app", "repo", "base.go"))
+	for _, want := range []string{"clause.Locking", "lockForUpdate = \"UPDATE\"", "lockForShare  = \"SHARE\""} {
+		if !strings.Contains(base, want) {
+			t.Errorf("repo/base.go 缺少 %s：加锁当前读没有落到 SQL 上", want)
+		}
+	}
+	userRepo := readFile(t, filepath.Join(backend, "app", "repo", "admin_user_repo.go"))
+	if !strings.Contains(userRepo, "firstLocking(ctx, lockForUpdate") {
+		t.Error("admin_user_repo.go 的 LockByUserID 不是排他锁当前读")
+	}
+	userRoleRepo := readFile(t, filepath.Join(backend, "app", "repo", "admin_user_role_repo.go"))
+	for _, want := range []string{
+		"findLocking(ctx, lockForUpdate",
+		"func (r *AdminUserRoleRepository) DeleteByUserID(",
+		"Where(\"user_id = ?\", userID).Delete(",
+	} {
+		if !strings.Contains(userRoleRepo, want) {
+			t.Errorf("admin_user_role_repo.go 缺少 %s", want)
+		}
+	}
+	roleRepo := readFile(t, filepath.Join(backend, "app", "repo", "admin_role_repo.go"))
+	if !strings.Contains(roleRepo, "firstLocking(ctx, lockForShare") {
+		t.Error("admin_role_repo.go 缺少共享锁当前读：角色事实读的是事务快照")
+	}
+
+	// 2. 每个「写用户」的入口都必须：在 RunInTx 内、且 guardUserWrite 排在任何写入之前
+	for _, tc := range []struct {
+		file   string
+		fn     string
+		writes []string
+	}{
+		{
+			file:   filepath.Join("app", "service", "user_service.go"),
+			fn:     "func (s *AdminUserService) UpdateUser(",
+			writes: []string{"UpdateByID(", "SyncPassword(", "replaceUserRolesTx("},
+		},
+		{
+			file:   filepath.Join("app", "service", "user_service.go"),
+			fn:     "func (s *AdminUserService) UpdateUserStatus(",
+			writes: []string{"UpdateByID("},
+		},
+		{
+			file:   filepath.Join("app", "service", "role_service.go"),
+			fn:     "func (s *AdminRoleService) UpdateUserRoles(",
+			writes: []string{"replaceUserRolesTx("},
+		},
+	} {
+		body := funcBody(readFile(t, filepath.Join(backend, tc.file)), tc.fn)
+		if body == "" {
+			t.Errorf("%s 找不到 %s", tc.file, tc.fn)
+			continue
+		}
+		if !strings.Contains(body, "s.store.RunInTx(") {
+			t.Errorf("%s%s 必须在 RunInTx 内完成：判定与写入不同事务时，判定完成后目标仍可能被授予超管", tc.file, tc.fn)
+		}
+		guardAt := strings.Index(body, "guardUserWrite(ctx, tx,")
+		if guardAt < 0 {
+			t.Errorf("%s%s 未调用 guardUserWrite：非超管可借接口权限改超管账号", tc.file, tc.fn)
+			continue
+		}
+		for _, write := range tc.writes {
+			writeAt := strings.Index(body, write)
+			if writeAt < 0 {
+				continue
+			}
+			if writeAt < guardAt {
+				t.Errorf("%s%s 的 %s 排在 guardUserWrite 之前：拒绝时会留下已写入的半成功状态", tc.file, tc.fn, write)
+			}
+		}
+	}
+
+	// 3. 删除走同一条带守卫的路径，不另开一条绕过判定的写入
+	del := funcBody(readFile(t, filepath.Join(backend, "app", "service", "user_service.go")),
+		"func (s *AdminUserService) DeleteUser(")
+	if !strings.Contains(del, "s.UpdateUserStatus(ctx, operatorID,") {
+		t.Error("DeleteUser 应复用带守卫的 UpdateUserStatus，不要自己直接写库")
+	}
+
+	// 3b. 角色关联的整体替换与入参角色校验都要走锁协议的那套读写
+	roleSvc := readFile(t, filepath.Join(backend, "app", "service", "role_service.go"))
+	replace := funcBody(roleSvc, "func replaceUserRolesTx(")
+	if replace == "" {
+		t.Error("role_service.go 找不到 replaceUserRolesTx")
+	} else {
+		if !strings.Contains(replace, "tx.UserRole().DeleteByUserID(ctx, userID)") {
+			t.Error("replaceUserRolesTx 未按 user_id 条件删除：逐行按快照主键删会漏掉并发新增的关联行，" +
+				"替换完会多出一个本次没打算赋的角色")
+		}
+		if strings.Contains(replace, "FindByUserID(") {
+			t.Error("replaceUserRolesTx 仍先查关联行再删：那是按快照主键删的写法")
+		}
+	}
+	roleFacts := funcBody(roleSvc, "func txRoleFactsByIDs(")
+	if roleFacts == "" {
+		t.Error("role_service.go 找不到 txRoleFactsByIDs")
+	} else {
+		if !strings.Contains(roleFacts, "FindByRoleIDAnyStatusForShare(") {
+			t.Error("txRoleFactsByIDs 读角色事实没有用「共享锁当前读 + 不过滤 status」：" +
+				"用快照读会按旧角色事实放行；按 status 过滤则会把「目标已持有、后来被禁用的角色」" +
+				"当成角色不存在，编辑一次资料就整笔失败")
+		}
+		if strings.Contains(roleFacts, "FindByRoleIDForShare(") {
+			t.Error("txRoleFactsByIDs 仍用只查启用角色的 FindByRoleIDForShare：" +
+				"状态策略应交给 CheckRoleStatusAssignable 判定，不要在查询里悄悄过滤")
+		}
+	}
+
+	// 3c. 资料编辑的角色更新语义：缺失/null = 不改，显式 [] = 清空；
+	// 禁用角色已持有可保留、新增必须拒绝。
+	userDTO := readFile(t, filepath.Join(backend, "app", "dto", "user_dto.go"))
+	provided := funcBody(userDTO, "func (r *UpdateUserRequest) RolesProvided()")
+	if provided == "" {
+		t.Error("user_dto.go 缺少 RolesProvided：无法区分「role_ids 字段缺失」与「显式空数组」")
+	} else {
+		if !strings.Contains(provided, "r.RoleIDs != nil") {
+			t.Error("RolesProvided 不是按切片 nil 性判断：缺失/null 解码后是 nil 切片，`[]` 是非 nil 空切片，" +
+				"只有 nil 性能把两者分开")
+		}
+		if strings.Contains(provided, "len(") {
+			t.Error("RolesProvided 用了长度判断：len(RoleIDs) == 0 把「没传」和「显式清空」混成一种，" +
+				"于是「只改昵称」的保存会把角色关联全删掉")
+		}
+	}
+	updateUser := funcBody(readFile(t, filepath.Join(backend, "app", "service", "user_service.go")),
+		"func (s *AdminUserService) UpdateUser(")
+	if !strings.Contains(updateUser, "req.RolesProvided()") {
+		t.Error("UpdateUser 未按 RolesProvided 选择性更新角色：没传 role_ids 时会把关联全部删掉")
+	}
+	guardAt := strings.Index(updateUser, "guardUserWrite(ctx, tx,")
+	providedAt := strings.Index(updateUser, "req.RolesProvided()")
+	if guardAt >= 0 && providedAt >= 0 && providedAt < guardAt {
+		t.Error("UpdateUser 先看 role_ids 再做目标账号保护：不传 role_ids 就成了绕过账号保护的口子")
+	}
+	roleGuard := readFile(t, filepath.Join(backend, "app", "service", "role_guard.go"))
+	if !strings.Contains(roleGuard, "func CheckRoleStatusAssignable(") {
+		t.Error("role_guard.go 缺少 CheckRoleStatusAssignable：禁用角色的「可保留、不可新增」没有判定")
+	}
+	if !strings.Contains(roleGuard, "Status: role.Status") {
+		t.Error("RoleFact 没带上角色状态（RoleFactOf 未取 Status）：赋角判定看不到角色状态，" +
+			"只能回退到在查询里按 status 过滤")
+	}
+	for _, tc := range []struct {
+		file string
+		fn   string
+	}{
+		{filepath.Join("app", "service", "user_service.go"), "func (s *AdminUserService) UpdateUser("},
+		{filepath.Join("app", "service", "role_service.go"), "func (s *AdminRoleService) UpdateUserRoles("},
+	} {
+		body := funcBody(readFile(t, filepath.Join(backend, tc.file)), tc.fn)
+		if !strings.Contains(body, "CheckRoleStatusAssignable(") {
+			t.Errorf("%s%s 未校验角色状态：可以借编辑页把已禁用的角色挂到新账号上", tc.file, tc.fn)
+		}
+	}
+	// 编辑页的角色事实必须以库里的关联表为准：只列启用角色时，持有中的禁用角色
+	// 回显不出来，整体替换就把这条关联顺手删了。
+	userRolesDetail := funcBody(roleSvc, "func (s *AdminRoleService) GetUserRolesAndPermissions(")
+	if !strings.Contains(userRolesDetail, "FindByRoleIDAnyStatus(") {
+		t.Error("GetUserRolesAndPermissions 没有补查「持有中但不在启用列表里」的角色：" +
+			"编辑页丢掉这条关联，保存资料时会静默撤销该角色")
+	}
+
+	// 3d. 赋角路由只有 /admin/role/assign 一个：文档/注释里写成 /admin/user/assign-roles
+	// 会让后续评审按一份不存在的入口清单核对覆盖面。
+	assertNoMatch(t, outDir, "assign-roles")
+
+	// 3d'. 菜单/按钮下发的真实路径是 /admin/user/menus-buttons（handler 在
+	// RoleController 上，但路由注册在 /admin/user 前缀的 userBaseChain 里）。
+	// 写成 /admin/role/menus-buttons 会让评审按一条不存在的路径去核对
+	// 「这个接口挂没挂接口权限」，而这两个前缀的中间件链恰好不一样。
+	assertNoMatch(t, outDir, "/admin/role/menus-buttons")
+
+	// 3e. 禁用角色不贡献权限：过滤只能落在那条**有效权限**联表查询上。
+	//
+	// 这是全项目非超管「实际被授权了哪些接口/菜单/按钮」的唯一**授权**出口：
+	// 接口权限校验（helper/permission.Checker）和菜单、按钮下发都从它取数。
+	// （菜单树的祖先节点另有一次按 parent_id 的补查，那只补结构、只为已授权的后代
+	// 发生、且祖先必须启用 —— 见 GetUserMenusAndButtons 的说明，不是第二条授权路径。）
+	// 原实现只有 ur→rp→p 三张表、只过滤 p.status，于是角色被禁用后持有它的人
+	// 照样能调接口、照样看得见菜单 —— 「禁用角色」只是在角色列表里灰了一下。
+	userPerms := funcBody(userRoleRepo, "func (r *AdminUserRoleRepository) FindUserPermissions(")
+	if userPerms == "" {
+		t.Error("admin_user_role_repo.go 找不到 FindUserPermissions")
+	} else {
+		for _, tc := range []struct {
+			fragment string
+			why      string
+		}{
+			{`Joins("JOIN admin_roles r ON r.role_id = ur.role_id")`,
+				"没联角色表就无从过滤角色状态：禁用角色会继续贡献权限"},
+			{"r.status = 1", "被禁用的角色必须不贡献任何接口/菜单/按钮权限"},
+			{"p.status = 1", "权限行自身禁用不生效（原有语义，不能顺手删掉）"},
+			{"DISTINCT", "多角色并集要去重"},
+		} {
+			if !strings.Contains(userPerms, tc.fragment) {
+				t.Errorf("FindUserPermissions 缺少 %s：%s", tc.fragment, tc.why)
+			}
+		}
+	}
+	// 配对的另一半：角色**关联**读不过滤状态，否则禁用角色启用后恢复不了、
+	// 编辑页也回显不出这条关联，一次「改昵称」的整体替换就把它删了。
+	assocRead := funcBody(userRoleRepo, "func (r *AdminUserRoleRepository) FindByUserID(")
+	if strings.Contains(assocRead, "status") {
+		t.Error("FindByUserID 按角色状态过滤了关联：禁用角色的关联会在保存资料时被静默删掉，" +
+			"启用后也恢复不了。过滤属于 FindUserPermissions 那条有效权限查询")
+	}
+	// 「有没有超管权力」必须要求角色启用中，与「目标账号是否受保护」（刻意不看状态）相反
+	isSuper := funcBody(roleSvc, "func (s *AdminRoleService) IsUserSuperAdmin(")
+	if !strings.Contains(isSuper, "role.Status == constants.RoleStatusEnabled") {
+		t.Error("IsUserSuperAdmin 未要求 super_admin 角色启用中：给权力的判定要和 FindUserPermissions " +
+			"过滤禁用角色同一口径")
+	}
+	// 菜单与按钮的**授权**来源只能是那个唯一出口，不能另起一条从关联表自己拼权限的路
+	// （祖先补查走 permissionRepo.FindByPermissionID，只补结构、不扩授权，不在此禁之列）
+	menus := funcBody(roleSvc, "func (s *AdminRoleService) GetUserMenusAndButtons(")
+	if !strings.Contains(menus, "s.GetUserAllPermissions(ctx, userID)") {
+		t.Error("GetUserMenusAndButtons 非超管分支未走 GetUserAllPermissions：过滤条件会分叉，" +
+			"出现「接口不通了但菜单还在」这类半截效果")
+	}
+	if strings.Contains(menus, "FindByRoleID(") || strings.Contains(menus, "rolePermissionRepo") {
+		t.Error("GetUserMenusAndButtons 自己从角色权限关联拼权限：绕过了角色状态过滤")
+	}
+	checker := funcBody(readFile(t, filepath.Join(backend, "app", "helper", "permission", "checker.go")),
+		"func (c *Checker) CheckAPIPermission(")
+	if !strings.Contains(checker, "c.roleService.GetUserAllPermissions(ctx, userID)") {
+		t.Error("CheckAPIPermission 未走 GetUserAllPermissions：接口权限会绕过角色状态过滤")
+	}
+
+	// 4. 无操作人、无目标保护的覆盖式重置他人密码入口必须已删除
+	auth := readFile(t, filepath.Join(backend, "app", "service", "auth_service.go"))
+	if strings.Contains(auth, "func (s *AuthService) UpdateUserPassword(") {
+		t.Error("AuthService.UpdateUserPassword 仍存在：它不认操作人、不做目标账号保护，是重置超管密码的旁路")
+	}
+
+	// 4b. 自助改密必须按同一个加锁顺序开头（先用户行、再凭证行）。
+	// 管理员重置密码是「锁 admin_users → 改 admin_user_logins → 自增 auth_version」，
+	// 自助改密若反过来，两条路径在同一账号上并发就是一对相反锁序，互等成死锁。
+	changePwd := funcBody(auth, "func (s *AuthService) ChangePassword(")
+	if changePwd == "" {
+		t.Error("auth_service.go 找不到 ChangePassword")
+	} else {
+		lockAt := strings.Index(changePwd, "lockSelfUserRow(ctx, tx,")
+		readAt := strings.Index(changePwd, "tx.UserLogin()")
+		switch {
+		case lockAt < 0:
+			t.Error("ChangePassword 未先锁本人用户行：与管理员重置密码形成相反加锁顺序，并发会死锁")
+		case readAt >= 0 && readAt < lockAt:
+			t.Error("ChangePassword 先碰凭证行再锁用户行：加锁顺序与管理员重置密码相反")
+		}
+	}
+
+	// 5. handler 必须从 JWT 取操作人并传给 service（请求体里给不了），
+	//    且用 FailByError 把 ErrForbidden 映射成 403
+	ctrl := readFile(t, filepath.Join(backend, "app", "controller", "user_controller.go"))
+	for _, tc := range []struct {
+		fn   string
+		call string
+	}{
+		{"func (c *UserController) UpdateUser(", "c.UserService.UpdateUser(r.Context(), operatorID, &req)"},
+		{"func (c *UserController) UpdateUserStatus(", "c.UserService.UpdateUserStatus(r.Context(), operatorID, req.UserID, req.Status)"},
+		{"func (c *UserController) DeleteUser(", "c.UserService.DeleteUser(r.Context(), operatorID, req.UserID)"},
+	} {
+		body := funcBody(ctrl, tc.fn)
+		if body == "" {
+			t.Errorf("user_controller.go 找不到 %s", tc.fn)
+			continue
+		}
+		if !strings.Contains(body, "middleware.CurrentUserIDFromJWT(r)") {
+			t.Errorf("%s 未从 JWT 取操作人", tc.fn)
+		}
+		if !strings.Contains(body, tc.call) {
+			t.Errorf("%s 未把操作人传给 service（应为 %s）", tc.fn, tc.call)
+		}
+		if !strings.Contains(body, "FailByError(w, err)") {
+			t.Errorf("%s 应用 FailByError 返回 403，否则拒绝会被当成 500", tc.fn)
+		}
+	}
+
+	// 6. 真实调用链的行为回归必须在场（纯守卫单测无法发现「守卫排在写之后」）
+	regression := readFile(t, filepath.Join(backend, "app", "controller", "user_admin_guard_test.go"))
+	for _, want := range []string{
+		"repo.NewStoreWithDB(db)",
+		"c.UpdateUser(rec, jwtRequest(",
+		"mock.ExpectationsWereMet()",
+		"TestUpdateUser_NonSuperAdminCannotWriteSuperAdminAccount",
+		"TestUpdateUser_IdentityQueryErrorFailsClosed",
+		"TestUpdateUser_SuperAdminManagesOrdinaryUser",
+		"TestDeleteUser_NonSuperAdminCannotDeleteSuperAdmin",
+		// 身份锁协议：锁序、同一 ID 只锁一次、用户行缺失 fail closed、
+		// 以及零角色账号的首次赋角色（锁锚在用户行上才覆盖得到）
+		"TestUpdateUser_LocksUserRowsInAscendingOrder",
+		"TestUpdateUser_SameUserLockedOnce",
+		"TestUpdateUser_MissingUserRowFailsClosed",
+		"TestUpdateUserRoles_FirstAssignmentToRolelessTarget",
+		"TestUpdateUserRoles_NonSuperAdminCannotGrantSuperAdmin",
+		"TestUpdateUserRoles_NonSuperAdminCannotRevokeSuperAdmin",
+		// role_ids 的选择性更新语义（缺失/null 不改、[] 清空）与禁用角色的
+		// 「可保留、不可新增」，都必须在 handler 的真实 JSON 解码上验证
+		"TestUpdateUser_RoleIDsSelectiveUpdate",
+		"TestUpdateUser_ResetPasswordWithoutRoleIDs",
+		"TestUpdateUser_KeepsHeldDisabledRole",
+		"TestUpdateUser_RejectsNewlyAddedDisabledRole",
+		// 已持有的禁用角色要能被**明确移除**：只放行「保留」而不放行「取消」，
+		// 等于禁用角色一旦挂上就摘不掉
+		"TestUpdateUser_RemovesHeldDisabledRole",
+		"TestGetUserInfo_IncludesHeldDisabledRole",
+		// 缺失与 null 只能用原始 JSON 文本表达，结构体请求体表达不了
+		"json.RawMessage(body)",
+		`"role_ids":null`,
+		`"role_ids":[]`,
+		// 期望里必须要求加锁子句，否则快照读也能过
+		"FOR UPDATE",
+		"FOR SHARE",
+	} {
+		if !strings.Contains(regression, want) {
+			t.Errorf("user_admin_guard_test.go 缺少 %s", want)
+		}
+	}
+
+	// 6b. 加锁 SQL 的形状回归（MySQL dialector + DryRun，不用 SQLite 冒充）
+	lockSQL := readFile(t, filepath.Join(backend, "app", "repo", "identity_lock_sql_test.go"))
+	for _, want := range []string{
+		"TestIdentityLockSQL_LockingReadsCarryLockClause",
+		"TestIdentityLockSQL_LockStrengthsAreNotInterchangeable",
+		"TestIdentityLockSQL_PlainReadsStayUnlocked",
+		"TestIdentityLockSQL_DeleteRolesByUserIDCondition",
+		"newDryRunDB(t)",
+	} {
+		if !strings.Contains(lockSQL, want) {
+			t.Errorf("identity_lock_sql_test.go 缺少 %s", want)
+		}
+	}
+	if strings.Contains(lockSQL, "sqlite") {
+		t.Error("加锁 SQL 测试不得用 SQLite：它没有 FOR UPDATE / FOR SHARE，等于什么都没测")
+	}
+
+	// 6d. 禁用角色不贡献权限的行为回归：
+	// 语句形状（repo，MySQL dialector + DryRun）+ 真实调用链（接口中间件、菜单/按钮 handler）。
+	//
+	// 两层都要在场：只有 SQL 形状测试证不了「调用链真的走这条查询」，
+	// 只有调用链测试又证不了「执行到库的语句带着过滤」——
+	// 喂几行假数据回来，实现过不过滤都能拼出一样的响应。
+	permSQL := readFile(t, filepath.Join(backend, "app", "repo", "user_permission_sql_test.go"))
+	for _, want := range []string{
+		"TestUserPermissionSQL_DisabledRolesContributeNothing",
+		"TestUserPermissionSQL_AssociationReadKeepsDisabledRoles",
+		"newDryRunDB(t)",
+		"r.status = 1",
+		"p.status = 1",
+	} {
+		if !strings.Contains(permSQL, want) {
+			t.Errorf("user_permission_sql_test.go 缺少 %s", want)
+		}
+	}
+	permScope := readFile(t, filepath.Join(backend, "app", "controller", "user_permission_scope_test.go"))
+	for _, want := range []string{
+		"TestAPIPermissionMiddleware_OnlyEnabledRolesGrantAccess",
+		"TestAPIPermissionMiddleware_IdentityQueryErrorFailsClosed",
+		"TestAPIPermissionMiddleware_PermissionQueryErrorFailsClosed",
+		"TestMenusButtons_OnlyEnabledRolesContribute",
+		// parent_id != 0 的嵌套菜单：祖先补查只为已授权后代发生，且祖先必须启用
+		"TestMenusButtons_AncestorBackfillOnlyForAuthorizedDescendants",
+		// 跑的是真的中间件 + 真的 Checker，不是直接调 service
+		"middleware.PermissionMiddleware()",
+		"permission.NewChecker(",
+		"c.MenusButtons(rec, jwtRequest(",
+		// 期望正则必须要求角色状态过滤：去掉 r.status = 1 就匹配不上
+		`JOIN admin_roles r ON r\.role_id = ur\.role_id`,
+		`AND r\.status = 1 AND p\.status = 1`,
+	} {
+		if !strings.Contains(permScope, want) {
+			t.Errorf("user_permission_scope_test.go 缺少 %s", want)
+		}
+	}
+	// 禁用角色的「保留 / 取消 / 新增拒绝」纯判定也要有单测兜底（超管无豁免口）
+	roleGuardUnit := readFile(t, filepath.Join(backend, "app", "service", "role_guard_test.go"))
+	for _, want := range []string{
+		"TestCheckRoleStatusAssignable",
+		"TestCheckRoleStatusAssignable_NoSuperAdminExemption",
+	} {
+		if !strings.Contains(roleGuardUnit, want) {
+			t.Errorf("role_guard_test.go 缺少 %s", want)
+		}
+	}
+
+	// 6c. 固定锁序的纯单测（去重、丢 0、升序）
+	guardUnit := readFile(t, filepath.Join(backend, "app", "service", "user_guard_test.go"))
+	if !strings.Contains(guardUnit, "TestSortedUniqueUserIDs") {
+		t.Error("user_guard_test.go 缺少 TestSortedUniqueUserIDs：固定锁序没有单测兜底")
+	}
+
+	// 7. 个人中心入口：复用已有 profile 路由，键盘可达（原生 button），不新增页面
+	home := readFile(t, filepath.Join(outDir, "frontend", "src", "views", "home", "index.vue"))
+	if !strings.Contains(home, "<button type=\"button\" class=\"user-entry\"") {
+		t.Error("顶栏个人中心入口应是原生 button（Tab 可聚焦、Enter/Space 可触发），不要给 div 挂 click")
+	}
+	if !strings.Contains(home, "router.push({ name: 'profile' })") {
+		t.Error("顶栏入口未跳转到已有的 profile 路由")
+	}
+	router := readFile(t, filepath.Join(outDir, "frontend", "src", "router", "index.ts"))
+	if !strings.Contains(router, "name: 'profile'") {
+		t.Error("前端路由缺少 profile 路由：顶栏入口会跳到死链接")
+	}
+
+	// 8. 用户编辑页：持有中的禁用角色要回显并可保留，但不能新增；
+	// 角色列表不能只拉启用角色，否则这条关联在页面上根本不存在。
+	edit := readFile(t, filepath.Join(outDir, "frontend", "src", "views", "user", "edit.vue"))
+	for _, want := range []string{
+		"heldRoleIds",
+		"function roleSelectable(",
+		":disabled=\"!roleSelectable(role)\"",
+		"status: QUERY_ALL",
+	} {
+		if !strings.Contains(edit, want) {
+			t.Errorf("user/edit.vue 缺少 %s：禁用角色要么丢关联、要么能被新增", want)
+		}
+	}
+	userTypes := readFile(t, filepath.Join(outDir, "frontend", "src", "types", "user.ts"))
+	if !strings.Contains(userTypes, "role_ids?: number[]") {
+		t.Error("UpdateUserRequest.role_ids 不是可选字段：前端表达不了「本次不改角色」，" +
+			"只能被迫传 [] 而把角色全撤销")
+	}
+}
+
+// 登录签发 / 刷新 / 解析 Token 都直接用 http.jwt.secret，那个开关只关掉
+// 请求侧的鉴权中间件，关不掉签名功能。
+func assertStartupSelfCheckWiring(t *testing.T, outDir string) {
+	t.Helper()
+
+	backend := filepath.Join(outDir, "backend")
+	check := funcBody(readFile(t, filepath.Join(backend, "app", "bootstrap.go")), "func checkSecurityConfig(")
+	if check == "" {
+		t.Fatal("bootstrap.go 找不到 checkSecurityConfig")
+	}
+	if strings.Contains(check, "http.jwt.enabled") {
+		t.Error("checkSecurityConfig 不得读 http.jwt.enabled：enabled=false 时签名功能仍在用密钥")
+	}
+	if !strings.Contains(check, "helper.ValidateStartupSecurity(") {
+		t.Error("checkSecurityConfig 应调用 helper.ValidateStartupSecurity 做无条件自检")
+	}
+
+	startup := readFile(t, filepath.Join(backend, "app", "helper", "startup_check.go"))
+	if !strings.Contains(startup, "func ValidateStartupSecurity(getString func(key string) string) error") {
+		t.Error("helper 缺少可测的 ValidateStartupSecurity(getString) 契约入口")
+	}
+}
+
+// assertNoDeadRegisterFlow 未路由的自助注册流程（T1 已要求删除）不得残留：
+// 它是一条没人走、也没人审计的建号路径。
+// assertLoginAuditStatus 登录审计状态的持久化契约：
+// 登录失败必须以 login_status=0 落库。model 上一旦出现 gorm default，GORM 就会把
+// 零值（失败）当成「未赋值」并用默认值替换，于是失败被记成成功、接口却照常返回 401，
+// 真实环境里曾出现「12 条带失败原因的日志全是成功」。
+func assertLoginAuditStatus(t *testing.T, outDir string) {
+	t.Helper()
+
+	backend := filepath.Join(outDir, "backend")
+
+	// 1. model 的 login_status 不得带任何 gorm 默认值
+	modelSrc := readFile(t, filepath.Join(backend, "app", "model", "admin_user_login_log.go"))
+	m := loginStatusTagPattern.FindStringSubmatch(modelSrc)
+	if m == nil {
+		t.Fatal("admin_user_login_log.go 里找不到 LoginStatus int8 字段定义")
+	}
+	if strings.Contains(m[1], "default:") {
+		t.Errorf("LoginStatus 的 gorm tag 带了默认值（%s）：登录失败的 0 会被替换，审计日志失真", m[1])
+	}
+
+	// 2. 建表默认值不能是 1（正常走不到，走到了也不该把失败记成成功）
+	initSQL := readFile(t, filepath.Join(outDir, "scripts", "sql", "init.sql"))
+	d := loginStatusDDLPattern.FindStringSubmatch(initSQL)
+	if d == nil {
+		t.Fatal("init.sql 里找不到 admin_user_login_logs.login_status 的列定义")
+	}
+	if d[1] != "0" {
+		t.Errorf("init.sql 的 login_status 默认值是 %s：漏写该列时会把失败记成成功，应为 0", d[1])
+	}
+
+	// 3. 写日志的那条路径必须原样透传 status，不做零值兜底
+	svc := readFile(t, filepath.Join(backend, "app", "service", "login_log_service.go"))
+	if !strings.Contains(funcBody(svc, "func newLoginLogRecord("), "LoginStatus:   status,") {
+		t.Error("newLoginLogRecord 没有把入参 status 原样写进 LoginStatus")
+	}
+	for _, forbidden := range []string{"if status == 0", "status = LoginStatusSuccess"} {
+		if strings.Contains(svc, forbidden) {
+			t.Errorf("login_log_service.go 里出现对状态的零值兜底 %q：失败状态会被改写", forbidden)
+		}
+	}
+
+	// 4. 必须存在真正跑 GORM Create 的回归测试（只查 tag 字符串拦不住这个缺陷）
+	regression := readFile(t, filepath.Join(backend, "app", "repo", "admin_user_login_log_repo_test.go"))
+	for _, must := range []string{
+		"DryRun",                               // 只构建 SQL、不连数据库
+		"mysql.New(",                           // 用真实 MySQL dialector，不用 SQLite 替身
+		"NewAdminUserLoginLogRepositoryWithDB", // 走真实仓储 Create，而不是直接调 gorm
+		`db.Callback().Create().After("gorm:create")`, // 断言的是真实构建出的语句
+		`cols["login_status"]`,
+	} {
+		if !strings.Contains(regression, must) {
+			t.Errorf("生成的登录日志回归测试缺少 %q：失败状态的落库路径没被真正覆盖", must)
+		}
+	}
+}
+
+// loginStatusTagPattern 取出 model 里 LoginStatus 字段的整条 struct tag。
+var loginStatusTagPattern = regexp.MustCompile("LoginStatus\\s+int8\\s+`([^`]*)`")
+
+// loginStatusDDLPattern 取出建表语句里 login_status 的默认值。
+var loginStatusDDLPattern = regexp.MustCompile("`login_status`\\s+TINYINT\\s+NOT NULL DEFAULT\\s+(\\S+)")
+
+func assertNoDeadRegisterFlow(t *testing.T, outDir string) {
+	t.Helper()
+
+	backend := filepath.Join(outDir, "backend")
+	for _, tc := range []struct {
+		file    string
+		needles []string
+	}{
+		{filepath.Join("app", "controller", "auth_controller.go"), []string{
+			"func (c *AuthController) Register(",
+			// controller 不得自己写一套 Token 提取优先级：登出必须吊销
+			// 「请求真正通过认证的那个 Token」
+			"func extractJWTTokenFromRequest(",
+		}},
+		{filepath.Join("app", "service", "auth_service.go"), []string{"func (s *AuthService) Register("}},
+		{filepath.Join("app", "dto", "auth_dto.go"), []string{"type RegisterRequest struct"}},
+	} {
+		content := readFile(t, filepath.Join(backend, tc.file))
+		for _, needle := range tc.needles {
+			if strings.Contains(content, needle) {
+				t.Errorf("%s 仍残留死代码 %q", tc.file, needle)
+			}
+		}
+	}
+
+	// 登出 / 刷新都必须复用中间件的提取顺序
+	auth := readFile(t, filepath.Join(backend, "app", "controller", "auth_controller.go"))
+	if strings.Count(auth, "middleware.GetJWTToken(r)") < 2 {
+		t.Error("Logout 与 RefreshToken 都应复用 middleware.GetJWTToken(r)")
+	}
+
+	if ts := readFile(t, filepath.Join(outDir, "frontend", "src", "types", "auth.ts")); strings.Contains(ts, "RegisterRequest") {
+		t.Error("frontend/src/types/auth.ts 仍残留 RegisterRequest 类型")
+	}
+
+	// 路由里本来就没挂注册接口，顺手钉住这个前提
+	if routes := readFile(t, filepath.Join(backend, "app", "routes", "routes.go")); strings.Contains(routes, "/register") {
+		t.Error("routes.go 出现 /register 路由：自助注册不在本底座范围内")
+	}
+}
+
+// assertSQLLogNoLeak GORM 日志不得把插值后的 SQL 或原始数据库错误写进日志文件。
+//
+// Pi 在生成项目上实测复现过：慢查询与错误分支会把带明文凭证字段的插值 SQL
+// 和原始错误一起落盘。行为由生成项目的 internal/taurus/daily_log_test.go
+// 覆盖（含合成敏感 marker），这里只钉住结构，防止改回去。
+func assertSQLLogNoLeak(t *testing.T, outDir string) {
+	t.Helper()
+
+	// 签名写全：下面要断言「函数体里不再出现原始 err」，参数列表不能混进来
+	const traceSig = "func (l *DailyGormLogger) Trace(ctx context.Context, begin time.Time, " +
+		"fc func() (sql string, rowsAffected int64), err error) {"
+	trace := funcBody(readFile(t, filepath.Join(outDir, "backend", "internal", "taurus", "daily_log.go")), traceSig)
+	if trace == "" {
+		t.Fatal("daily_log.go 找不到 gorm logger 的 Trace 实现")
+	}
+	// fc() 的第一个返回值是插值 SQL：只能用来取语句类型，不能进日志行
+	for _, line := range strings.Split(trace, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "sqlStr, rows := fc()" || trimmed == "verb := sqlVerb(sqlStr)" {
+			continue
+		}
+		if strings.Contains(trimmed, "sqlStr") {
+			t.Errorf("Trace 的 %q 引用了插值 SQL：语句原文不得进日志（会带出明文凭证等字段值）", trimmed)
+		}
+	}
+	// 原始错误同理：只允许判空和过分类函数，err.Error() 会把参数值带出来
+	sanitized := strings.NewReplacer("err != nil", "", "safeDBErrorClass(err)", "").Replace(trace)
+	if regexp.MustCompile(`\berr\b`).MatchString(sanitized) {
+		t.Error("Trace 除判空与 safeDBErrorClass 分类外不得再接触原始数据库错误")
+	}
+	if !strings.Contains(trace, "safeDBErrorClass(err)") {
+		t.Error("Trace 的错误分支应只输出 safeDBErrorClass(err) 这类错误分类")
+	}
+	// 排障信息要保住：耗时、行数、语句类型
+	for _, must := range []string{"[rows:%v]", "[op:%s]", "durationMillis(elapsed)"} {
+		if !strings.Contains(trace, must) {
+			t.Errorf("Trace 丢掉了排障信息 %q", must)
+		}
+	}
+}
+
+// funcBody 返回以 signature 开头的那个顶层函数的函数体（到行首 "}" 为止）。
+func funcBody(src, signature string) string {
+	i := strings.Index(src, signature)
+	if i < 0 {
+		return ""
+	}
+	rest := src[i+len(signature):]
+	end := strings.Index(rest, "\n}")
+	if end < 0 {
+		return ""
+	}
+	return rest[:end]
+}
+
+// blockAfter 返回 marker 之后到下一行 "\t}" 为止的内容（匹配顶层缩进的收尾花括号）。
+func blockAfter(src, marker string) string {
+	i := strings.Index(src, marker)
+	if i < 0 {
+		return ""
+	}
+	rest := src[i+len(marker):]
+	end := strings.Index(rest, "\n\t}")
+	if end < 0 {
+		return ""
+	}
+	return rest[:end]
+}
+
+// groupContaining 返回包含 needle 的那个 AddRouterGroup(...) 调用的源码片段。
+func groupContaining(src, needle string) string {
+	const marker = "taurus.Container.Http.AddRouterGroup(router.RouteGroup{"
+	for start := 0; ; {
+		i := strings.Index(src[start:], marker)
+		if i < 0 {
+			return ""
+		}
+		i += start
+		rest := src[i:]
+		end := strings.Index(rest, "\n\t})")
+		if end < 0 {
+			return ""
+		}
+		group := rest[:end]
+		if strings.Contains(group, needle) {
+			return group
+		}
+		start = i + end
 	}
 }
 
@@ -112,6 +1082,17 @@ func assertBaseline(t *testing.T, outDir, project string) {
 		if !strings.Contains(sql, p) {
 			t.Errorf("init.sql 缺少接口权限 path %s", p)
 		}
+	}
+
+	// 部门编码可空，但非空值仍受唯一约束。
+	// 两半缺一不可：不可空 → 第二个不填编码的部门撞唯一索引建不出来；
+	// 去掉唯一索引 → 修好了创建却丢了编码不重复的保证。
+	deptCodeCol := regexp.MustCompile("`dept_code`\\s+VARCHAR\\(50\\)\\s+NULL DEFAULT NULL")
+	if !deptCodeCol.MatchString(sql) {
+		t.Error("admin_depts.dept_code 应为 NULL DEFAULT NULL（可空），否则第二个空编码部门建不出来")
+	}
+	if !strings.Contains(sql, "UNIQUE KEY `uk_dept_code` (`dept_code`)") {
+		t.Error("admin_depts.dept_code 应保留 uk_dept_code 唯一约束")
 	}
 
 	// 模板占位必须全部被渲染掉
@@ -229,14 +1210,68 @@ func TestGenerate_RequiredComponentsAlwaysPresent(t *testing.T) {
 // TestPasswordHash 初始密码散列必须与生成项目 app/helper/crypto.go 的算法一致：
 // hex(sha256(password + salt))。
 func TestPasswordHash(t *testing.T) {
-	// 固定输入的期望值由同一算法手算确定，用于防止算法被悄悄改动
-	const salt = "0123456789abcdef0123456789abcdef"
-	got := passwordHash("Taurus@2026", salt)
+	// 合成口令 + 固定 salt 的已知答案（由同一算法独立算出），
+	// 算法被悄悄改掉时这里会直接失败。
+	const (
+		password = "SyntheticPw123"
+		salt     = "0123456789abcdef0123456789abcdef"
+		want     = "b51e612a3004a92f3910efa546772ac442efcf073cf78dc14d9599216dd1d916"
+	)
+	got := passwordHash(password, salt)
+	if got != want {
+		t.Fatalf("散列与已知答案不一致\n期望: %s\n实际: %s", want, got)
+	}
 	if len(got) != 64 {
 		t.Fatalf("散列长度应为 64 位 hex，实际 %d", len(got))
 	}
-	if got == passwordHash("Taurus@2026", "ffffffffffffffffffffffffffffffff") {
+	if got == passwordHash(password, "ffffffffffffffffffffffffffffffff") {
 		t.Fatal("不同 salt 应产生不同散列")
+	}
+}
+
+// TestRandomPassword 随机初始密码必须：每次不同、长度正确、
+// 只含字母数字且字母与数字都至少出现一次。
+//
+// 最后一条是硬约束：生成项目的 helper.ValidatePasswordStrength 要求
+// 6-20 位且字母数字齐全，初始密码过不了它自己的校验，用户首次改密就会被挡。
+func TestRandomPassword(t *testing.T) {
+	const length = 16
+	const rounds = 200
+
+	seen := make(map[string]bool, rounds)
+	for i := 0; i < rounds; i++ {
+		pw, err := randomPassword(length)
+		if err != nil {
+			t.Fatalf("生成随机密码失败: %v", err)
+		}
+		if len(pw) != length {
+			t.Fatalf("密码长度应为 %d，实际 %d", length, len(pw))
+		}
+		if seen[pw] {
+			t.Fatal("随机密码重复，熵不足或实现有误")
+		}
+		seen[pw] = true
+
+		hasLetter, hasDigit := false, false
+		for _, c := range pw {
+			switch {
+			case c >= '0' && c <= '9':
+				hasDigit = true
+			case (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'):
+				hasLetter = true
+			default:
+				t.Fatalf("密码含非字母数字字符: %q", c)
+			}
+		}
+		if !hasLetter || !hasDigit {
+			t.Fatal("密码必须同时包含字母和数字（生成项目的密码强度校验要求）")
+		}
+	}
+
+	for _, bad := range []int{0, 7, 21} {
+		if _, err := randomPassword(bad); err == nil {
+			t.Errorf("长度 %d 应被拒绝", bad)
+		}
 	}
 }
 
@@ -398,6 +1433,71 @@ func containsAll(s string, needles []string) bool {
 		}
 	}
 	return true
+}
+
+// assertDockerCrossPlatform Dockerfile 必须按 BuildKit 的目标平台编译，不能写死架构。
+// 固定 GOARCH=amd64 时镜像仍能 build 成功（Go 交叉编译），故障推迟到容器启动才暴露
+// （arm64 宿主上 exec format error），所以这里按文本钉死四条约束。
+func assertDockerCrossPlatform(t *testing.T, outDir string) {
+	t.Helper()
+
+	dockerfile := readFile(t, filepath.Join(outDir, "Dockerfile"))
+
+	// 1. 不得写死目标架构：这正是修复前的故障形态
+	if regexp.MustCompile(`GOARCH=(amd64|arm64|386|arm)\b`).MatchString(dockerfile) {
+		t.Error("Dockerfile 写死了 GOARCH：跨架构宿主上 build 会通过但容器启动即 exec format error")
+	}
+	// 同理也不能把 GOARCH 的默认值写成某个具体架构（${TARGETARCH:-amd64}）
+	if regexp.MustCompile(`TARGETARCH:[-=]\w`).MatchString(dockerfile) {
+		t.Error("Dockerfile 给 TARGETARCH 写了具体默认架构：BuildKit 被关掉时会悄悄编出错架构的二进制")
+	}
+
+	// 2. 后端编译阶段必须声明并使用 BuildKit 注入的目标平台变量
+	for _, want := range []string{"ARG TARGETOS", "ARG TARGETARCH", "GOARCH=${TARGETARCH}"} {
+		if !strings.Contains(dockerfile, want) {
+			t.Errorf("Dockerfile 缺少跨平台编译所需的 %q", want)
+		}
+	}
+
+	// 3. builder 阶段原生跑（免 QEMU 模拟），前后端两个 builder 都要
+	for _, stage := range []string{"AS frontend-builder", "AS backend-builder"} {
+		line := dockerfileStageLine(t, dockerfile, stage)
+		if !strings.Contains(line, "--platform=$BUILDPLATFORM") {
+			t.Errorf("builder 阶段 %q 未使用 --platform=$BUILDPLATFORM：%s", stage, line)
+		}
+	}
+
+	// 4. 运行时阶段必须跟随目标平台，绝不能钉在 BUILDPLATFORM
+	//    （否则交叉构建时 rootfs 跟着构建机，又和二进制架构对不上）
+	runtime := dockerfileStageLine(t, dockerfile, "FROM alpine:")
+	if strings.Contains(runtime, "--platform") {
+		t.Errorf("运行时阶段不应固定 platform，须跟随构建目标：%s", runtime)
+	}
+}
+
+// dockerfileStageLine 取出包含 marker 的那一行 FROM 指令。
+func dockerfileStageLine(t *testing.T, dockerfile, marker string) string {
+	t.Helper()
+
+	for _, line := range strings.Split(dockerfile, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "FROM ") && strings.Contains(trimmed, marker) {
+			return trimmed
+		}
+	}
+	t.Fatalf("Dockerfile 里找不到 %q 对应的 FROM 阶段", marker)
+	return ""
+}
+
+// assertComposeNoFixedPlatform Compose 不得用写死 platform 的方式绕过架构问题：
+// 架构由 Dockerfile 的 TARGET* 决定，compose 里固定 platform 会掩盖真实不匹配。
+func assertComposeNoFixedPlatform(t *testing.T, outDir string) {
+	t.Helper()
+
+	compose := readFile(t, filepath.Join(outDir, "docker-compose.yml"))
+	if regexp.MustCompile(`(?m)^\s*platform:`).MatchString(compose) {
+		t.Error("docker-compose.yml 出现 platform:：不得用强制 platform 绕过架构不匹配")
+	}
 }
 
 // optionalDeployMarkers 可选组件在 docker-compose.yml 里的特征串（选中才会出现）。

@@ -1,0 +1,123 @@
+package middleware
+
+import (
+	"net"
+	"net/http"
+	"strings"
+	"sync"
+
+	"{{ .Module }}/internal/taurus"
+)
+
+// 可信代理名单（逗号分隔的 IP 或 CIDR），来自 http.trusted_proxies，默认空。
+var (
+	trustedProxiesOnce sync.Once
+	trustedProxiesList []string
+)
+
+// ClientIP 解析请求的客户端 IP。
+//
+// 只有当直连对端（RemoteAddr）本身在可信代理名单内时，才采信
+// X-Forwarded-For / X-Real-IP；否则一律用 RemoteAddr。
+// 这样客户端自己伪造 X-Real-IP 无法影响限流键和日志里的来源 IP。
+// 默认名单为空，即「没有反向代理」的直连部署；放在 Nginx 后面时
+// 把代理地址写进 http.trusted_proxies。
+func ClientIP(r *http.Request) string {
+	trustedProxiesOnce.Do(func() {
+		trustedProxiesList = parseTrustedProxies(taurus.Container.Config.GetString("http.trusted_proxies"))
+	})
+	return clientIPFrom(
+		r.RemoteAddr,
+		r.Header.Get("X-Forwarded-For"),
+		r.Header.Get("X-Real-IP"),
+		trustedProxiesList,
+	)
+}
+
+// parseTrustedProxies 解析逗号分隔的可信代理配置。
+// 只保留合法的 IP / CIDR：配置占位值（如默认的 none）或手写错误都会被丢弃，
+// 结果是「空名单」而不是「误把什么东西当成可信代理」。
+func parseTrustedProxies(raw string) []string {
+	var out []string
+	for _, item := range strings.Split(raw, ",") {
+		s := strings.TrimSpace(item)
+		if s == "" {
+			continue
+		}
+		if strings.Contains(s, "/") {
+			if _, _, err := net.ParseCIDR(s); err != nil {
+				continue
+			}
+		} else if net.ParseIP(s) == nil {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// clientIPFrom 纯函数形式的解析逻辑，便于测试。
+func clientIPFrom(remoteAddr, xForwardedFor, xRealIP string, trusted []string) string {
+	peer := ipHost(remoteAddr)
+	if peer == "" {
+		return ""
+	}
+	// 直连对端不可信：它说自己是谁就是谁，转发头一律忽略
+	if !ipInList(peer, trusted) {
+		return peer
+	}
+
+	// X-Forwarded-For 从右往左找第一个「不可信」的地址，
+	// 右侧都是我们自己的代理链，左侧可能被客户端伪造。
+	hops := strings.Split(xForwardedFor, ",")
+	for i := len(hops) - 1; i >= 0; i-- {
+		hop := ipHost(strings.TrimSpace(hops[i]))
+		if hop == "" {
+			continue
+		}
+		if !ipInList(hop, trusted) {
+			return hop
+		}
+	}
+
+	if real := ipHost(strings.TrimSpace(xRealIP)); real != "" {
+		return real
+	}
+	return peer
+}
+
+// ipHost 从 "ip:port" / "[ipv6]:port" / "ip" 中取出合法 IP，取不到返回空串。
+func ipHost(addr string) string {
+	if addr == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		addr = host
+	}
+	addr = strings.Trim(addr, "[]")
+	if ip := net.ParseIP(addr); ip != nil {
+		return ip.String()
+	}
+	return ""
+}
+
+// ipInList 判断 IP 是否命中名单（支持单个 IP 与 CIDR）。
+func ipInList(ip string, list []string) bool {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	for _, entry := range list {
+		if strings.Contains(entry, "/") {
+			_, network, err := net.ParseCIDR(entry)
+			if err == nil && network.Contains(parsed) {
+				return true
+			}
+			continue
+		}
+		if other := net.ParseIP(entry); other != nil && other.Equal(parsed) {
+			return true
+		}
+	}
+	return false
+}

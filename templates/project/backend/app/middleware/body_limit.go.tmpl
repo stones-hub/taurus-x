@@ -1,0 +1,45 @@
+package middleware
+
+import (
+	"net/http"
+
+	"github.com/stones-hub/taurus-pro-http/pkg/httpx"
+
+	"{{ .Module }}/internal/taurus"
+)
+
+// defaultMaxBodyBytes 未配置时的请求体上限（1MiB）。
+// 底座没有文件上传接口，1MiB 对 JSON 接口足够宽裕。
+const defaultMaxBodyBytes int64 = 1 << 20
+
+// BodyLimitMiddleware 限制请求体大小，取 http.max_body_bytes（字节，<=0 表示不限制）。
+func BodyLimitMiddleware() func(next http.Handler) http.Handler {
+	maxBytes := defaultMaxBodyBytes
+	if v := taurus.Container.Config.GetInt("http.max_body_bytes"); v != 0 {
+		maxBytes = int64(v)
+	}
+	return bodyLimitMiddleware(maxBytes)
+}
+
+// bodyLimitMiddleware 纯参数版本，便于测试。
+func bodyLimitMiddleware(maxBytes int64) func(next http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if maxBytes <= 0 {
+				next.ServeHTTP(w, r)
+				return
+			}
+			// 声明了长度的直接拒绝，省掉读取开销
+			if r.ContentLength > maxBytes {
+				httpx.SendResponse(w, http.StatusRequestEntityTooLarge, "请求体过大", nil)
+				return
+			}
+			// 没声明长度（chunked）的靠 MaxBytesReader 兜底：
+			// 超限时后续读取报错，handler 的参数解析会失败并返回错误响应。
+			if r.Body != nil {
+				r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}

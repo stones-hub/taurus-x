@@ -36,10 +36,18 @@ func NewAdminRoleService(store *repo.Store) *AdminRoleService {
 	}
 }
 
-// IsUserSuperAdmin 检查用户是否是超级管理员
+// IsUserSuperAdmin 检查用户是否是超级管理员。
+//
+// 这里要求 super_admin 角色**启用中**（role.Status == 1）：它回答的是「这个人有没有
+// 超管权力」，禁用角色不授予任何权力，和 FindUserPermissions 过滤禁用角色是同一条口径。
+//
+// 与 user_guard.go 里「目标账号是否受保护」的判定方向刻意相反 —— 那边不看角色状态，
+// 否则把 super_admin 禁用一下就能改超管的密码。给权力要严、保护要宽。
 func (s *AdminRoleService) IsUserSuperAdmin(ctx context.Context, userID uint64) (bool, error) {
 	userRoles, err := s.userRoleRepo.FindByUserID(ctx, userID)
 	if err != nil {
+		// 身份查不出来一律按「不是超管」返回错误，让调用方拒绝（fail closed），
+		// 不能把一次数据库抖动变成一次放行。
 		return false, err
 	}
 	for _, userRole := range userRoles {
@@ -47,20 +55,45 @@ func (s *AdminRoleService) IsUserSuperAdmin(ctx context.Context, userID uint64) 
 		if err != nil {
 			return false, err
 		}
-		if role != nil && role.RoleCode == constants.SuperAdminRoleCode && role.Status == 1 {
+		if role != nil && role.RoleCode == constants.SuperAdminRoleCode && role.Status == constants.RoleStatusEnabled {
 			return true, nil
 		}
 	}
 	return false, nil
 }
 
-// GetUserAllPermissions 获取用户所有权限（去重）
+// GetUserAllPermissions 获取用户的**有效权限**（去重）。
+//
+// 一条 join 直接取：只算启用角色名下的启用权限（见 repo.FindUserPermissions 的
+// r.status / p.status 两个条件）。这是**有效权限的唯一来源**：接口权限校验与
+// 菜单、按钮下发都从这里取数，不要在调用方另开一条「从关联表自己拼权限」的路
+// —— 那样过滤条件就会分叉。
+//
+// 注意它返回的是「被直接授权的那些权限行」（下文称**有效叶子**）。菜单树还需要
+// 祖先节点才能挂得起来，那部分由 collectMenuParentRecursive 另外补查，
+// 规则见 GetUserMenusAndButtons 的说明 —— 补查只补结构，不扩授权。
 func (s *AdminRoleService) GetUserAllPermissions(ctx context.Context, userID uint64) ([]model.AdminPermissions, error) {
-	// 一条 join 直接取用户所有权限（去重、仅启用），替代原来的三次查询 + 手工去重
 	return s.userRoleRepo.FindUserPermissions(ctx, userID)
 }
 
-// GetUserMenusAndButtons 获取用户有权限的菜单树和按钮权限列表
+// GetUserMenusAndButtons 获取用户有权限的菜单树和按钮权限列表。
+//
+// 非超管的**授权来源**只有 GetUserAllPermissions（启用角色 × 启用权限），所以
+// 「角色被禁用」的效果是菜单和按钮一起消失，不需要在这里再写一遍角色状态判断。
+//
+// 但别把它说成「完全没有第二次查询」—— 菜单树需要祖先节点才挂得起来，
+// collectMenuParentRecursive 会按 parent_id 再查 admin_permissions
+// （FindByPermissionID，SQL 不带状态条件）。这次补查**不是**第二条授权路径，
+// 因为它受两条约束夹住：
+//
+//   - **只为已授权的后代补全**：递归的起点全部来自 GetUserAllPermissions 的结果。
+//     没有任何有效后代时（比如角色被禁用，那条查询一行都不返回），递归根本不执行 ——
+//     所以「借祖先补查让菜单冒出来」这条路不存在；
+//   - **祖先自身必须启用**：parent.Status != 1 就地停住，既不收集这个祖先、
+//     也不再往上走。于是禁用的祖先不会被补出来（它下面那条有效子菜单会变成
+//     挂不上根的孤儿节点，由 buildFrontendMenuTree 丢弃）。
+//
+// 下面两处 `Status != 1` / `Status == 1` 过滤的是**权限行自身**的状态，是另一层。
 func (s *AdminRoleService) GetUserMenusAndButtons(ctx context.Context, userID uint64) (dto.UserMenuButtonResponse, error) {
 	response := dto.UserMenuButtonResponse{
 		Menus:   make([]*dto.MenuNode, 0),
@@ -133,6 +166,11 @@ func (s *AdminRoleService) GetUserMenusAndButtons(ctx context.Context, userID ui
 	return response, nil
 }
 
+// collectMenuParentRecursive 为一条**已授权**的权限向上补全祖先菜单节点。
+//
+// 只补结构、不扩授权：调用方传进来的 perm 必须来自 GetUserAllPermissions 的结果，
+// 所以没有有效后代时这个函数不会被调到。祖先自身 Status != 1 就地返回 ——
+// 禁用的祖先不补出来，也不继续往上找。
 func (s *AdminRoleService) collectMenuParentRecursive(ctx context.Context, perm *model.AdminPermissions, collectMap map[uint64]*model.AdminPermissions) error {
 	if perm.ParentID == 0 {
 		return nil
@@ -231,6 +269,9 @@ func (s *AdminRoleService) GetRoleList(ctx context.Context, page, pageSize int, 
 
 // AddRole 新增角色（含权限关联，事务整体提交）
 func (s *AdminRoleService) AddRole(ctx context.Context, req *dto.AddRoleRequest) error {
+	if err := CheckNewRoleCode(req.RoleCode); err != nil {
+		return err
+	}
 	existing, err := s.roleRepo.FindByRoleCode(ctx, req.RoleCode)
 	if err != nil {
 		return err
@@ -265,7 +306,9 @@ func (s *AdminRoleService) AddRole(ctx context.Context, req *dto.AddRoleRequest)
 			Description: req.Description,
 			SortOrder:   req.SortOrder,
 			Status:      1,
-			IsSystem:    int8(req.IsSystem),
+			// is_system 永远是 0：系统角色只能由初始化 SQL 定义，
+			// 不接受接口入参，否则调用方可以自己造一个「不可删改」的角色。
+			IsSystem: 0,
 		}
 		if err := tx.Role().Create(ctx, role); err != nil {
 			return err
@@ -285,11 +328,8 @@ func (s *AdminRoleService) UpdateRole(ctx context.Context, req *dto.UpdateRoleRe
 	if err != nil {
 		return err
 	}
-	if role == nil {
-		return errors.New("角色不存在")
-	}
-	if role.IsSystem == 1 {
-		return errors.New("系统角色不能修改")
+	if err := CheckRoleMutable(role, "修改"); err != nil {
+		return err
 	}
 
 	// 事务前校验权限 ID（只读）
@@ -334,11 +374,8 @@ func (s *AdminRoleService) DeleteRole(ctx context.Context, roleID uint64) error 
 	if err != nil {
 		return err
 	}
-	if role == nil {
-		return errors.New("角色不存在")
-	}
-	if role.IsSystem == 1 {
-		return errors.New("系统角色不能删除")
+	if err := CheckRoleMutable(role, "删除"); err != nil {
+		return err
 	}
 	userRoles, err := s.userRoleRepo.FindByRoleID(ctx, roleID)
 	if err != nil {
@@ -363,14 +400,38 @@ func (s *AdminRoleService) DeleteRole(ctx context.Context, roleID uint64) error 
 	})
 }
 
-// UpdateRoleStatus 更新角色状态
+// UpdateRoleStatus 更新角色状态（角色必须存在，系统角色不能改状态）
 func (s *AdminRoleService) UpdateRoleStatus(ctx context.Context, roleID uint64, status int) error {
+	if status != int(constants.UserStatusEnabled) && status != int(constants.UserStatusDisabled) {
+		return errors.New("状态值必须为0(禁用)或1(启用)")
+	}
+	role, err := s.roleRepo.FindByRoleIDAnyStatus(ctx, roleID)
+	if err != nil {
+		return err
+	}
+	// 原来这里直接 UPDATE，角色不存在也返回成功，系统角色也能被禁用；
+	// 禁用 super_admin 等于把整套权限体系锁死。
+	if err := CheckRoleMutable(role, "禁用或启用"); err != nil {
+		return err
+	}
 	return s.roleRepo.UpdateByID(ctx, roleID, map[string]interface{}{"status": status})
 }
 
 // ==================== 用户角色 ====================
 
-// GetUserRolesAndPermissions 获取用户角色和权限
+// GetUserRolesAndPermissions 获取用户角色和权限。
+//
+// 返回的 Roles 是「全部启用角色」**并上**「该用户当前真实持有的角色（含已禁用）」：
+// 只列启用角色的话，用户持有的某个角色一旦被禁用，编辑页就看不到这条关联、
+// 回显出来的 role_ids 里也没有它，保存资料时整体替换就把这条关联顺手删了 ——
+// 一次「改昵称」变成一次静默的角色撤销。所以持有中的禁用角色必须一起带出来，
+// 由前端显示成「已禁用」并保持勾选（新增禁用角色仍由服务端 CheckRoleStatusAssignable 拒绝）。
+//
+// 返回的 AllPermissions 是**回显用途**：它按「这些角色挂着哪些权限」逐个关联查出来，
+// 刻意不按角色状态过滤（禁用角色名下的权限也要能在编辑页看到）。
+// 它**不是**有效权限，不要拿它做任何鉴权判定 —— 鉴权只认 GetUserAllPermissions
+// （→ repo.FindUserPermissions，带 r.status / p.status 过滤）。
+// 同理 GetEditRoleInfo 的权限树也只是展示。
 func (s *AdminRoleService) GetUserRolesAndPermissions(ctx context.Context, userID uint64) (dto.UserRoleDetailResponse, error) {
 	response := dto.UserRoleDetailResponse{
 		UserID:         userID,
@@ -389,6 +450,27 @@ func (s *AdminRoleService) GetUserRolesAndPermissions(ctx context.Context, userI
 	userRoleIDMap := make(map[uint64]bool)
 	for _, ur := range userRoles {
 		userRoleIDMap[ur.RoleID] = true
+	}
+
+	// 把「持有中但不在启用列表里」的角色补进来（通常就是被禁用的角色）。
+	// 以库里的关联表为准，不依赖前端把它回传。
+	listedIDs := make(map[uint64]bool, len(allRoles))
+	for _, role := range allRoles {
+		listedIDs[role.RoleID] = true
+	}
+	for _, ur := range userRoles {
+		if listedIDs[ur.RoleID] {
+			continue
+		}
+		role, err := s.roleRepo.FindByRoleIDAnyStatus(ctx, ur.RoleID)
+		if err != nil {
+			return response, err
+		}
+		if role == nil {
+			continue // 角色行已被删除，关联是孤儿，不展示
+		}
+		listedIDs[role.RoleID] = true
+		allRoles = append(allRoles, *role)
 	}
 
 	permissionMap := make(map[uint64]model.AdminPermissions)
@@ -420,37 +502,89 @@ func (s *AdminRoleService) GetUserRolesAndPermissions(ctx context.Context, userI
 	return response, nil
 }
 
-// UpdateUserRoles 更新用户角色（先删后加，事务整体提交）
-func (s *AdminRoleService) UpdateUserRoles(ctx context.Context, userID uint64, roleIDs []uint64) error {
-	// 事务前校验角色 ID（只读）
-	for _, roleID := range roleIDs {
-		role, err := s.roleRepo.FindByRoleID(ctx, roleID)
+// UpdateUserRoles 更新用户角色（整体替换，一个事务）。
+//
+// operatorID 是发起操作的人（来自 JWT）。三道判定都在写入之前、且在同一个事务里：
+//   - 目标账号保护：非超管不能动持有超管角色的账号（guardUserWrite）；
+//   - 角色变更保护：非超管不能增删受保护角色，既包括「给自己或别人加超管」，
+//     也包括「把别人的超管摘掉」（CheckRoleAssignmentAllowed）；
+//   - 角色状态保护：不能新增已禁用的角色，但目标已经持有的禁用角色可以原样保留
+//     （CheckRoleStatusAssignable）。
+//
+// 本方法是整体替换语义：roleIDs 为空表示清空该用户的角色关联。
+// 调用方若想表达「本次不动角色」，不要传空切片，而是干脆不调它
+// （资料编辑见 dto.UpdateUserRequest.RolesProvided 的约定）。
+//
+// 判定所依据的事实（操作人是否超管、目标现有角色、目标角色是否受保护）一律从库里
+// 的关联表读，不看入参 role_ids 之外的任何调用方声明。读的方式也有讲究：
+// guardUserWrite 先按固定顺序锁住操作人与目标的用户行，再**加锁当前读**身份，
+// 所以「我读到目标不是超管 → 别人把超管授给他 → 我按旧事实写」这条竞态被锁挡在外面；
+// 用普通读（事务快照）做不到这一点，它看不见并发已提交的授权。
+//
+// 这也是「新增用户之后赋角色」走的入口（AddUser 只建账号不赋角色），
+// 所以目标此刻可能一条角色关联都没有 —— 锁锚在用户行上，空角色同样锁得住。
+func (s *AdminRoleService) UpdateUserRoles(ctx context.Context, operatorID, userID uint64, roleIDs []uint64) error {
+	return s.store.RunInTx(ctx, func(tx *repo.Tx) error {
+		g, err := guardUserWrite(ctx, tx, operatorID, userID)
 		if err != nil {
 			return err
+		}
+		next, err := txRoleFactsByIDs(ctx, tx, roleIDs)
+		if err != nil {
+			return err
+		}
+		if err := CheckRoleAssignmentAllowed(g.OperatorIsSuperAdmin, g.TargetRoleFacts, next); err != nil {
+			return err
+		}
+		if err := CheckRoleStatusAssignable(g.TargetRoleFacts, next); err != nil {
+			return err
+		}
+		return replaceUserRolesTx(ctx, tx, userID, roleIDs)
+	})
+}
+
+// txRoleFactsByIDs 校验这组角色 ID 都存在，并取出判定要素（事务作用域）。
+// 不存在的角色一律报错而不是跳过：否则「传个不存在的 ID」会变成静默少赋一个角色。
+//
+// 用 FOR SHARE 当前读：这些角色事实（is_system、role_code、status）直接决定「能不能赋」，
+// 读到事务快照里的旧值就可能把一个刚被改过的角色按旧事实放过去；共享锁还保证
+// 判定到写入之间这些角色行不被改。不用排他锁 —— 这里只读角色、不写角色。
+//
+// **不过滤 status**：禁用角色也要能查出来，否则「目标账号已经持有某个后来被禁用的
+// 角色」在编辑页提交时会被当成「角色ID不存在」而整笔失败。状态该怎么判定交给
+// CheckRoleStatusAssignable（已持有可保留、新增一律拒绝），不在查询里悄悄过滤。
+func txRoleFactsByIDs(ctx context.Context, tx *repo.Tx, roleIDs []uint64) ([]RoleFact, error) {
+	facts := make([]RoleFact, 0, len(roleIDs))
+	for _, roleID := range roleIDs {
+		role, err := tx.Role().FindByRoleIDAnyStatusForShare(ctx, roleID)
+		if err != nil {
+			return nil, err
 		}
 		if role == nil {
-			return errors.New("角色ID不存在")
+			return nil, errors.New("角色ID不存在")
 		}
+		facts = append(facts, RoleFactOf(role))
 	}
+	return facts, nil
+}
 
-	// 删旧用户角色 + 加新用户角色，任一失败整体回滚
-	return s.store.RunInTx(ctx, func(tx *repo.Tx) error {
-		oldUserRoles, err := tx.UserRole().FindByUserID(ctx, userID)
-		if err != nil {
+// replaceUserRolesTx 用 roleIDs 整体替换该用户的角色关联（事务作用域）。
+// 只负责写，不做任何授权判定 —— 调用方必须已经在同一事务内判定过，
+// 且必须已经通过 guardUserWrite 锁住了这个用户行。
+//
+// 删除按 user_id 条件一次删掉，不是「先查出关联行再按主键逐行删」：
+// 逐行删只删得掉自己读到的那份快照里的行，快照之后新插入的关联行会原样留下，
+// 「整体替换」就变成了「替换 + 多出一个本次没打算赋的角色」。
+func replaceUserRolesTx(ctx context.Context, tx *repo.Tx, userID uint64, roleIDs []uint64) error {
+	if err := tx.UserRole().DeleteByUserID(ctx, userID); err != nil {
+		return err
+	}
+	for _, roleID := range roleIDs {
+		if err := tx.UserRole().Create(ctx, &model.AdminUserRole{UserID: userID, RoleID: roleID}); err != nil {
 			return err
 		}
-		for _, ur := range oldUserRoles {
-			if err := tx.UserRole().Delete(ctx, &ur); err != nil {
-				return err
-			}
-		}
-		for _, roleID := range roleIDs {
-			if err := tx.UserRole().Create(ctx, &model.AdminUserRole{UserID: userID, RoleID: roleID}); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	}
+	return nil
 }
 
 // GetEditRoleInfo 获取编辑角色信息（角色字段 + 全量权限树，当前角色拥有的权限标记选中）

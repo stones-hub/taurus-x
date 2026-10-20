@@ -5,13 +5,21 @@ import (
 )
 
 // AdminUserLoginLog 用户登录日志表（admin_user_login_logs）
+//
+// LoginStatus 的 gorm tag 刻意**不带 default**：带 default 的字段取零值时，GORM 认为
+// 「调用方没赋值」而用默认值替换它 —— 字面量默认值会被解析后直接写进 INSERT 的绑定
+// 变量（连模型字段也一起改写），非字面量默认值则整列略过、交给数据库默认值。该列
+// 0=失败，失败恰好是零值，所以一旦写上 default，所有登录失败都会被存成成功
+// （接口仍返回 401，只有审计日志失真，真实环境里踩过）。
+// 反向写 default:0 也不管用：零值仍被视为未赋值，走的还是同一条替换路径。
+// 回归测试：app/repo/admin_user_login_log_repo_test.go。
 type AdminUserLoginLog struct {
 	LogID         uint64    `json:"log_id" gorm:"primaryKey;autoIncrement;column:log_id;comment:日志ID"`
 	UserID        uint64    `json:"user_id" gorm:"index:idx_user_id;not null;column:user_id;comment:用户ID"`
 	LoginType     string    `json:"login_type" gorm:"index:idx_login_type;size:20;not null;column:login_type;comment:登录方式"`
 	LoginIP       string    `json:"login_ip" gorm:"size:45;not null;default:'';column:login_ip;comment:登录IP"`
 	UserAgent     string    `json:"user_agent" gorm:"size:500;not null;default:'';column:user_agent;comment:用户代理"`
-	LoginStatus   int8      `json:"login_status" gorm:"index:idx_login_status;not null;default:1;column:login_status;comment:登录状态：1成功，0失败"`
+	LoginStatus   int8      `json:"login_status" gorm:"index:idx_login_status;not null;column:login_status;comment:登录状态：1成功，0失败"`
 	FailureReason string    `json:"failure_reason" gorm:"size:255;not null;default:'';column:failure_reason;comment:失败原因"`
 	LoginTime     time.Time `json:"login_time" gorm:"index:idx_login_time;not null;default:CURRENT_TIMESTAMP;column:login_time;comment:登录时间"`
 }

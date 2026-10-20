@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/google/wire"
+
 	"{{ .Module }}/app/dto"
 	"{{ .Module }}/app/middleware"
 	"{{ .Module }}/app/service"
@@ -64,24 +65,6 @@ func (c *UserController) ChangePassword(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err := c.AuthService.ChangePassword(r.Context(), userID, &req); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	OK(w, map[string]string{"status": "success"})
-}
-
-// SetPassword 设置/重置密码（POST /admin/user/set-password）
-func (c *UserController) SetPassword(w http.ResponseWriter, r *http.Request) {
-	userID, ok := middleware.CurrentUserIDFromJWT(r)
-	if !ok {
-		Fail(w, http.StatusUnauthorized, "未授权访问")
-		return
-	}
-	var req dto.SetPasswordRequest
-	if !BindJSON(w, r, &req) {
-		return
-	}
-	if err := c.AuthService.SetPassword(r.Context(), userID, &req); err != nil {
 		Fail(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -152,6 +135,21 @@ func (c *UserController) GetUserList(w http.ResponseWriter, r *http.Request) {
 	OK(w, resp)
 }
 
+// GetUserOptions 用户选项（POST /admin/option/users，最小字段）
+func (c *UserController) GetUserOptions(w http.ResponseWriter, r *http.Request) {
+	var req dto.UserListRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	req.Normalize()
+	resp, err := c.UserService.GetUserOptions(r.Context(), req.PageNo, req.PageSize, req.UsernameMobileEmail, req.Status)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, resp)
+}
+
 // GetUserInfo 用户详情（含角色权限，POST /admin/user/info）
 func (c *UserController) GetUserInfo(w http.ResponseWriter, r *http.Request) {
 	var req dto.UserIDRequest
@@ -180,6 +178,11 @@ func (c *UserController) GetUserInfo(w http.ResponseWriter, r *http.Request) {
 
 // AddUser 新增用户（POST /admin/user/add）
 func (c *UserController) AddUser(w http.ResponseWriter, r *http.Request) {
+	operatorID, ok := middleware.CurrentUserIDFromJWT(r)
+	if !ok {
+		Fail(w, http.StatusUnauthorized, "未授权访问")
+		return
+	}
 	var req dto.AddUserRequest
 	if !BindJSON(w, r, &req) {
 		return
@@ -195,8 +198,8 @@ func (c *UserController) AddUser(w http.ResponseWriter, r *http.Request) {
 	}
 	// 分配角色
 	if len(req.RoleIDs) > 0 {
-		if err := c.RoleService.UpdateUserRoles(r.Context(), userID, req.RoleIDs); err != nil {
-			Fail(w, http.StatusInternalServerError, err.Error())
+		if err := c.RoleService.UpdateUserRoles(r.Context(), operatorID, userID, req.RoleIDs); err != nil {
+			FailByError(w, err)
 			return
 		}
 	}
@@ -204,7 +207,16 @@ func (c *UserController) AddUser(w http.ResponseWriter, r *http.Request) {
 }
 
 // UpdateUser 更新用户（POST /admin/user/update）
+//
+// 资料 / 密码 / 角色一次调用交给 service 在**同一个事务**里完成：
+// 身份判定（非超管不得编辑超管账号）在任何写入之前跑，拒绝时三者都不落库。
+// controller 不再自己按顺序串三个 service —— 那样第一个已经提交了，后面再 403 也撤不回来。
 func (c *UserController) UpdateUser(w http.ResponseWriter, r *http.Request) {
+	operatorID, ok := middleware.CurrentUserIDFromJWT(r)
+	if !ok {
+		Fail(w, http.StatusUnauthorized, "未授权访问")
+		return
+	}
 	var req dto.UpdateUserRequest
 	if !BindJSON(w, r, &req) {
 		return
@@ -213,20 +225,8 @@ func (c *UserController) UpdateUser(w http.ResponseWriter, r *http.Request) {
 		Fail(w, http.StatusBadRequest, "用户ID不能为空")
 		return
 	}
-	if err := c.UserService.UpdateUser(r.Context(), &req); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	// 可选：更新密码
-	if req.Password != "" {
-		if err := c.AuthService.UpdateUserPassword(r.Context(), req.UserID, req.Password); err != nil {
-			Fail(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-	}
-	// 更新角色
-	if err := c.RoleService.UpdateUserRoles(r.Context(), req.UserID, req.RoleIDs); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+	if err := c.UserService.UpdateUser(r.Context(), operatorID, &req); err != nil {
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -234,12 +234,18 @@ func (c *UserController) UpdateUser(w http.ResponseWriter, r *http.Request) {
 
 // UpdateUserStatus 更新用户状态（POST /admin/user/update-status）
 func (c *UserController) UpdateUserStatus(w http.ResponseWriter, r *http.Request) {
+	operatorID, ok := middleware.CurrentUserIDFromJWT(r)
+	if !ok {
+		Fail(w, http.StatusUnauthorized, "未授权访问")
+		return
+	}
 	var req dto.UpdateUserStatusRequest
 	if !BindJSON(w, r, &req) {
 		return
 	}
-	if err := c.UserService.UpdateUserStatus(r.Context(), req.UserID, req.Status); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+	// 操作人必须带下去：有 update-status 权限不等于可以禁用超管账号
+	if err := c.UserService.UpdateUserStatus(r.Context(), operatorID, req.UserID, req.Status); err != nil {
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -247,6 +253,11 @@ func (c *UserController) UpdateUserStatus(w http.ResponseWriter, r *http.Request
 
 // DeleteUser 删除用户（软删，POST /admin/user/delete）
 func (c *UserController) DeleteUser(w http.ResponseWriter, r *http.Request) {
+	operatorID, ok := middleware.CurrentUserIDFromJWT(r)
+	if !ok {
+		Fail(w, http.StatusUnauthorized, "未授权访问")
+		return
+	}
 	var req dto.UserIDRequest
 	if !BindJSON(w, r, &req) {
 		return
@@ -255,8 +266,8 @@ func (c *UserController) DeleteUser(w http.ResponseWriter, r *http.Request) {
 		Fail(w, http.StatusBadRequest, "用户ID不能为空")
 		return
 	}
-	if err := c.UserService.DeleteUser(r.Context(), req.UserID); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+	if err := c.UserService.DeleteUser(r.Context(), operatorID, req.UserID); err != nil {
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})

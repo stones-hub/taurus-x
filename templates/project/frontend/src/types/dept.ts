@@ -70,6 +70,21 @@ export interface DeptOptionItem {
     parent_id: number
 }
 
+/** 用户选项项（对应后端 dto.UserOptionItem，/admin/option/* 的最小字段） */
+export interface UserOptionItem {
+    user_id: number
+    username: string
+    realname: string
+}
+
+/** 用户选项列表响应（对应后端 dto.UserOptionListResponse） */
+export interface UserOptionListResponse {
+    page_no: number
+    page_size: number
+    result_total: number
+    list: UserOptionItem[]
+}
+
 /** 部门员工项（对应后端 dto.DeptUserResponse） */
 export interface DeptUserResponse {
     id: number

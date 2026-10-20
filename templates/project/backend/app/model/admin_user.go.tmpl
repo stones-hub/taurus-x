@@ -18,6 +18,10 @@ type AdminUser struct {
 	Position      string     `json:"position" gorm:"size:100;not null;default:'';column:position;comment:职位"`
 	Status        int8       `json:"status" gorm:"index:idx_status;not null;default:1;column:status;comment:状态：1启用，0禁用，-1删除"`
 	UserSource    int8       `json:"user_source" gorm:"index:idx_user_source;not null;default:1;column:user_source;comment:用户来源：1自主注册，2企业微信同步，3其他SSO"`
+	// AuthVersion 认证版本：改密、重置密码、禁用/删除用户时在同一事务内自增，
+	// 使该用户此前签发的所有 Token 立即失效。**不序列化给前端**：它是认证内部状态。
+	// 从 1 起算，0 表示「查不到用户」，会话校验据此 fail closed。
+	AuthVersion   int64      `json:"-" gorm:"not null;default:1;column:auth_version;comment:认证版本：改密/禁用等变更时自增，使已签发Token立即失效"`
 	LastLoginTime *time.Time `json:"last_login_time" gorm:"column:last_login_time;comment:最后登录时间"`
 	LastLoginIP   string     `json:"last_login_ip" gorm:"size:45;not null;default:'';column:last_login_ip;comment:最后登录IP"`
 	CreatedAt     time.Time  `json:"created_at" gorm:"not null;default:CURRENT_TIMESTAMP;column:created_at;comment:创建时间"`

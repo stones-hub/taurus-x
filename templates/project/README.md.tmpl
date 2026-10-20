@@ -90,11 +90,16 @@ mysql -u <用户> -p {{ .DBName }} < scripts/sql/init.sql
 
 ```bash
 cd backend
-cp .env.example .env.local   # 填 DB_DSN / REDIS_* / JWT_SECRET
+cp .env.example .env.local        # 填 DB_DSN / REDIS_*
+openssl rand -hex 32              # 把输出写进 .env.local 的 JWT_SECRET=
 ```
 
+> `JWT_SECRET` **必填**：`.env.example` 里刻意留空（该文件进版本库，带现成密钥等于把签名
+> 密钥一起提交）。未配置、过短（< 32 字符）或是示例/弱值时服务会**拒绝启动**，
+> 见 `app/helper/startup_check.go`。
+>
 > `.env.local` 的值会被**原样文本替换**进 `config/` 下的配置文件，再做 YAML/TOML 解析：
-> **不要加引号**，不要在值里写 `}` 或换行。`JWT_SECRET` 用 `openssl rand -hex 32` 生成。
+> **不要加引号**，不要在值里写 `}` 或换行。
 
 ### 3. 起后端
 
@@ -128,15 +133,28 @@ pnpm build    # 生产构建（含 vue-tsc 类型检查），产出 dist/，由�
 | 项 | 值 |
 |----|-----|
 | 用户名 | `{{ .AdminUsername }}` |
-| 初始密码 | `{{ .AdminPassword }}` |
+| 初始密码 | **随机生成，只在 `taurus-x` 生成本项目时在终端打印过一次**（不写进本文件，也不写进 `scripts/sql/init.sql`） |
 | 角色 | `super_admin`（代码里直接放行全部菜单/按钮/接口权限） |
 
-密码在 `scripts/sql/init.sql` 里以 `SHA-256(密码 + salt)` 的小写 hex 存入
+密码在 `scripts/sql/init.sql` 里只以 `SHA-256(密码 + salt)` 的小写 hex 存入
 `admin_user_logins.login_credential`，`salt` 是 16 字节随机数的 32 位 hex，**每次生成项目都不同**。
 算法与 `backend/app/helper/crypto.go` 的 `HashPassword`/`GenerateSalt` 完全一致。
 
-> ⚠️ **首次登录后立即改密**（个人信息 → 修改密码），并把本节的明文密码从仓库里删掉。
-> 本文件会随代码进版本库，明文密码留在这里等于没有密码。
+**没记下初始密码怎么办**：明文无法从散列反推。自己选一个新密码，按同样算法算出散列后更新库里那一行即可：
+
+```bash
+# 取出当前 salt
+mysql -uroot -p -N -e "SELECT salt FROM {{ .DBName }}.admin_user_logins WHERE login_value='{{ .AdminUsername }}'"
+# 用取到的 salt 算新散列（密码从标准输入读，别写进命令行历史）
+printf '%s%s' "<新密码>" "<上面的 salt>" | shasum -a 256
+# 回写
+mysql -uroot -p -e "UPDATE {{ .DBName }}.admin_user_logins SET login_credential='<新散列>' WHERE login_value='{{ .AdminUsername }}'"
+```
+
+也可以直接重新生成一个项目，拿新的随机初始密码。
+
+> ⚠️ **首次登录后立即改密**（个人信息 → 修改密码）。改密会吊销该账号的所有既有 Token，
+> 需要重新登录，这是有意的。
 
 ---
 
@@ -164,16 +182,33 @@ pnpm build    # 生产构建（含 vue-tsc 类型检查），产出 dist/，由�
 ```bash
 # 先按 docs/部署文档.md 第 5.3 节在项目根目录写一份 .env
 # （至少要有 MYSQL_PASSWORD / JWT_SECRET / DB_DSN，JWT_SECRET 未设置时 compose 会直接拒绝启动）
+
+# 日志 bind mount 目录：app 容器以非 root（uid=1000）运行，不 chown 会起不来
+mkdir -p docker-data/logs && sudo chown -R 1000:1000 docker-data
+
 docker compose up -d --build
 ```
 
 `docker compose` 只编排**本项目实际选中的组件**。详见 [`docs/部署文档.md`](docs/部署文档.md)。
 
+镜像按**当前宿主机架构**构建（`Dockerfile` 用 BuildKit 的 `TARGETOS` / `TARGETARCH`，
+运行时阶段跟随同一目标），x86_64 与 arm64 都能直接 `up`；**不要**在 `docker-compose.yml`
+里写 `platform:`。给另一种架构的服务器出包用 `docker buildx build --platform linux/amd64 .`，
+但交叉构建出的镜像**不能在本机验证**，必须在目标架构的机器上实际启动确认 —— 见
+[`docs/部署文档.md`](docs/部署文档.md) 第 5.4.1 节。
+{{- if .Has.milvus }}
+
+> ⚠️ 本项目勾选了 milvus：compose 里 Milvus standalone 依赖的 minio 镜像 tag 当前**无已确认
+> 可用的公开来源**（匿名 manifest 401），完整 `up` 会在拉镜像这一步失败。处置方式见
+> [`docs/部署文档.md`](docs/部署文档.md) 第一节的已知阻塞说明；app 自身不依赖 Milvus 启动。
+{{- end }}
+
 ---
 
 ## 七、已知风险与待办
 
-底座是从一个在用的管理后台抽取的，以下问题**已知、尚未修复**，在上生产前请逐条处理：
+底座是从一个在用的管理后台抽取的。安全加固**已落实到代码**的部分见下方「已落实的加固」，
+以下问题**已知、尚未修复**，在上生产前请逐条处理：
 
 ### 安全
 
@@ -181,28 +216,188 @@ docker compose up -d --build
    生产前应换成 `bcrypt` 或 `argon2id`（`golang.org/x/crypto`）。改动点集中在
    `app/helper/crypto.go` 的三个函数；因为 `salt` 与 `login_credential` 都在
    `admin_user_logins` 里，可以做「登录时发现是旧格式就重算并升级」的平滑迁移。
-2. **`config/autoload/http/http.yaml` 的 JWT 密钥有弱默认值**。`.env.local` / compose 的
-   `JWT_SECRET` 没设置时会退回该默认值，等于任何人都能签发合法 token。
-   compose 已用 `${JWT_SECRET:?...}` 强制必填，**裸机部署没有这层保护，务必自行确认已设置**。
-3. **本 README 第四节含初始管理员明文密码**。首次登录改密后请删除该节内容。
-4. **`.env.local` / `.env` 必须留在版本库外**（已在 `.gitignore` 里），并设 `chmod 600`。
-5. 访问日志与操作日志会落**请求体与响应体**（截断）。涉及密码、令牌、个人敏感信息的接口
-   应在 `app/middleware/` 的日志中间件里加字段脱敏，目前**没有脱敏**。
+2. **`.env.local` / `.env` 必须留在版本库外**（已在 `.gitignore` 里），并设 `chmod 600`。
+3. **`/admin/user/bind-mobile`、`unbind-mobile` 仍挂在接口权限链上**。这两个接口只能改
+   JWT 里的自己（和 `change-password` 一样），但权限数据里还登记着 209、210 两条接口权限，
+   所以**普通角色不配这两条权限就绑不了自己的手机号**。`change-password` 已移出权限链；
+   这两条要一起移的话，同时删掉 `init.sql` 里 209/210 两行并改 `routes.go` 的中间件链。
+4. **限流器的 per-IP 桶是无上限的 map**（`tlimit.CompositeRateLimiter`，来自公共库）。
+   被打散 IP 刷匿名接口时内存会持续增长。入口建议再加一层 Nginx / WAF 限流，
+   或替换成带 TTL 淘汰的实现。
+5. **`/admin/permission/update-is-system` 允许调用者翻转权限行的 `is_system`**。
+   角色侧的系统角色保护已做（见「已落实的加固」），权限侧还没有；配了该接口权限的人
+   可以把系统权限标记成非系统权限再删掉。
 
 ### 功能缺陷
 
-6. **`admin_depts.dept_code` 是 `NOT NULL DEFAULT ''` 上的唯一索引**，而 `AddDept`
-   允许 `dept_code` 为空 —— 于是**第二个不填编码的部门会因唯一键冲突而创建失败**。
-   修法二选一：把 `dept_code` 改成可空（`*string`，像 `mobile`/`email` 那样，MySQL 允许多个
-   NULL），或在 service 层强制 `dept_code` 必填。
-7. **`/admin/user/change-password`、`set-password`、`bind-mobile`、`unbind-mobile`
-   挂在 `userProtectedChain` 上**（走接口权限校验）。`super_admin` 不受影响，但
-   **普通角色不配这几条接口权限就改不了自己的密码**。给每个角色都配上，或把「改自己」
-   的那几个接口移到 `userBaseChain`。
-8. 日志表没有归档 / 清理机制，`admin_access_logs` 会随流量无上限增长。上生产前加分区、
+6. 日志表没有归档 / 清理机制，`admin_access_logs` 会随流量无上限增长。上生产前加分区、
    定期归档或定时清理（可用 `app/crontab/`）。
+
+### 行为约定（不是缺陷，容易被当成 bug）
+
+- **部门编码创建后不可修改**：`dept_code` 只在创建部门时写入，`UpdateDept` 不改它。
+  编码被 `uk_dept_code` 约束、并可能已被外部系统引用，改掉会让既有引用失效，
+  所以编辑部门时传新编码不会生效。要换编码请新建部门再迁移下属数据。
+
+### 已落实的加固（代码层面，含单元测试）
+
+下面这些改动已经进代码并有对应单元测试覆盖；**是否满足你的业务验收仍需你自己在
+本机跑一遍真实流程确认**，这里不代表已通过业务验收。
+
+- JWT 签名密钥**没配置、过短（< 32 字符）或命中弱值时拒绝启动**（`app/helper/startup_check.go`），
+  `.env.example` 不再预置密钥。自检**不看 `http.jwt.enabled`**：那个开关只关掉请求侧的
+  鉴权中间件，登录签发 / 刷新 / 解析 Token 始终在用 `http.jwt.secret`。
+- 配置不再明文打印；访问日志 / 操作日志对密码、Token、验证码等字段**脱敏**，
+  验证码不再记明文。
+- **数据库日志不再写 SQL 语句原文**（`internal/taurus/daily_log.go`）：GORM 回调给出的是
+  **插值后**的 SQL，参数值（含密码散列、salt、手机号）就在语句里，所以错误 / 慢查询 / info
+  三个分支都只记录「耗时 + 影响行数 + 语句类型（SELECT/UPDATE/…）+ 错误分类
+  （如 `mysql_errno_1062`）」，原始数据库错误文本也不落盘。
+  注意这只覆盖本项目这个 logger —— 你自己新加的日志点仍要自己脱敏。
+- `/admin/option/*` 只返回选人必需的最小字段（不含手机号、邮箱、登录 IP）。
+- **系统角色受保护**：非超级管理员不能给自己或别人加/减超级管理员角色，
+  也不能通过新建或改角色伪造 `super_admin`、禁用系统角色（`app/service/role_guard.go`）。
+- **超管账号受保护：有接口权限 ≠ 能动这个账号**（`app/service/user_guard.go`）。
+  之前任何配了 `user/update`、`user/update-status`、`user/delete` 权限的普通管理员都能
+  **改超管资料、重置超管密码、禁用或删除超管**：`UpdateUser` 当时按「资料 → 密码 → 角色」
+  串了三个独立事务，唯一的超管判定在最后一步，所以 403 返回前密码已经提交，且撤不回来。
+  现在：
+  - 操作人只认 JWT 带上来的 `user_id`，目标身份只认库里的 `admin_user_roles` 关联表 ——
+    入参的 `role_ids` / `is_system` 不作为身份依据（否则等于让调用方自证清白）；
+  - 身份判定排在**任何写入之前**，并与写入在**同一个事务**里完成；拒绝时资料 / 密码 /
+    角色一个都不落库；
+  - 事实必须是**加锁当前读**的结果。「同一个事务里读」不等于「读到的是当前值」：
+    MySQL 默认 REPEATABLE READ，事务里第一次普通 `SELECT` 就钉死一致性快照，
+    并发已提交的「把超管授给目标」看不见。所以统一走**身份锁协议**：
+    先按 `user_id` 升序、去重地 `SELECT ... FOR UPDATE` 锁住操作人与目标的
+    `admin_users` 主键行，再 `FOR UPDATE` 当前读角色关联、`FOR SHARE` 当前读角色行，
+    然后判定，最后才写。锁锚在用户行而不是关联行，所以零角色账号、首次赋角色
+    同样锁得住；固定升序让交叉管理不会锁序反转；锁等待超时 / 死锁一律整笔回滚，
+    不做隐式重试。自助改密走同一个「先锁用户行」的开头，只为统一加锁顺序；
+  - 覆盖的入口：`/admin/user/update`、`update-status`、`delete`、
+    `/admin/role/assign`（新增用户后赋角色也走它），以及自助 `change-password`
+    的锁顺序对齐；
+  - 角色关联的整体替换按 `user_id` 条件删一次再插入，不再「先查关联行、按主键逐行删」——
+    后者只删得掉自己快照里的行，快照之后新增的关联行会留下来；
+  - 身份查询出错或查不到一律拒绝（fail closed），不让一次数据库抖动变成一次提权；
+  - 口径故意不对称：判定「操作人有没有超管权力」要求角色启用中，判定「目标是否受保护」
+    不看角色状态 —— 否则把 `super_admin` 角色禁用一下就能改超管密码；
+  - 原来那个无操作人、无目标保护的 `AuthService.UpdateUserPassword`（只收 userID +
+    新密码的覆盖式重置）**已删除**，管理员重置他人密码只剩 `/admin/user/update` 一个入口；
+  - 保留：超管管理任何账号、普通管理员管理普通账号、本人自助改密（仍须旧密码，
+    也不会把超管本人的改密挡住）。
+  回归测试 `app/controller/user_admin_guard_test.go` 用 sqlmock 在**真实调用链**
+  （handler → service → repo → GORM）上按顺序断言：非超管管理超管时只有那几条带
+  `FOR UPDATE` / `FOR SHARE` 的身份读、随后 ROLLBACK，**一条写语句都不出现**，
+  `body.code` 为 403；用 `WithArgs` 钉住每条加锁读的 `user_id`，于是锁序（目标 ID 更小
+  就先锁目标）、「操作自己只锁一次」也成了可证的；用户行缺失、锁等待超时都拒绝；
+  零角色账号的首次赋角色、超管/普通管理员管理普通账号与本人自助改密照常走完整写入并
+  COMMIT。`app/repo/identity_lock_sql_test.go` 另用 MySQL dialector + DryRun 断言生成的
+  SQL 真的带加锁子句、删除真的按 `user_id` 条件走（不用 SQLite —— 它没有这两个子句）。
+  > 边界：这些测试能证明语句顺序、加锁子句、绑定参数和「没有写入」，
+  > **证不了真实 MySQL 的事务原子性与并发交错结果**（可见性、锁等待、死锁回滚）。
+  > 那部分仍需在真库上跑一遍，不要把它当成已验证的并发安全。
+- **编辑用户资料不会再静默撤销角色**。`/admin/user/update` 的 `role_ids` 改成
+  **选择性更新**：没带这个字段（或 `null`）表示本次不改角色，完全不碰
+  `admin_user_roles`；要清空必须显式传 `[]`。之前它是无条件整体替换，
+  于是前端一次「只改昵称」的保存就把该账号的角色全删了。
+  判定依据是切片的 **nil 性**而不是长度 —— `encoding/json` 对「字段缺失」和 `null`
+  都留下 nil 切片，对 `[]` 给出非 nil 的空切片，用 `len(...) == 0` 会把两者混成一种。
+  注意这只影响角色这一段：**目标账号保护、身份锁、`auth_version` 原子变更与
+  本次改不改角色无关，始终执行**，「不传 `role_ids`」不是绕过账号保护的口子。
+  > **选择性更新只有 `role_ids` 一个字段**，这个端点**不是 PATCH**：
+  > `realname`、`nickname`、`email`、`mobile`、`status`、`password` 等仍是
+  > **完整表单语义**（按收到的值覆盖），改一个字段仍要把其它字段的当前值一起回传。
+  > 只想改角色、不动资料，走已有的 `/admin/role/assign`。
+- **角色被禁用后，持有它的账号仍能正常编辑**：
+  - 编辑页的角色列表包含「该账号持有中但已被禁用」的角色（以库里的
+    `admin_user_roles` 为准补查，不依赖前端回传），显示为「已禁用」并保持勾选；
+  - 这类关联**可以原样保留、也可以明确取消**，但**不能新增**已禁用的角色
+    （`app/service/role_guard.go` 的 `CheckRoleStatusAssignable`）。对超管同样生效 ——
+    这是「禁用中的角色不该被新赋出去」的数据正确性约束，不是权限大小问题，
+    要赋它先把角色启用；
+  - 入参角色校验不再按 `status = 1` 过滤（`FindByRoleIDAnyStatusForShare`）：
+    过滤的后果是「保留一个自己已经持有的禁用角色」被当成「角色ID不存在」而整笔失败，
+    于是运维一禁用某个角色，持有它的账号连改昵称都存不下去。状态该怎么判定交给上面
+    那个纯守卫，不在查询里悄悄过滤。
+- **被禁用的角色不再贡献任何接口 / 菜单 / 按钮权限**。之前
+  `repo.FindUserPermissions` 只联 `admin_user_roles → admin_role_permissions →
+  admin_permissions` 并且只过滤权限行自身的 `status`，**没有角色状态条件** ——
+  于是「禁用角色」只是在角色列表里灰了一下：持有它的人该调的接口照样调通、
+  该看见的菜单照样在。现在那条查询联上 `admin_roles` 并同时要求
+  `r.status = 1 AND p.status = 1`：
+  - 关联行**照样保留**（启用后权限自然恢复、编辑页也靠它回显），禁用期间不算权限；
+    明确提交一个不含它的新集合同样允许，关联会被移除；
+  - 过滤只写在这一个地方。非超管「实际被授权了哪些权限」只有这一个出口：接口权限校验
+    （`middleware.PermissionMiddleware` → `helper/permission.Checker`）与菜单、按钮下发
+    （`AdminRoleService.GetUserMenusAndButtons`）都从它取数，所以不会出现
+    「接口已经不通了、菜单却还在」这种半截效果；
+  - 「唯一出口」指的是唯一的**授权来源**，不是「整个请求只查一次库」：那条查询给出的是
+    被直接授权的权限行（有效叶子），`parent_id != 0` 的子菜单要挂上树还需要祖先节点，
+    由 `collectMenuParentRecursive` 按 `parent_id` 再查一次 `admin_permissions`。
+    这次补查**只补结构、不扩授权** —— 递归起点全来自那条已过滤的查询，
+    **没有有效后代就不会发生补查**（禁用角色借不到这条路让菜单冒出来），
+    且**祖先自身必须启用**，禁用的祖先不补出来、它下面的有效子菜单成孤儿被丢弃；
+  - 多角色并集的口径：禁用角色**独占**的权限随它消失，同一条权限只要还有另一个
+    启用角色挂着就照常有效；角色重新启用后权限恢复，但**仍受权限行自身状态控制**；
+  - 「有没有超管权力」（`IsUserSuperAdmin`）同样要求 `super_admin` 角色启用中；
+    权限查询出错一律 fail closed（回 500 且不执行后续 handler）；
+  - **不引入权限缓存**，每次校验都查库 —— 加缓存必须同时设计禁用角色的失效路径。
+
+  回归测试分两层：`app/repo/user_permission_sql_test.go` 用 MySQL dialector + DryRun
+  断言生成的语句真的联了 `admin_roles` 且带这两个条件（状态是写死的常量、不是绑定参数）；
+  `app/controller/user_permission_scope_test.go` 跑真实调用链（真的中间件 + 真的
+  Checker + 真的 service + 真的 repo），期望正则**要求**语句里出现
+  `JOIN admin_roles` 与 `r.status = 1`，覆盖禁用 / 启用 / 多角色共享 / 权限行自身禁用 /
+  超管短路 / 查询出错 fail closed，以及 `parent_id != 0` 的嵌套菜单
+  （补出启用祖先并挂好子菜单 / 无有效后代时一次补查都不发生 / 祖先被禁用时不补出）。
+  > 边界：sqlmock **不执行也不理解 SQL**，「禁用角色的权限行没被返回」是测试喂的行数据
+  > 所模拟的结果。上面能证明的是**语句形状**、**授权只从这个出口取数**，以及
+  > **祖先补查发生与否和它的参数**；
+  > 「MySQL 真的按这些条件过滤出正确的并集」仍需真库验证。
+- **Token 吊销以数据库列 `admin_users.auth_version` 为权威标记**：
+  - 签发时把「校验凭证那一刻读到的版本」和 jti 一起登记到 Redis（`auth:jti:<jti>`），
+    校验时与库里的当前版本比对，不相等即失效；
+  - 改密、重置密码、禁用 / 删除用户都在**同一个数据库事务**里自增该版本，
+    不存在「密码已改、吊销没写成功」的中间态；
+  - 刷新 Token 沿用旧会话的版本，不重新读当前值，所以刷新不能跨过一次改密 / 禁用续命；
+  - 吊销标记不放 Redis，是因为 Redis 可淘汰、可重启丢失：计数一丢，已吊销的会话会复活。
+    现在丢的只可能是 jti 键，而 jti 键丢失的后果是**拒绝**，方向是安全的；
+  - 会话校验依赖的 Redis 或版本来源出错时**拒绝放行**（fail closed），而不是放过去。
+- 登出吊销的是**请求真正通过认证的那个 Token**：controller 与中间件统一用
+  `middleware.GetJWTToken`（Cookie → `jwt_token` 头 → `Bearer`），不再各写一套优先级。
+- `RefreshToken` 不再从 URL query 取 Token。
+- 登录、验证码发送/校验、前端错误上报都挂了**限流**，并限制请求体大小；
+  客户端自带的 `X-Real-IP` 不再被信任（`app/middleware/client_ip.go`）。
+- 登录成功 / 失败都写 `admin_user_login_logs`；pprof 默认关闭。
+- **登录失败真的以 `login_status=0` 落库**。之前 model 的 `LoginStatus` 带了
+  `gorm:"default:1"`，GORM 把零值（失败）当成「调用方没赋值」并用默认值替换，
+  于是**每一条失败登录都被记成成功**（接口仍返回 401，只有日志表失真）——
+  真实环境里出现过「带失败原因的记录全是成功」。现在该字段**不带任何 gorm 默认值**，
+  建表默认值也改成 0（漏写列时记成失败比记成成功安全）。回归测试
+  `app/repo/admin_user_login_log_repo_test.go` 用 MySQL dialector + DryRun 真的跑一遍
+  GORM 的 Create，断言 INSERT 里 `login_status` 在场且绑定值就是 0 / 1。
+  > 注意：这个默认值是审计语义的坑，不是单个字段的笔误 —— 给「零值有业务含义」的列
+  > （0=失败 / 0=禁用 / 0=未读）加 `gorm:"default:..."` 都会踩同一条路径。
+- 普通用户可以改自己的密码（`/admin/user/change-password` 不再走接口权限）。
+- **个人中心有入口可进**：顶栏右上角的用户名 + 头像现在是一个原生按钮，点击进入已有的
+  `profile` 页面（Tab 可聚焦、Enter / Space 可触发，无障碍与键盘操作走浏览器默认行为）。
+  之前这块只是静态文字，`profile` 路由存在但没有任何入口，改密、绑手机只能手敲地址栏。
+  没有新增页面，也没有新增菜单权限行。
+- **自助改密只有一个入口，且必须带旧密码**：个人信息 → 修改密码（`/admin/user/change-password`）。
+  原来还有一个 `/admin/user/set-password`：它从 JWT 取本人 ID、只收 `new_password`，
+  等于「拿到一个有效 Token 就能静默改掉密码」，且与上面的流程重复 —— 已连同
+  controller / service / DTO / 接口权限行 / 前端页面、路由、API、类型一起删除。
+  **管理员重置他人密码不受影响**，走用户管理的 `/admin/user/update`（`password` 字段），
+  仍受接口权限校验（权限 204），并额外受上面的超管账号保护；资料 / 密码 / 角色在同一个
+  事务里写，判定不通过时都不落库。
+- `admin_depts.dept_code` 改成**可空**（`*string` + `NULL DEFAULT NULL`），
+  不填编码也能连续创建多个部门；非空编码仍受 `uk_dept_code` 唯一约束。
+- 初始管理员密码每次生成随机，且不写进本仓库任何文件。
+- 删掉了未挂路由的自助注册流程（controller / service / DTO / 前端类型）：
+  本底座的建号入口只有「管理员新增用户」。
 
 ### 其它
 
-9. `docs/` 下的流程文档用「公告（Notice）」作为贯穿的示例域，**那是示例，不是已实现的模块**，
-   仓库里没有对应代码和表。
+- `docs/` 下的流程文档用「公告（Notice）」作为贯穿的示例域，**那是示例，不是已实现的模块**，
+  仓库里没有对应代码和表。

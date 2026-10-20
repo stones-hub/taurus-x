@@ -1,0 +1,185 @@
+package service
+
+import (
+	"errors"
+	"testing"
+
+	"{{ .Module }}/app/constants"
+	"{{ .Module }}/app/model"
+)
+
+// 判定用到的几种角色事实（写成变量而不是内联字面量，与 role_guard_test.go 保持一致）
+var (
+	superAdminFact = RoleFact{RoleID: 1, RoleCode: constants.SuperAdminRoleCode, IsSystem: 1}
+	// is_system 被改成 0 的超管角色：受保护与否只认 role_code
+	superAdminNotSystemFact = RoleFact{RoleID: 1, RoleCode: constants.SuperAdminRoleCode, IsSystem: 0}
+	opsAdminFact            = RoleFact{RoleID: 3, RoleCode: "ops_admin", IsSystem: 0}
+	viewerFact              = RoleFact{RoleID: 4, RoleCode: "viewer", IsSystem: 0}
+	// RoleFactOf(nil) 的结果，不能被当成超管
+	zeroFact = RoleFact{}
+)
+
+// TestHoldsSuperAdminRole 判定「目标是否受超管保护」只看 role_code，
+// 不看 is_system、不看角色状态：这两个都可能被改，而受保护与否不该跟着松动。
+func TestHoldsSuperAdminRole(t *testing.T) {
+	cases := []struct {
+		name  string
+		facts []RoleFact
+		want  bool
+	}{
+		{name: "无角色", facts: nil, want: false},
+		{name: "空切片", facts: []RoleFact{}, want: false},
+		{name: "只有普通角色", facts: []RoleFact{opsAdminFact, viewerFact}, want: false},
+		{name: "持有超管角色", facts: []RoleFact{opsAdminFact, superAdminFact}, want: true},
+		{name: "超管角色的 is_system 为 0", facts: []RoleFact{superAdminNotSystemFact}, want: true},
+		{name: "零值事实", facts: []RoleFact{zeroFact}, want: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := HoldsSuperAdminRole(tc.facts); got != tc.want {
+				t.Errorf("HoldsSuperAdminRole = %v, 期望 %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCheckTargetUserManageable 目标账号保护的判定表。
+func TestCheckTargetUserManageable(t *testing.T) {
+	cases := []struct {
+		name                 string
+		operatorIsSuperAdmin bool
+		targetFacts          []RoleFact
+		wantForbidden        bool
+	}{
+		// 保留的既有授权功能
+		{name: "超管管理超管", operatorIsSuperAdmin: true, targetFacts: []RoleFact{superAdminFact}, wantForbidden: false},
+		{name: "超管管理普通账号", operatorIsSuperAdmin: true, targetFacts: []RoleFact{opsAdminFact}, wantForbidden: false},
+		{name: "普通管理员管理普通账号", operatorIsSuperAdmin: false, targetFacts: []RoleFact{opsAdminFact}, wantForbidden: false},
+		{name: "普通管理员管理无角色账号", operatorIsSuperAdmin: false, targetFacts: nil, wantForbidden: false},
+		// 本次修的漏洞
+		{name: "普通管理员管理超管账号", operatorIsSuperAdmin: false, targetFacts: []RoleFact{superAdminFact}, wantForbidden: true},
+		{
+			name:                 "普通管理员管理兼有超管与普通角色的账号",
+			operatorIsSuperAdmin: false,
+			targetFacts:          []RoleFact{opsAdminFact, superAdminFact},
+			wantForbidden:        true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := CheckTargetUserManageable(tc.operatorIsSuperAdmin, tc.targetFacts)
+			if tc.wantForbidden {
+				if !errors.Is(err, ErrForbidden) {
+					t.Errorf("应返回 ErrForbidden（供 FailByError 映射成 403），实际 %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("应放行，实际被拒: %v", err)
+			}
+		})
+	}
+}
+
+// TestGuardIdentityAsymmetry 两个方向的判定口径必须是不对称的：
+//
+//	holdsEnabledSuperAdmin（我有没有超管权力）要求角色启用中 —— 禁用期间不给权力；
+//	HoldsSuperAdminRole（这个账号是否受保护）不看状态 —— 禁用期间仍受保护。
+//
+// 写成对称的任一种都有坑：都看状态，则把 super_admin 角色禁用一下就能改超管密码；
+// 都不看状态，则被禁用超管角色的人还能继续行使超管权力。
+func TestGuardIdentityAsymmetry(t *testing.T) {
+	superRoleDisabled := model.AdminRole{RoleID: 1, RoleCode: constants.SuperAdminRoleCode, IsSystem: 1, Status: 0}
+	superRoleEnabled := model.AdminRole{RoleID: 1, RoleCode: constants.SuperAdminRoleCode, IsSystem: 1, Status: 1}
+	opsRole := model.AdminRole{RoleID: 3, RoleCode: "ops_admin", IsSystem: 0, Status: 1}
+
+	disabledSuper := []model.AdminRole{superRoleDisabled}
+	if holdsEnabledSuperAdmin(disabledSuper) {
+		t.Error("超管角色已禁用时，持有者不应被认定为有超管权力")
+	}
+	if !HoldsSuperAdminRole(roleFactsOf(disabledSuper)) {
+		t.Error("超管角色已禁用时，该账号仍应受目标账号保护")
+	}
+
+	if !holdsEnabledSuperAdmin([]model.AdminRole{superRoleEnabled}) {
+		t.Error("启用中的超管角色应被认定为有超管权力")
+	}
+
+	ordinary := []model.AdminRole{opsRole}
+	if holdsEnabledSuperAdmin(ordinary) {
+		t.Error("普通角色不应被认定为有超管权力")
+	}
+	if HoldsSuperAdminRole(roleFactsOf(ordinary)) {
+		t.Error("只持有普通角色的账号不应受超管保护")
+	}
+}
+
+// TestRoleFactsOf roleFactsOf 必须逐个保留判定要素，且空输入返回空切片而非 nil
+// （调用方会把它接着传给 CheckRoleAssignmentAllowed）。
+func TestRoleFactsOf(t *testing.T) {
+	roles := []model.AdminRole{
+		{RoleID: 1, RoleCode: constants.SuperAdminRoleCode, IsSystem: 1, Status: 1},
+		{RoleID: 3, RoleCode: "ops_admin", IsSystem: 0, Status: 1},
+	}
+	facts := roleFactsOf(roles)
+	if len(facts) != len(roles) {
+		t.Fatalf("事实条数 = %d，期望 %d", len(facts), len(roles))
+	}
+	for i := range roles {
+		if facts[i].RoleID != roles[i].RoleID || facts[i].RoleCode != roles[i].RoleCode || facts[i].IsSystem != roles[i].IsSystem {
+			t.Errorf("第 %d 条事实与角色不一致: %+v vs %+v", i, facts[i], roles[i])
+		}
+	}
+
+	if got := roleFactsOf(nil); got == nil || len(got) != 0 {
+		t.Errorf("空输入应返回空切片，实际 %#v", got)
+	}
+}
+
+// TestSortedUniqueUserIDs 固定锁序的实现必须「升序 + 去重 + 丢掉 0」。
+//
+// 这三条都不是风格问题：
+//   - 不升序：A 改 B 的同时 B 改 A，两笔各持一半用户行锁互等，死锁；
+//   - 不去重：操作人就是目标时会对同一行连锁两次，多一次无用的当前读，
+//     也让「锁了几行」对不上账，测试和排查都会被误导；
+//   - 不丢 0：user_id 从 1 起算，0 是「没有操作人 / 没有目标」的占位，
+//     拿它去查只会查不到，徒增一次语句。
+func TestSortedUniqueUserIDs(t *testing.T) {
+	crossManage := []uint64{11, 2}
+	crossManageReversed := []uint64{2, 11}
+	wantCross := []uint64{2, 11}
+
+	selfManage := []uint64{7, 7}
+	wantSelf := []uint64{7}
+
+	withZero := []uint64{0, 5, 0}
+	wantWithZero := []uint64{5}
+
+	cases := []struct {
+		name string
+		in   []uint64
+		want []uint64
+	}{
+		{name: "交叉管理按升序", in: crossManage, want: wantCross},
+		{name: "入参顺序相反也得到同一锁序", in: crossManageReversed, want: wantCross},
+		{name: "操作自己只锁一次", in: selfManage, want: wantSelf},
+		{name: "丢掉 0", in: withZero, want: wantWithZero},
+		{name: "空输入", in: nil, want: []uint64{}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sortedUniqueUserIDs(tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("锁定条数 = %d(%v)，期望 %d(%v)", len(got), got, len(tc.want), tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Errorf("第 %d 个锁定 ID = %d，期望 %d（完整结果 %v）", i, got[i], tc.want[i], got)
+				}
+			}
+		})
+	}
+}

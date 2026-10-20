@@ -237,13 +237,17 @@ func printNextSteps(result *generator.Result) {
 	fmt.Printf("  1. 建库并导入初始化 SQL:\n")
 	fmt.Printf("       mysql -u<user> -p -e \"CREATE DATABASE IF NOT EXISTS <库名> DEFAULT CHARSET utf8mb4\"\n")
 	fmt.Printf("       mysql -u<user> -p <库名> < %s/scripts/sql/init.sql\n", rel)
-	fmt.Printf("  2. 配置环境变量（含 JWT 密钥、数据库/Redis 地址）:\n")
-	fmt.Printf("       cd %s/backend && cp .env.example .env.local && vi .env.local\n", rel)
+	fmt.Printf("  2. 生成 JWT 签名密钥并配置环境变量（数据库/Redis 地址）:\n")
+	fmt.Printf("       cd %s/backend && cp .env.example .env.local\n", rel)
+	fmt.Printf("       openssl rand -hex 32        # 输出写进 .env.local 的 JWT_SECRET=\n")
+	fmt.Printf("       %s（JWT_SECRET 未配置或过短时后端会拒绝启动）%s\n", yellow, reset)
 	fmt.Printf("  3. 安装前端依赖:\n")
 	fmt.Printf("       cd %s/frontend && pnpm install\n", rel)
 	fmt.Printf("  4. 本地开发（前端 Vite + 后端 Go）:\n")
 	fmt.Printf("       cd %s && make dev\n", rel)
-	fmt.Printf("\n%s初始管理员:%s 账号 %s%s%s / 默认密码 %s%s%s —— 登录后请立即修改。\n",
-		yellow, reset, green, result.AdminUsername, reset, green, result.AdminPassword, reset)
+	fmt.Printf("\n%s初始管理员（随机生成，只显示这一次，没有写进项目文件）:%s\n", yellow, reset)
+	fmt.Printf("    账号 %s%s%s / 密码 %s%s%s\n",
+		green, result.AdminUsername, reset, green, result.AdminPassword, reset)
+	fmt.Printf("  %s请现在就记下来，并在首次登录后立即修改；丢了只能按 README「初始管理员」一节重算散列。%s\n", yellow, reset)
 	fmt.Printf("%s生成项目的 README.md「已知风险」章节列出了底座仍待修复的安全问题，上线前请先阅读。%s\n", yellow, reset)
 }

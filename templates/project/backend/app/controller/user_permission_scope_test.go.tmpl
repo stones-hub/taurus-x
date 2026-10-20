@@ -1,0 +1,584 @@
+// 「禁用角色不贡献权限」在**真实调用链**上的行为回归：
+// 接口权限中间件（middleware.PermissionMiddleware → helper/permission.Checker）
+// 与菜单、按钮下发（RoleController.MenusButtons → service.GetUserMenusAndButtons）。
+//
+// 跑的是真的中间件 + 真的 Checker + 真的 service + 真的 repo + 真的 GORM，
+// 只有数据库连接是 sqlmock。能证明的是三件事：
+//
+//  1. **执行到数据库的那条语句带着角色状态过滤**。期望用的正则（userPermQuery）
+//     要求语句里出现 `JOIN admin_roles` 与 `r.status = 1`：谁把过滤条件去掉，
+//     这条期望就匹配不上，测试立刻红。这是本文件里唯一能证明「过滤真的生效」的断言方式。
+//  2. **授权来源只有这一条查询**。注意这不等于「整个请求只查一次库」：菜单树的
+//     祖先节点由 collectMenuParentRecursive 按 parent_id 另外补查
+//     （admin_permissions 单行读，SQL 不带状态条件）。本文件的做法是把这些补查
+//     逐条登记进期望表 —— 多查一次、少查一次、换个参数查都会失败，于是
+//     「补查只为已授权的后代发生、且祖先必须启用」成了可证的；
+//     而**凭空多出一条不在期望表里的取数路径**同样会撞上「未预期的语句」。
+//  3. 超管短路、权限行自身禁用、身份查询出错 fail closed 这三条分支的实际响应码。
+//
+// sqlmock 的局限必须说清，不能拿它冒充真库：**它不执行 SQL，也不理解 SQL**。
+// 「禁用角色的权限行没被返回」这件事是本文件喂给它的行数据所**模拟**的结果，
+// 不是 MySQL 按 WHERE 过滤出来的结果。所以：
+//   - 语句形状（联了哪些表、带了哪些条件、参数怎么绑）—— 本文件 + repo/user_permission_sql_test.go 可证；
+//   - MySQL 真的按这些条件过滤出了正确的多角色并集 —— 证不了，归真库验收。
+//
+// 另外：中间件的检查器是 middleware 包的**包级全局变量**（SetPermissionChecker），
+// 所以本文件的用例不能并行（没有 t.Parallel），每个用例自己装一次、用完置空。
+package controller
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
+
+	"{{ .Module }}/app/constants"
+	"{{ .Module }}/app/helper/permission"
+	"{{ .Module }}/app/middleware"
+	"{{ .Module }}/app/repo"
+	"{{ .Module }}/app/service"
+)
+
+// permCheckedAPIPath 被校验的接口路径：必须和 jwtRequest 构造出来的请求路径一致
+// （Checker 按 r.URL.Path 精确比对 permission.path）。
+const permCheckedAPIPath = "/admin/user/update"
+
+// disabledSuperRole 一个**被禁用的** super_admin 角色。
+//
+// 用来钉住 IsUserSuperAdmin 的口径：它要求角色启用中，所以持有这条角色的账号
+// 不按超管放行，而是老老实实走权限表 —— 而权限表那条查询又过滤了禁用角色，
+// 于是它什么也拿不到。反过来，user_guard.go 判定「目标账号是否受保护」时
+// 刻意不看状态（禁用的 super_admin 同样受保护），两个方向不要混。
+var disabledSuperRole = identity{
+	roleID:   roleSuperID,
+	roleCode: constants.SuperAdminRoleCode,
+	isSystem: 1,
+	status:   constants.RoleStatusDisabled,
+}
+
+// ---------- SQL 期望 ----------
+
+// plainSel 普通读（无锁）。用 `^SELECT \*` 锚住开头是必要的：
+// 身份关联读和有效权限联表读都落在 admin_user_roles 上，
+// 不锚开头的话 `SELECT DISTINCT p.* FROM admin_user_roles ur ...` 也会被
+// 身份读的期望吃掉，于是「实现跳过了身份判定」就测不出来了。
+func plainSel(table string) string { return `^SELECT \* FROM .?` + table }
+
+// userPermQuery 有效权限联表查询的期望。
+//
+// 这条正则是本文件的核心断言：它**要求**执行到数据库的语句里带着
+// `JOIN admin_roles` 和 `r.status = 1`（禁用角色不贡献权限），
+// 以及 `p.status = 1`（权限行自身禁用不生效）。
+// 把其中任何一个条件从 repo 实现里删掉，这里就匹配不上而失败。
+//
+// 中间用 `.*` 留白、不绑死 GORM 的完整渲染（反引号、空格、字段顺序），
+// 否则升个 GORM 小版本就会误报。
+func userPermQuery() string {
+	return `SELECT DISTINCT p\.\* FROM admin_user_roles ur.*` +
+		`JOIN admin_roles r ON r\.role_id = ur\.role_id.*` +
+		`JOIN admin_role_permissions rp.*JOIN admin_permissions p.*` +
+		`WHERE ur\.user_id = \? AND r\.status = 1 AND p\.status = 1`
+}
+
+// permRows admin_permissions 的列（联表查的是 `DISTINCT p.*`，所以列就是这张表的列）。
+func permRows() *sqlmock.Rows {
+	return sqlmock.NewRows([]string{
+		"permission_id", "parent_id", "permission_name", "permission_code",
+		"permission_type", "path", "icon", "sort_order", "status",
+	})
+}
+
+// expectIdentityRead 登记一次「普通读某账号的身份」（IsUserSuperAdmin 的取数方式：
+// 关联表 + 逐个角色行，都不加锁 —— 这是只读校验路径，不是授权写入路径）。
+//
+// 关联读**不按角色状态过滤**：禁用角色的关联行照样读得出来（启用后要能恢复、
+// 编辑页要能回显）。它不授予权限是后面那条有效权限查询的事。
+func expectIdentityRead(mock sqlmock.Sqlmock, userID uint64, ids ...identity) {
+	rows := sqlmock.NewRows([]string{"id", "user_id", "role_id"})
+	for i, id := range ids {
+		rows.AddRow(i+1, userID, id.roleID)
+	}
+	mock.ExpectQuery(plainSel("admin_user_roles")).WithArgs(userID).WillReturnRows(rows)
+	for _, id := range ids {
+		mock.ExpectQuery(plainSel("admin_roles")).WithArgs(firstArgs(id.roleID)...).
+			WillReturnRows(roleRows().AddRow(id.roleID, id.roleCode, id.isSystem, id.status))
+	}
+}
+
+// middlewareRespCode 取响应体里的业务码。
+//
+// 不能复用 respCode：权限中间件直接调 httpx.SendResponse(w, 403, "无权限访问该接口", nil)，
+// data 是个**字符串**；controller 层的 Fail 才包成 {"message": ...} 对象。
+// 两种形态都是 HTTP 200 + body.code，判成功失败只能看 code。
+func middlewareRespCode(t *testing.T, rec *httptest.ResponseRecorder) int {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("HTTP 状态码应为 200（业务码在 body.code 里），实际 %d", rec.Code)
+	}
+	var resp struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v，body = %s", err, rec.Body.String())
+	}
+	return resp.Code
+}
+
+// ---------- 接口权限中间件 ----------
+
+// newAPIPermissionHandler 按生产方式装配接口权限链：
+// Store → AdminRoleService → permission.Checker → middleware.PermissionMiddleware。
+// 返回值里的 *bool 表示「后续 handler 有没有被执行」—— 拒绝时它必须还是 false。
+func newAPIPermissionHandler(t *testing.T) (http.Handler, *bool, sqlmock.Sqlmock) {
+	t.Helper()
+	db, mock := newMockDB(t)
+	middleware.SetPermissionChecker(permission.NewChecker(service.NewAdminRoleService(repo.NewStoreWithDB(db))))
+	t.Cleanup(func() { middleware.SetPermissionChecker(nil) })
+
+	reached := false
+	h := middleware.PermissionMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		OK(w, map[string]string{"message": "reached"})
+	}))
+	return h, &reached, mock
+}
+
+// TestAPIPermissionMiddleware_OnlyEnabledRolesGrantAccess 接口权限只由启用角色贡献。
+//
+// 四条语义各自对应一种线上现象：
+//   - 禁用角色独占的接口要立刻不通（本次修的就是这条：原来照样能调）；
+//   - 同一条接口只要还有另一个启用角色挂着，就不该被连带掉；
+//   - 权限行自身被禁用时不生效；
+//   - super_admin 被禁用时不按超管放行，落回权限表（于是也什么都拿不到）。
+func TestAPIPermissionMiddleware_OnlyEnabledRolesGrantAccess(t *testing.T) {
+	apiPerm := func(status int8) func() *sqlmock.Rows {
+		return func() *sqlmock.Rows {
+			return permRows().AddRow(300, 0, "编辑用户", "user.update",
+				constants.PermissionTypeAPI, permCheckedAPIPath, "", 0, status)
+		}
+	}
+	noPerm := func() *sqlmock.Rows { return permRows() }
+
+	cases := []struct {
+		name  string
+		roles []identity
+		// perms 有效权限查询返回的行；nil 表示这条查询**根本不该发生**（超管短路）
+		perms    func() *sqlmock.Rows
+		wantCode int
+		wantNext bool
+		why      string
+	}{
+		{
+			name: "禁用角色独占的接口：不通",
+			// 账号挂着两个角色，但 3 号（启用）名下没有这条接口，5 号（禁用）才有。
+			// 过滤生效时这条联表查询一行都查不出来。
+			roles:    []identity{ordinaryRole, disabledRole},
+			perms:    noPerm,
+			wantCode: http.StatusForbidden,
+			wantNext: false,
+			why:      "角色被禁用后它独占的接口必须立刻不通",
+		},
+		{
+			name: "共享权限：另一个启用角色也挂着，照常放行",
+			// 并集的口径：禁用角色不贡献独占权限，但不能把别的启用角色的权限连带掉
+			roles:    []identity{ordinaryRole, disabledRole},
+			perms:    apiPerm(1),
+			wantCode: http.StatusOK,
+			wantNext: true,
+			why:      "禁用一个角色不该顺带吊销其他启用角色给的权限",
+		},
+		{
+			name:     "权限行自身被禁用：不通",
+			roles:    []identity{ordinaryRole},
+			perms:    apiPerm(0),
+			wantCode: http.StatusForbidden,
+			wantNext: false,
+			why:      "权限行 status=0 时不生效（SQL 已过滤，Go 侧还有一道兜底）",
+		},
+		{
+			name:     "super_admin 角色被禁用：不按超管放行",
+			roles:    []identity{disabledSuperRole},
+			perms:    noPerm,
+			wantCode: http.StatusForbidden,
+			wantNext: false,
+			why:      "IsUserSuperAdmin 要求角色启用中，禁用后落回权限表",
+		},
+		{
+			name:  "启用的 super_admin：短路放行，不查权限表",
+			roles: []identity{superRole},
+			// perms 为 nil：期望表里没有联表查询，超管若还去查一次就撞上未预期的语句
+			perms:    nil,
+			wantCode: http.StatusOK,
+			wantNext: true,
+			why:      "超管直接放行是既有语义，不能因为本次改动而退化成查权限表",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			h, reached, mock := newAPIPermissionHandler(t)
+
+			expectIdentityRead(mock, operatorOrdinaryID, tc.roles...)
+			if tc.perms != nil {
+				mock.ExpectQuery(userPermQuery()).WithArgs(operatorOrdinaryID).WillReturnRows(tc.perms())
+			}
+
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, jwtRequest(t, operatorOrdinaryID, nil))
+
+			if got := middlewareRespCode(t, rec); got != tc.wantCode {
+				t.Errorf("body.code 应为 %d，实际 %d（%s）；body = %s", tc.wantCode, got, tc.why, rec.Body.String())
+			}
+			if *reached != tc.wantNext {
+				t.Errorf("后续 handler 是否执行应为 %v，实际 %v（%s）", tc.wantNext, *reached, tc.why)
+			}
+			assertNoUnexpectedSQL(t, mock)
+		})
+	}
+}
+
+// TestAPIPermissionMiddleware_IdentityQueryErrorFailsClosed 身份查不出来一律拒绝。
+//
+// 这里要拦住的不是「没权限」，而是「不知道有没有权限就放过去」：
+// 一次数据库抖动不能变成一次放行。Checker 把 error 原样往上传，
+// 中间件回 500 并且**不执行**后续 handler。
+func TestAPIPermissionMiddleware_IdentityQueryErrorFailsClosed(t *testing.T) {
+	h, reached, mock := newAPIPermissionHandler(t)
+
+	mock.ExpectQuery(plainSel("admin_user_roles")).WithArgs(operatorOrdinaryID).
+		WillReturnError(errors.New("连接中断"))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, jwtRequest(t, operatorOrdinaryID, nil))
+
+	if got := middlewareRespCode(t, rec); got != http.StatusInternalServerError {
+		t.Errorf("身份查询出错应回 500（fail closed），实际 body.code = %d", got)
+	}
+	if *reached {
+		t.Error("身份查询出错时绝不能执行后续 handler")
+	}
+	assertNoUnexpectedSQL(t, mock)
+}
+
+// TestAPIPermissionMiddleware_PermissionQueryErrorFailsClosed 有效权限查询出错同样拒绝。
+func TestAPIPermissionMiddleware_PermissionQueryErrorFailsClosed(t *testing.T) {
+	h, reached, mock := newAPIPermissionHandler(t)
+
+	expectIdentityRead(mock, operatorOrdinaryID, ordinaryRole)
+	mock.ExpectQuery(userPermQuery()).WithArgs(operatorOrdinaryID).
+		WillReturnError(errors.New("连接中断"))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, jwtRequest(t, operatorOrdinaryID, nil))
+
+	if got := middlewareRespCode(t, rec); got != http.StatusInternalServerError {
+		t.Errorf("权限查询出错应回 500（fail closed），实际 body.code = %d", got)
+	}
+	if *reached {
+		t.Error("权限查询出错时绝不能执行后续 handler")
+	}
+	assertNoUnexpectedSQL(t, mock)
+}
+
+// ---------- 菜单与按钮 ----------
+
+// menuNodeBody 菜单树节点（只取编码与子节点：这些测试关心「有哪些、挂在谁下面」，
+// 不关心 name/icon/sort 这些渲染字段）。
+type menuNodeBody struct {
+	Code     string         `json:"code"`
+	Children []menuNodeBody `json:"children"`
+}
+
+// menuButtonBody /admin/user/menus-buttons 的响应体。
+// （handler 挂在 RoleController 上，但路由注册在 /admin/user 前缀的 userBaseChain 里，
+// 见 routes.go —— 它只校验登录，不校验接口权限。别把它写成 /admin/role/...）
+type menuButtonBody struct {
+	Code int `json:"code"`
+	Data struct {
+		Menus   []menuNodeBody `json:"menus"`
+		Buttons []string       `json:"buttons"`
+	} `json:"data"`
+}
+
+func decodeMenuButton(t *testing.T, rec *httptest.ResponseRecorder) menuButtonBody {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("HTTP 状态码应为 200（业务码在 body.code 里），实际 %d", rec.Code)
+	}
+	var body menuButtonBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("解析响应失败: %v，body = %s", err, rec.Body.String())
+	}
+	return body
+}
+
+// TestMenusButtons_OnlyEnabledRolesContribute 菜单与按钮的**授权来源**只有那条
+// 已过滤的有效权限查询。
+//
+// 为什么菜单和按钮要一起测：它们是两段不同的代码（菜单走 collectMenuParentRecursive
+// + buildFrontendMenuTree，按钮是另一次遍历），但取数都来自 GetUserAllPermissions。
+// 「角色禁用后菜单没了、按钮还在」是很容易出现的半截修复，这条把两边绑在一起看。
+//
+// 本用例里的权限 parent_id 全是 0，所以不涉及祖先补查；parent_id != 0 的嵌套菜单
+// 行为（补查何时发生、祖先禁用怎么办）见
+// TestMenusButtons_AncestorBackfillOnlyForAuthorizedDescendants。
+//
+// 注意 GetUserMenusAndButtons 对非超管会调 GetUserAllPermissions **两次**
+// （菜单一次、按钮一次），所以期望表里登记两条同样的联表查询；
+// 两条都用 userPermQuery，于是两次取数都必须带角色状态过滤 ——
+// 任何一次绕过过滤都会匹配不上。
+func TestMenusButtons_OnlyEnabledRolesContribute(t *testing.T) {
+	// 四条权限：启用菜单 / 禁用菜单 / 启用按钮 / 禁用按钮。
+	// parent_id 全为 0，于是 collectMenuParentRecursive 不会再去查父权限
+	// （期望表里也就没有 admin_permissions 的单行查询，多查一次即失败）。
+	fullPerms := func() *sqlmock.Rows {
+		return permRows().
+			AddRow(100, 0, "用户管理", "user", constants.PermissionTypeMenu, "/user", "", 1, 1).
+			AddRow(101, 0, "旧模块", "legacy", constants.PermissionTypeMenu, "/legacy", "", 2, 0).
+			AddRow(200, 0, "新增用户", "user.add", constants.PermissionTypeButton, "", "", 0, 1).
+			AddRow(201, 0, "导出旧数据", "legacy.export", constants.PermissionTypeButton, "", "", 0, 0)
+	}
+
+	cases := []struct {
+		name        string
+		roles       []identity
+		perms       func() *sqlmock.Rows
+		wantMenus   []string
+		wantButtons []string
+		why         string
+	}{
+		{
+			name: "角色禁用期间：菜单和按钮一起为空",
+			// 账号的关联还在（启用后要能恢复），但有效权限查询过滤掉了它，
+			// 于是菜单树和按钮列表都是空的。
+			roles:       []identity{disabledRole},
+			perms:       func() *sqlmock.Rows { return permRows() },
+			wantMenus:   []string{},
+			wantButtons: []string{},
+			why:         "禁用角色不贡献菜单，也不贡献按钮",
+		},
+		{
+			name: "角色启用后恢复：但权限行自身禁用的仍被过滤",
+			// 「启用后恢复权限」不等于「恢复全部」：权限行 status=0 的那层过滤还在
+			roles:       []identity{ordinaryRole},
+			perms:       fullPerms,
+			wantMenus:   []string{"user"},
+			wantButtons: []string{"user.add"},
+			why:         "角色启用后权限恢复，仍受权限行自身状态控制",
+		},
+		{
+			name: "多角色：禁用角色不贡献，启用角色照常贡献",
+			// 两个角色的关联都读得出来，但权限并集由那条已过滤的查询给出
+			roles:       []identity{ordinaryRole, disabledRole},
+			perms:       fullPerms,
+			wantMenus:   []string{"user"},
+			wantButtons: []string{"user.add"},
+			why:         "并集只算启用角色，不能因为挂了个禁用角色就整体失效",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			c, mock := newRoleController(t)
+
+			expectIdentityRead(mock, operatorOrdinaryID, tc.roles...)
+			// 菜单一次、按钮一次：两次都走同一条已过滤的查询
+			mock.ExpectQuery(userPermQuery()).WithArgs(operatorOrdinaryID).WillReturnRows(tc.perms())
+			mock.ExpectQuery(userPermQuery()).WithArgs(operatorOrdinaryID).WillReturnRows(tc.perms())
+
+			rec := httptest.NewRecorder()
+			c.MenusButtons(rec, jwtRequest(t, operatorOrdinaryID, nil))
+
+			body := decodeMenuButton(t, rec)
+			if body.Code != http.StatusOK {
+				t.Fatalf("应成功，实际 body.code = %d，body = %s", body.Code, rec.Body.String())
+			}
+
+			gotMenus := make([]string, 0, len(body.Data.Menus))
+			for _, m := range body.Data.Menus {
+				gotMenus = append(gotMenus, m.Code)
+			}
+			assertSameCodes(t, "菜单", gotMenus, tc.wantMenus, tc.why)
+			assertSameCodes(t, "按钮", body.Data.Buttons, tc.wantButtons, tc.why)
+
+			assertNoUnexpectedSQL(t, mock)
+		})
+	}
+}
+
+// assertSameCodes 比对编码集合（按顺序比；本测试的用例里顺序是确定的）。
+func assertSameCodes(t *testing.T, what string, got, want []string, why string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Errorf("%s 应为 %v，实际 %v（%s）", what, want, got, why)
+		return
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("%s 应为 %v，实际 %v（%s）", what, want, got, why)
+			return
+		}
+	}
+}
+
+// flattenMenuCodes 把菜单树压成 "父>子" 形式的路径列表，这样一条断言既能看出
+// 「有哪些菜单」，也能看出「挂在谁下面」—— 只比顶层 code 的话，
+// 「祖先补出来了但子菜单没挂上去」这种半截结果测不出来。
+func flattenMenuCodes(nodes []menuNodeBody, prefix string) []string {
+	out := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		path := n.Code
+		if prefix != "" {
+			path = prefix + ">" + n.Code
+		}
+		out = append(out, path)
+		out = append(out, flattenMenuCodes(n.Children, path)...)
+	}
+	return out
+}
+
+// expectAncestorRead 登记一次「按 parent_id 补查祖先权限行」
+// （AdminPermissionsRepository.FindByPermissionID → SELECT * FROM admin_permissions
+// WHERE permission_id = ? LIMIT 1，SQL 里**不带**状态条件，状态是 Go 侧判的）。
+//
+// 它登记在期望表里而不是被放行，是为了让「补查了几次、按什么参数补」都可证：
+// 不该补的时候补了会撞上未预期的语句，该补的时候没补会「期望未满足」。
+func expectAncestorRead(mock sqlmock.Sqlmock, permissionID uint64, rows *sqlmock.Rows) {
+	mock.ExpectQuery(plainSel("admin_permissions")).WithArgs(firstArgs(permissionID)...).WillReturnRows(rows)
+}
+
+// ancestorExpect 一次预期中的祖先补查（按登记顺序即预期的上溯顺序）。
+type ancestorExpect struct {
+	permissionID uint64
+	rows         func() *sqlmock.Rows
+}
+
+func anc(permissionID uint64, rows func() *sqlmock.Rows) ancestorExpect {
+	return ancestorExpect{permissionID: permissionID, rows: rows}
+}
+
+// TestMenusButtons_AncestorBackfillOnlyForAuthorizedDescendants 嵌套菜单（parent_id != 0）
+// 的祖先补查行为。
+//
+// 这条补的是「有效叶子」与「树结构」之间那段：有效权限查询只返回**被直接授权的**
+// 权限行，而 parent_id != 0 的子菜单要挂到树上还需要祖先节点，
+// 由 collectMenuParentRecursive 按 parent_id 另查 admin_permissions 取回。
+// 这次补查是真实存在的第二次查询，所以不能笼统说「只查一次」；它不构成第二条
+// 授权路径，靠的是下面三条用例各自钉住的约束：
+//
+//   - 有效子菜单在场时，启用的祖先要被补出来，并且子菜单真的挂在它下面；
+//   - 没有任何有效后代时（角色被禁用，那条已过滤的查询一行都不返回），
+//     补查**根本不发生** —— 期望表里一条 admin_permissions 单行读都没登记，
+//     谁加个「兜底把菜单捞回来」的分支就会撞上未预期的语句。
+//     这是「禁用角色不能借祖先补查让菜单冒出来」的可证形式；
+//   - 遇到被禁用的祖先就**就地停住**：既不收集它，也不继续往上走。
+//
+// 最后那条为什么要造三层（孙→被禁用的父→启用的祖父）：只造两层测不出
+// collectMenuParentRecursive 里的状态守卫。把守卫删掉，禁用的父节点会被收进来，
+// 但紧接着又被 GetUserMenusAndButtons 里那道 `perm.Status != 1` 过滤掉，
+// 两层的最终响应一模一样 —— 断言就白写了。三层的区别是可观测的：
+// 守卫在时上溯到父节点就停，祖父那次补查不该发生；守卫被删掉就会多查一次祖父，
+// 并把它当成顶级菜单下发。
+//
+// 同样的 sqlmock 局限：它**不执行也不理解 SQL**。这里能证的是补查发生与否、
+// 补查的参数、以及 Go 侧的取舍与最终响应，**不是** MySQL 的执行与过滤结果；
+// 真库行为仍归真库验收。
+func TestMenusButtons_AncestorBackfillOnlyForAuthorizedDescendants(t *testing.T) {
+	const (
+		grandMenuID  = 90  // 一级菜单「系统管理」(system)
+		parentMenuID = 100 // 二级菜单「用户管理」(user)，parent_id = 90
+		childMenuID  = 110 // 三级菜单「用户列表」(user.list)，parent_id = 100
+	)
+
+	// childOnly 有效权限查询只返回那条最深的子菜单：它的祖先都没有被直接授权，
+	// 要靠 parent_id 补查才会出现（真实权限数据里就是这样配的）。
+	childOnly := func() *sqlmock.Rows {
+		return permRows().AddRow(childMenuID, parentMenuID, "用户列表", "user.list",
+			constants.PermissionTypeMenu, "/user/list", "", 1, 1)
+	}
+	noPerm := func() *sqlmock.Rows { return permRows() }
+	menuRow := func(id, parentID uint64, code string, status int8) func() *sqlmock.Rows {
+		return func() *sqlmock.Rows {
+			return permRows().AddRow(id, parentID, code, code,
+				constants.PermissionTypeMenu, "/"+code, "", 1, status)
+		}
+	}
+
+	cases := []struct {
+		name  string
+		roles []identity
+		perms func() *sqlmock.Rows
+		// ancestors 预期发生的祖先补查，按顺序；空表示「这次请求不该发生祖先补查」
+		ancestors []ancestorExpect
+		wantMenus []string
+		why       string
+	}{
+		{
+			name:  "有效子菜单：补出启用的祖先，子菜单挂在它下面",
+			roles: []identity{ordinaryRole},
+			perms: childOnly,
+			ancestors: []ancestorExpect{
+				anc(parentMenuID, menuRow(parentMenuID, grandMenuID, "user", 1)),
+				anc(grandMenuID, menuRow(grandMenuID, 0, "system", 1)),
+			},
+			wantMenus: []string{"system", "system>user", "system>user>user.list"},
+			why:       "子菜单有权限时祖先必须一路补到根，否则前端没有可挂载的父节点",
+		},
+		{
+			name:  "没有有效后代：禁用角色不能借祖先补查让菜单出现",
+			roles: []identity{disabledRole},
+			perms: noPerm,
+			// 期望表里没有 admin_permissions 单行读：补查一次都不该发生
+			ancestors: nil,
+			wantMenus: []string{},
+			why:       "递归的起点全部来自那条已过滤的查询，它为空时补查无从发生",
+		},
+		{
+			name:  "祖先被禁用：就地停住，不再上溯，子菜单成孤儿被丢弃",
+			roles: []identity{ordinaryRole},
+			perms: childOnly,
+			// 只登记父节点那一次。守卫被删掉的话会继续补查 grandMenuID，
+			// 那条语句不在期望表里 → 「未预期的语句」，整个请求失败。
+			ancestors: []ancestorExpect{
+				anc(parentMenuID, menuRow(parentMenuID, grandMenuID, "user", 0)),
+			},
+			wantMenus: []string{},
+			why:       "禁用的祖先不该出现在菜单树里，也不该让上面的祖父被补成顶级菜单",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			c, mock := newRoleController(t)
+
+			expectIdentityRead(mock, operatorOrdinaryID, tc.roles...)
+			// 菜单那一遍：已过滤的有效权限查询 →（如适用）自下而上的祖先补查
+			mock.ExpectQuery(userPermQuery()).WithArgs(operatorOrdinaryID).WillReturnRows(tc.perms())
+			for _, a := range tc.ancestors {
+				expectAncestorRead(mock, a.permissionID, a.rows())
+			}
+			// 按钮那一遍：同一条已过滤的查询再走一次（按钮不需要祖先）
+			mock.ExpectQuery(userPermQuery()).WithArgs(operatorOrdinaryID).WillReturnRows(tc.perms())
+
+			rec := httptest.NewRecorder()
+			c.MenusButtons(rec, jwtRequest(t, operatorOrdinaryID, nil))
+
+			body := decodeMenuButton(t, rec)
+			if body.Code != http.StatusOK {
+				t.Fatalf("应成功，实际 body.code = %d，body = %s", body.Code, rec.Body.String())
+			}
+
+			assertSameCodes(t, "菜单树", flattenMenuCodes(body.Data.Menus, ""), tc.wantMenus, tc.why)
+			// 这三个用例里有效权限全是菜单类型，按钮列表必须是空的
+			assertSameCodes(t, "按钮", body.Data.Buttons, []string{}, tc.why)
+
+			assertNoUnexpectedSQL(t, mock)
+		})
+	}
+}

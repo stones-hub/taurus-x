@@ -51,6 +51,15 @@
 {{- end }}
 
 > 构建前端需 node（20.19+ / 22.12+，Vite 8 要求），但**只在构建时**需要，运行时不需；推荐本机构建后上传 `dist`。
+{{- if .Has.milvus }}
+>
+> ⚠️ **已知阻塞（未解决）**：Milvus standalone 依赖的 `minio/minio:RELEASE.2024-08-17T01-24-54Z`
+> 在 Docker Hub 与 Quay 的匿名 manifest 请求均返回 401，没有已确认可用的拉取来源，
+> 因此**完整的 `docker compose up` 目前会在拉 minio 镜像这一步失败**。
+> 处置前先自行确认一个可信来源与版本（不要随手换成 `latest` 或来源不明的第三方镜像），
+> 或暂时不启用 compose 里的 milvus / etcd / minio 三个服务（app 本身不依赖它们启动：
+> `milvus.enable` 关掉即可，连不上时也只打日志、不阻断启动）。
+{{- end }}
 
 ---
 
@@ -262,8 +271,30 @@ docker compose ps
 
 - 首次启动 MySQL 自动导入 `scripts/sql/init.sql`（建表 + 底座菜单权限 + 初始管理员）。
 - app 容器对外 `9080:9080`，前端静态由 Go 托管。
+- bind mount 的 `docker-data/logs` 必须先按 5.2 建好并 `chown 1000:1000`：app 容器以非 root
+  （uid=1000）运行，日志目录不可写会导致日志模块初始化失败、容器直接退出。
 
-#### 5.4.1 国内网络：Go 依赖代理
+#### 5.4.1 构建架构（跨平台）
+
+镜像**默认按当前宿主机架构构建**：后端编译阶段用 BuildKit 注入的 `TARGETOS` / `TARGETARCH`
+（`Dockerfile` 里的 `GOARCH=${TARGETARCH}`），运行时阶段不固定 platform，跟着同一个目标走，
+所以 x86_64 机器上出 amd64 镜像、arm64 机器（含 Apple Silicon）上出 arm64 镜像，二进制与
+基础镜像架构始终一致。**不要**在 `docker-compose.yml` 里写 `platform:` —— 那只会把二进制与
+rootfs 的架构不匹配掩盖成启动时的 `exec format error`。
+
+在本机为**另一种架构**的服务器出包时，显式指定目标平台（需要 buildx / BuildKit）：
+
+```bash
+# 例：在 Apple Silicon 上为 amd64 服务器构建并推送
+docker buildx build --platform linux/amd64 -t <你的镜像仓库>/{{ .ProjectName }}-app:<tag> --push .
+```
+
+> 注意：交叉构建出来的镜像**不能在本机运行验证**（除非开 QEMU 模拟，那不等于目标机行为）。
+> 跨架构交付时，「构建通过」和「容器真能起来」是两件事，必须在目标架构的机器上实际启动验证。
+> 另外 `DOCKER_BUILDKIT=0` 时 `TARGETARCH` 为空，等价于按构建机原生架构编译（结果仍正确，
+> 但无法交叉出包）。
+
+#### 5.4.2 国内网络：Go 依赖代理
 
 `Dockerfile` 后端构建阶段默认已设置 `GOPROXY=https://goproxy.cn,direct`，执行 `docker compose up -d --build app` 时会使用该代理下载 Go 依赖，无需额外配置；实际可用性仍取决于目标机网络。
 

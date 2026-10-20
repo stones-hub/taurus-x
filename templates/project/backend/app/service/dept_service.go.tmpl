@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/google/wire"
 
@@ -57,7 +58,7 @@ func (s *AdminDeptService) GetDeptList(ctx context.Context, page, pageSize int, 
 			DeptName:       dept.DeptName,
 			ParentID:       dept.ParentID,
 			ParentDeptName: parentName,
-			DeptCode:       dept.DeptCode,
+			DeptCode:       deptCodeText(dept.DeptCode),
 			Description:    dept.Description,
 			SortOrder:      dept.SortOrder,
 			DeptSource:     dept.DeptSource,
@@ -89,7 +90,7 @@ func (s *AdminDeptService) GetEditDeptInfo(ctx context.Context, deptID uint64) (
 		DeptID:      dept.DeptID,
 		DeptName:    dept.DeptName,
 		ParentID:    dept.ParentID,
-		DeptCode:    dept.DeptCode,
+		DeptCode:    deptCodeText(dept.DeptCode),
 		Description: dept.Description,
 		SortOrder:   dept.SortOrder,
 		DeptSource:  dept.DeptSource,
@@ -102,8 +103,9 @@ func (s *AdminDeptService) AddDept(ctx context.Context, req *dto.AddDeptRequest)
 	if req.DeptName == "" {
 		return errors.New("部门名称不能为空")
 	}
-	if req.DeptCode != "" {
-		exist, err := s.deptRepo.FindByDeptCode(ctx, req.DeptCode)
+	deptCode := normalizeDeptCode(req.DeptCode)
+	if deptCode != nil {
+		exist, err := s.deptRepo.FindByDeptCode(ctx, *deptCode)
 		if err != nil {
 			return err
 		}
@@ -127,12 +129,33 @@ func (s *AdminDeptService) AddDept(ctx context.Context, req *dto.AddDeptRequest)
 	return s.deptRepo.Create(ctx, &model.AdminDept{
 		DeptName:    req.DeptName,
 		ParentID:    req.ParentID,
-		DeptCode:    req.DeptCode,
+		DeptCode:    deptCode,
 		Description: req.Description,
 		SortOrder:   req.SortOrder,
 		DeptSource:  deptSource,
 		Status:      1,
 	})
+}
+
+// normalizeDeptCode 把「没填编码」归一化成 NULL。
+//
+// dept_code 上有唯一约束 uk_dept_code。如果空编码存成空串，第二个不填编码的
+// 部门就会撞唯一键建不出来；MySQL 的唯一索引允许多个 NULL，所以空值必须是 NULL。
+// 非空编码仍然受唯一约束，这是有意保留的。
+func normalizeDeptCode(code string) *string {
+	trimmed := strings.TrimSpace(code)
+	if trimmed == "" {
+		return nil
+	}
+	return &trimmed
+}
+
+// deptCodeText 把可空编码转成对外输出用的字符串，NULL 输出空串。
+func deptCodeText(code *string) string {
+	if code == nil {
+		return ""
+	}
+	return *code
 }
 
 // UpdateDept 更新部门
@@ -275,6 +298,42 @@ func (s *AdminDeptService) GetDeptUserList(ctx context.Context, deptID uint64, p
 		})
 	}
 	return &dto.DeptUserListResponse{
+		PageNo:      page,
+		PageSize:    pageSize,
+		ResultTotal: total,
+		List:        items,
+	}, nil
+}
+
+// GetDeptUserOptions 获取部门员工选项（/admin/option/dept-users 专用）。
+//
+// 只返回选人必需的字段。选项接口不做接口权限校验，
+// 带上手机号就等于让任何登录用户都能按部门拉通讯录。
+func (s *AdminDeptService) GetDeptUserOptions(ctx context.Context, deptID uint64, page, pageSize int) (*dto.UserOptionListResponse, error) {
+	dept, err := s.deptRepo.FindByDeptID(ctx, deptID)
+	if err != nil {
+		return nil, err
+	}
+	if dept == nil {
+		return nil, errors.New("部门不存在")
+	}
+	userDepts, total, err := s.userDeptRepo.ListByDeptID(ctx, deptID, page, pageSize)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]*dto.UserOptionItem, 0, len(userDepts))
+	for i := range userDepts {
+		user, _ := s.userRepo.FindByUserID(ctx, userDepts[i].UserID)
+		if user == nil {
+			continue
+		}
+		items = append(items, &dto.UserOptionItem{
+			UserID:   user.UserID,
+			Username: user.Username,
+			Realname: user.Realname,
+		})
+	}
+	return &dto.UserOptionListResponse{
 		PageNo:      page,
 		PageSize:    pageSize,
 		ResultTotal: total,

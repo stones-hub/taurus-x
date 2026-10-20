@@ -2,10 +2,12 @@ package service
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/wire"
 
 	"{{ .Module }}/app/dto"
+	"{{ .Module }}/app/model"
 	"{{ .Module }}/app/repo"
 )
 
@@ -26,6 +28,56 @@ func NewAdminLoginLogService(store *repo.Store) *AdminLoginLogService {
 		loginLogRepo: store.UserLoginLog(),
 		userRepo:     store.User(),
 	}
+}
+
+// 登录日志字段长度上限（与 admin_user_login_logs 的列定义一致）。
+// 超长必须先截断：MySQL 严格模式下写超长值会直接报错，
+// 那样「登录失败没留痕」反而成了新的盲区。
+const (
+	maxLoginIPLen        = 45
+	maxLoginUserAgentLen = 500
+	maxFailureReasonLen  = 255
+)
+
+// 登录状态（admin_user_login_logs.login_status）
+const (
+	LoginStatusFailure int8 = 0
+	LoginStatusSuccess int8 = 1
+)
+
+// RecordLogin 写入一条登录日志。
+//
+// 失败场景下 userID 可能为 0（账号不存在），仍然要落库：
+// 「某个 IP 在猜不存在的账号」本身就是需要留痕的信号。
+// failureReason 只写「原因」，调用方不要把口令等输入拼进来。
+func (s *AdminLoginLogService) RecordLogin(ctx context.Context, userID uint64, loginType, ip, userAgent string, status int8, failureReason string) error {
+	return s.loginLogRepo.Create(ctx, newLoginLogRecord(userID, loginType, ip, userAgent, status, failureReason, time.Now()))
+}
+
+// newLoginLogRecord 组装一条登录日志记录（纯函数，便于直接断言落库前的字段值）。
+// status 原样保留：失败必须是 0、成功必须是 1，中间不得做「零值视为未赋值」的兜底。
+func newLoginLogRecord(userID uint64, loginType, ip, userAgent string, status int8, failureReason string, at time.Time) *model.AdminUserLoginLog {
+	return &model.AdminUserLoginLog{
+		UserID:        userID,
+		LoginType:     loginType,
+		LoginIP:       clampLen(ip, maxLoginIPLen),
+		UserAgent:     clampLen(userAgent, maxLoginUserAgentLen),
+		LoginStatus:   status,
+		FailureReason: clampLen(failureReason, maxFailureReasonLen),
+		LoginTime:     at,
+	}
+}
+
+// clampLen 按字符（rune）截断，避免把多字节字符切断成乱码。
+func clampLen(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	runes := []rune(s)
+	for len(runes) > 0 && len(string(runes)) > max {
+		runes = runes[:len(runes)-1]
+	}
+	return string(runes)
 }
 
 // GetLoginLogList 分页查询登录日志（状态过滤），并回填用户名

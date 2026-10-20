@@ -2,40 +2,221 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"{{ .Module }}/internal/taurus"
 )
 
-// AuthRedisStore 认证安全相关 Redis 存取（改密时间戳等）
-type AuthRedisStore struct{}
+// 会话白名单的 Redis 键：
+//
+//	auth:jti:<jti> -> "<uid>:<auth_version>"，TTL 跟随 token 有效期，登出时直接删除
+//
+// 吊销版本（auth_version）**不存 Redis**，而是存在 MySQL 的 admin_users.auth_version：
+//
+//   - Redis 是可淘汰、可丢失的缓存。吊销计数一旦被 allkeys 策略淘汰（TTL 之前也会
+//     发生）或实例重启丢失，计数回到 0，而 jti 白名单键还在，已吊销的会话就复活了。
+//     把权威版本放进数据库，丢的只可能是 jti 键，而 jti 键丢失的后果是「拒绝」，
+//     方向是安全的。
+//   - 改密/禁用必须和吊销原子生效。版本存库后，凭证变更与版本自增可以放进同一个
+//     事务：要么都提交，要么都回滚，不存在「密码已改、吊销写失败」这种中间态。
+//
+// 用「签发时记录 jti + 版本」而不是「记录改密时间戳」，是为了精确吊销：
+// 时间戳方案在同一秒内改密 + 旧 token 签发时无法区分先后（claims.IssuedAt 只有秒），
+// 而版本号与时刻无关，旧 token 携带的版本必然不等于当前值，一定被拒；
+// 改密后新登录会以新版本重新登记，不会被误伤。
+const sessionJTIKeyPrefix = "auth:jti:"
 
-// NewAuthRedisStore 构造实例
+var (
+	// ErrSessionStoreUnavailable 会话存储不可用（Redis 未初始化、访问失败，
+	// 或认证版本权威来源不可用）。认证链路遇到它必须拒绝请求（fail closed）。
+	ErrSessionStoreUnavailable = errors.New("会话存储不可用")
+	// ErrSessionRevoked 会话已被吊销（登出、改密、禁用、删除、重置密码）或从未登记。
+	ErrSessionRevoked = errors.New("会话已失效，请重新登录")
+)
+
+// KVStore 会话存储依赖的最小 Redis 能力，由 *redisx.RedisClient 满足。
+// 抽成接口是为了让会话吊销逻辑能在没有真实 Redis 的情况下被测试覆盖。
+type KVStore interface {
+	Get(ctx context.Context, key string) (string, error)
+	Set(ctx context.Context, key string, value interface{}, expiration time.Duration) error
+	Del(ctx context.Context, keys ...string) error
+}
+
+// AuthVersionResolver 读取用户认证版本的权威来源（生产实现是 admin_users 表）。
+//
+// 接口声明在本包、实现放在 repo 层，由 main 注入：store 直接 import repo 会和
+// repo -> app/helper 的依赖方向打架，而认证链路（middleware）又不能 import repo。
+//
+// 约定：用户不存在时返回 (0, nil)。版本从 1 起算，所以 0 永远不是合法版本，
+// 调用方据此把「查不到的用户」按已吊销处理。
+type AuthVersionResolver interface {
+	CurrentAuthVersion(ctx context.Context, userID uint64) (int64, error)
+}
+
+var (
+	authVersionMu       sync.RWMutex
+	defaultAuthVersions AuthVersionResolver
+)
+
+// SetAuthVersionResolver 注入认证版本权威来源（由 main 在组件初始化后调用）。
+// 没注入时会话校验一律 fail closed，不会退化成「不校验版本」。
+func SetAuthVersionResolver(r AuthVersionResolver) {
+	authVersionMu.Lock()
+	defer authVersionMu.Unlock()
+	defaultAuthVersions = r
+}
+
+func globalAuthVersionResolver() AuthVersionResolver {
+	authVersionMu.RLock()
+	defer authVersionMu.RUnlock()
+	return defaultAuthVersions
+}
+
+// AuthRedisStore 认证会话（Token 白名单）存取。
+type AuthRedisStore struct {
+	kv       KVStore
+	versions AuthVersionResolver
+}
+
+// NewAuthRedisStore 构造实例，运行时从组件容器取 Redis、从注入的权威来源取认证版本。
 func NewAuthRedisStore() *AuthRedisStore {
 	return &AuthRedisStore{}
 }
 
-// InvalidateUserSessions 更新最近一次改密时间戳（使旧 token 失效）
-func (s *AuthRedisStore) InvalidateUserSessions(userID uint64) error {
-	if taurus.Container == nil || taurus.Container.Redis == nil {
-		return nil
-	}
-	key := fmt.Sprintf("user:last_pw_change:%d", userID)
-	return taurus.Container.Redis.Set(context.Background(), key, fmt.Sprintf("%d", time.Now().Unix()), 0)
+// NewAuthRedisStoreWith 用指定 KVStore 与认证版本来源构造实例（测试用）。
+func NewAuthRedisStoreWith(kv KVStore, versions AuthVersionResolver) *AuthRedisStore {
+	return &AuthRedisStore{kv: kv, versions: versions}
 }
 
-// GetLastPasswordChangeAt 读取最近一次改密时间戳（未设置返回 0）
-func (s *AuthRedisStore) GetLastPasswordChangeAt(userID uint64) (int64, error) {
-	if taurus.Container == nil || taurus.Container.Redis == nil {
-		return 0, nil
+// kvStore 解析底层存储；拿不到时返回 ErrSessionStoreUnavailable 而不是静默放行。
+func (s *AuthRedisStore) kvStore() (KVStore, error) {
+	if s.kv != nil {
+		return s.kv, nil
 	}
-	key := fmt.Sprintf("user:last_pw_change:%d", userID)
-	v, err := taurus.Container.Redis.Get(context.Background(), key)
-	if err != nil || v == "" {
+	if taurus.Container == nil || taurus.Container.Redis == nil {
+		return nil, ErrSessionStoreUnavailable
+	}
+	return taurus.Container.Redis, nil
+}
+
+// authVersions 解析认证版本权威来源；没有来源就不校验是不可接受的，直接 fail closed。
+func (s *AuthRedisStore) authVersions() (AuthVersionResolver, error) {
+	if s.versions != nil {
+		return s.versions, nil
+	}
+	if r := globalAuthVersionResolver(); r != nil {
+		return r, nil
+	}
+	return nil, fmt.Errorf("%w: 认证版本来源未注入", ErrSessionStoreUnavailable)
+}
+
+// RegisterSession 登记一个新签发的 Token。
+//
+// authVersion 必须由调用方从「校验凭证/状态的那次读取」里带进来，不能在这里
+// 现读一遍：现读会留下一个竞态窗口 —— 旧密码校验通过后、登记之前发生改密，
+// 登记就会用上新版本，旧凭证换来的会话反而活了下来。
+func (s *AuthRedisStore) RegisterSession(userID uint64, jti string, ttl time.Duration, authVersion int64) error {
+	if jti == "" {
+		return errors.New("会话登记失败: 缺少 jti")
+	}
+	if ttl <= 0 {
+		return errors.New("会话登记失败: 无效的有效期")
+	}
+	// 版本从 1 起算：拿不到版本的调用方不许登记会话，否则会登记出一个
+	// 永远无法被版本校验命中的「幽灵会话」。
+	if authVersion <= 0 {
+		return fmt.Errorf("%w: 会话登记失败: 缺少认证版本", ErrSessionStoreUnavailable)
+	}
+	kv, err := s.kvStore()
+	if err != nil {
+		return err
+	}
+	value := fmt.Sprintf("%d:%d", userID, authVersion)
+	if err := kv.Set(context.Background(), sessionJTIKeyPrefix+jti, value, ttl); err != nil {
+		return fmt.Errorf("%w: %v", ErrSessionStoreUnavailable, err)
+	}
+	return nil
+}
+
+// ValidateSession 校验 Token 是否仍然有效，并返回该会话登记时的认证版本。
+//
+// 返回 nil error 才算通过；存储或版本来源故障返回 ErrSessionStoreUnavailable，
+// 调用方必须拒绝请求。返回的版本供「刷新 Token」原样沿用（见 middleware.rotateSession）。
+func (s *AuthRedisStore) ValidateSession(userID uint64, jti string) (int64, error) {
+	if jti == "" {
+		return 0, ErrSessionRevoked
+	}
+	kv, err := s.kvStore()
+	if err != nil {
 		return 0, err
 	}
-	var ts int64
-	_, scanErr := fmt.Sscan(v, &ts)
-	return ts, scanErr
+	ctx := context.Background()
+	raw, err := kv.Get(ctx, sessionJTIKeyPrefix+jti)
+	if err != nil {
+		return 0, fmt.Errorf("%w: %v", ErrSessionStoreUnavailable, err)
+	}
+	if raw == "" {
+		// 键不存在：已登出、已过期、被淘汰，或签发时未登记成功 —— 一律拒绝
+		return 0, ErrSessionRevoked
+	}
+	storedUID, storedVersion, err := parseSessionValue(raw)
+	if err != nil {
+		return 0, ErrSessionRevoked
+	}
+	if storedUID != userID || storedVersion <= 0 {
+		return 0, ErrSessionRevoked
+	}
+
+	resolver, err := s.authVersions()
+	if err != nil {
+		return 0, err
+	}
+	current, err := resolver.CurrentAuthVersion(ctx, userID)
+	if err != nil {
+		return 0, fmt.Errorf("%w: 读取认证版本失败: %v", ErrSessionStoreUnavailable, err)
+	}
+	// current <= 0 表示用户不存在（约定见 AuthVersionResolver），按已吊销处理；
+	// 不相等（含 storedVersion 大于当前值这种异常）同样拒绝。
+	if current <= 0 || storedVersion != current {
+		return 0, ErrSessionRevoked
+	}
+	return storedVersion, nil
+}
+
+// RevokeSession 吊销单个 Token（登出）。
+func (s *AuthRedisStore) RevokeSession(jti string) error {
+	if jti == "" {
+		return nil
+	}
+	kv, err := s.kvStore()
+	if err != nil {
+		return err
+	}
+	if err := kv.Del(context.Background(), sessionJTIKeyPrefix+jti); err != nil {
+		return fmt.Errorf("%w: %v", ErrSessionStoreUnavailable, err)
+	}
+	return nil
+}
+
+// parseSessionValue 解析 "<uid>:<auth_version>"。
+// 缺少版本段、版本段非法都返回 error，由调用方按已吊销处理（fail closed）。
+func parseSessionValue(raw string) (uint64, int64, error) {
+	uidPart, versionPart, ok := strings.Cut(raw, ":")
+	if !ok {
+		return 0, 0, errors.New("会话值格式非法")
+	}
+	uid, err := strconv.ParseUint(uidPart, 10, 64)
+	if err != nil {
+		return 0, 0, err
+	}
+	version, err := strconv.ParseInt(versionPart, 10, 64)
+	if err != nil {
+		return 0, 0, err
+	}
+	return uid, version, nil
 }

@@ -1,0 +1,202 @@
+package middleware
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/url"
+	"strings"
+)
+
+// redactedPlaceholder 脱敏后的占位值。
+const redactedPlaceholder = "[REDACTED]"
+
+// sensitiveKeys 需要脱敏的字段名，**精确**匹配（忽略大小写、忽略下划线/短横线）。
+//
+// 故意不做子串匹配：底座里 role_code、dept_code、permission_code 都是正常业务字段，
+// 子串匹配会把它们一起糊掉，日志就没法排查了。
+var sensitiveKeys = map[string]bool{
+	"password":         true,
+	"oldpassword":      true,
+	"newpassword":      true,
+	"confirmpassword":  true,
+	"passwd":           true,
+	"pwd":              true,
+	"salt":             true,
+	"token":            true,
+	"accesstoken":      true,
+	"refreshtoken":     true,
+	"jwttoken":         true,
+	"authorization":    true,
+	"secret":           true,
+	"jwtsecret":        true,
+	"csrftoken":        true,
+	"verifycode":       true,
+	"verificationcode": true,
+	"smscode":          true,
+	"captcha":          true,
+}
+
+// stringOnlySensitiveKeys 只在值为字符串时才脱敏的字段名。
+//
+// `code` 既是短信验证码的请求字段（字符串），也是统一响应结构里的状态码（数字）。
+// 按值类型区分，既能挡住验证码明文，也不会把 {"code":200} 糊成 [REDACTED]。
+var stringOnlySensitiveKeys = map[string]bool{
+	"code": true,
+}
+
+// normalizeKey 归一化字段名：转小写并去掉下划线/短横线，
+// 这样 old_password、oldPassword、Old-Password 都能命中同一条规则。
+func normalizeKey(key string) string {
+	var b strings.Builder
+	b.Grow(len(key))
+	for _, r := range key {
+		if r == '_' || r == '-' {
+			continue
+		}
+		if r >= 'A' && r <= 'Z' {
+			r += 'a' - 'A'
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// isSensitiveKey 判断字段名是否需要脱敏；isString 表示该字段的值是不是字符串。
+func isSensitiveKey(key string, isString bool) bool {
+	normalized := normalizeKey(key)
+	if sensitiveKeys[normalized] {
+		return true
+	}
+	return isString && stringOnlySensitiveKeys[normalized]
+}
+
+// redactBody 对请求/响应体做脱敏。
+//
+// 顺序：先按 JSON 处理（底座接口全是 JSON），再按表单处理，
+// 都解析不了但文本里出现了敏感字段名时整体打掉 —— 宁可丢失日志可读性，
+// 也不要把明文密码/Token 落库。
+// 注意 JSON 分支会重新序列化，字段顺序可能变化（map 无序），只影响可读性。
+func redactBody(contentType, body string) string {
+	if strings.TrimSpace(body) == "" {
+		return body
+	}
+
+	if redacted, ok := redactJSON(body); ok {
+		return redacted
+	}
+	if redacted, ok := redactForm(contentType, body); ok {
+		return redacted
+	}
+	if containsSensitiveKeyName(body) {
+		return redactedPlaceholder
+	}
+	return body
+}
+
+// redactQuery 对 URL query string 脱敏（?token=xxx 这类）。
+func redactQuery(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		if containsSensitiveKeyName(raw) {
+			return redactedPlaceholder
+		}
+		return raw
+	}
+	redactValues(values)
+	return values.Encode()
+}
+
+// redactJSON 解析并脱敏 JSON，第二个返回值表示是否按 JSON 处理成功。
+func redactJSON(body string) (string, bool) {
+	trimmed := strings.TrimSpace(body)
+	if len(trimmed) == 0 || (trimmed[0] != '{' && trimmed[0] != '[') {
+		return "", false
+	}
+
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	// UseNumber 保留数字原样，避免大整数 ID 被转成科学计数法
+	dec.UseNumber()
+	var parsed interface{}
+	if err := dec.Decode(&parsed); err != nil {
+		return "", false
+	}
+
+	cleaned := redactValue(parsed)
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(cleaned); err != nil {
+		return "", false
+	}
+	return strings.TrimRight(buf.String(), "\n"), true
+}
+
+// redactValue 递归脱敏已解析的 JSON 值。
+func redactValue(v interface{}) interface{} {
+	switch typed := v.(type) {
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(typed))
+		for k, val := range typed {
+			_, isString := val.(string)
+			if isSensitiveKey(k, isString) {
+				out[k] = redactedPlaceholder
+				continue
+			}
+			out[k] = redactValue(val)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(typed))
+		for i, item := range typed {
+			out[i] = redactValue(item)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+// redactForm 解析并脱敏 application/x-www-form-urlencoded 请求体。
+func redactForm(contentType, body string) (string, bool) {
+	isForm := strings.HasPrefix(contentType, "application/x-www-form-urlencoded")
+	if !isForm && !strings.Contains(body, "=") {
+		return "", false
+	}
+	values, err := url.ParseQuery(body)
+	if err != nil || len(values) == 0 {
+		return "", false
+	}
+	if !isForm {
+		// 没有声明表单类型时要求整体看起来像表单，避免把普通文本误当成 k=v
+		if strings.ContainsAny(body, "{}\n") {
+			return "", false
+		}
+	}
+	redactValues(values)
+	return values.Encode(), true
+}
+
+// redactValues 就地脱敏 url.Values（表单值都是字符串）。
+func redactValues(values url.Values) {
+	for k := range values {
+		if isSensitiveKey(k, true) {
+			values[k] = []string{redactedPlaceholder}
+		}
+	}
+}
+
+// containsSensitiveKeyName 兜底判断：文本里是否出现了任何敏感字段名。
+// 只用于「解析不了的内容」，所以这里允许宽松匹配。
+func containsSensitiveKeyName(s string) bool {
+	lower := strings.ToLower(s)
+	for key := range sensitiveKeys {
+		if strings.Contains(normalizeKey(lower), key) {
+			return true
+		}
+	}
+	return false
+}

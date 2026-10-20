@@ -1,93 +1,735 @@
 # taurus-x
 
-Go + Vue 后台底座脚手架。一条命令生成一个**只含管理后台最小闭环**的全新项目：
-登录鉴权、用户 / 角色 / 权限（菜单 / 按钮 / 接口三级 RBAC）、部门与部门成员、
-四类日志（登录 / 访问 / 操作 / 前端错误），**不含任何业务模块**。
+**用来生成 Go + Vue 管理后台项目的命令行脚手架。**
 
-生成的项目后端 Go + Google Wire + GORM，前端 Vue3 + TypeScript + Vite + Element Plus，
-前端构建产物由 Go 进程直接托管（SPA history 回退），单端口对外。
+你运行一次 `taurus-x new <项目名>`，它就生成一份独立的项目代码，包含前后端、数据库初始化 SQL、Dockerfile 和部署文档。之后在生成的项目中开发业务，不是在这个脚手架仓库里开发业务。
 
-## 安装与使用
+> **第一次使用建议：只选默认的必选组件，先跑通登录。**
+>
+> 基础组合已经在本机 ARM Docker 环境验证过：生成 → 构建 → 启动 → 初始化数据库 → 管理员登录 → 读取身份 → 登出。
+> 勾选 `milvus` 的完整 Docker 启动仍受 MinIO 镜像下载问题阻塞，不建议第一次测试时全选。
+> 这不代表所有平台、可选组件或生产场景都已验证。详细证据见 [T2 验收记录](docs/T2验收记录.md)。
+
+## 目录
+
+- [1. 能生成什么](#1-能生成什么)
+- [2. 准备环境](#2-准备环境)
+- [3. 安装脚手架](#3-安装脚手架)
+- [4. 生成你的项目](#4-生成你的项目)
+- [5. 方式一：Docker 启动，推荐首次测试](#5-方式一docker-启动推荐首次测试)
+- [6. 方式二：本机开发启动](#6-方式二本机开发启动)
+- [7. 登录后怎么测试](#7-登录后怎么测试)
+- [8. 配置和命令速查](#8-配置和命令速查)
+- [9. 项目生成后如何开发](#9-项目生成后如何开发)
+- [10. 常见问题](#10-常见问题)
+- [11. 已知限制与安全提醒](#11-已知限制与安全提醒)
+- [12. 维护脚手架本身](#12-维护脚手架本身)
+
+## 1. 能生成什么
+
+### 自带功能
+
+| 功能 | 说明 |
+| --- | --- |
+| 登录与身份认证 | 管理员登录、登出、Token 刷新、个人信息 |
+| 用户管理 | 新建、编辑、状态管理、管理员重置用户密码 |
+| 角色管理 | 用户分配角色、角色分配权限 |
+| 权限管理 | 菜单、按钮、接口三级 RBAC |
+| 部门管理 | 部门与部门成员 |
+| 日志 | 登录、访问、操作、前端错误四类日志 |
+| 个人中心 | 编辑个人资料、使用旧密码修改自己的密码 |
+| 项目基础设施 | 配置、日志、MySQL、Redis、Wire 依赖注入、前端构建与托管 |
+
+**不包含订单、客户、财务等业务模块，也不是业务代码自动生成器。** 文档中的业务示例不等于已实现的功能。
+
+### 技术栈
+
+- 后端：Go 1.25、Taurus Pro 组件、GORM、Google Wire。
+- 前端：Vue 3、TypeScript、Vite、Element Plus、Pinia。
+- 数据库与缓存：MySQL 8.0、Redis 7。
+- 生产式运行：前端编译为静态文件，由 Go 后端托管，一个 HTTP 端口提供页面和接口。
+
+### 组件怎么选
+
+| 组件 | 是否必选 | 作用与选择建议 |
+| --- | --- | --- |
+| `common` | 是 | 日志、JWT、公共工具 |
+| `config` | 是 | 配置加载、环境变量替换 |
+| `http` | 是 | HTTP 服务和中间件 |
+| `storage` | 是 | MySQL 和 Redis，后台底座必须使用 |
+| `consul` | 否 | 服务注册发现；确有服务发现需求再选 |
+| `opentelemetry` | 否 | 链路追踪、指标上报；需另备 collector |
+| `tcp` | 否 | TCP 服务基础设施；需自己注册业务 handler |
+| `grpc` | 否 | gRPC 服务基础设施；需自己注册业务 service |
+| `milvus` | 否 | 向量数据库客户端；Docker 还依赖 etcd 和 MinIO，当前有镜像下载阻塞 |
+
+必选组件即使取消，也会被生成器补回。未选的可选组件会从依赖、配置、组件注册和 Docker 编排中裁掉，不只是把开关关闭。
+
+## 2. 准备环境
+
+两种运行方式任选一种，**不要同时启动，避免端口和数据库冲突**。
+
+| 工具 | Docker 方式 | 本机开发方式 |
+| --- | --- | --- |
+| Go 1.25 或兼容版本 | 必须，CLI 生成后会执行 Go 依赖整理与 Wire | 必须 |
+| Git | 获取源码时使用 | 获取源码时使用 |
+| Docker 与 Compose 插件 | 必须；macOS 可使用 Docker Desktop | 只在用容器提供 MySQL/Redis 时需要 |
+| Node.js | 本机不要求，Docker 构建阶段自带 | 建议 Node 22.12+；Vite 要求 Node 20.19+ 或 22.12+ |
+| pnpm | 本机不要求，Docker 构建阶段自带 | 本文使用 `npm exec` 临时调用固定版本，不要求全局安装 |
+| MySQL 8.0 / Redis 7 | Compose 自动启动 | 自备独立服务，或使用测试容器 |
+| make | 不要求 | 使用 Makefile 时需要，也可用本文直接命令 |
+
+先确认 Go 正常：
 
 ```bash
-go build -o taurus-x .          # 或 go install github.com/stones-hub/taurus-x@latest
-./taurus-x new my-admin
+go version
 ```
 
-`new` 会依次问四件事，然后生成项目：
+如果准备走 Docker 方式，启动 Docker 后检查：
 
-1. **Go module 路径**（默认 `github.com/stones-hub/<项目名>`）
-2. **输出目录**（默认 `./<项目名>`；目录必须不存在或为空，**不会覆盖已有内容**）
-3. **组件多选**（空格勾选 / 回车确认）
-4. **汇总确认**
-
-生成后自动执行 `go mod tidy` 与 Wire 代码生成，并打印下一步（建库导 SQL、配 `.env.local`、
-装前端依赖、`make dev`）和初始管理员账号。
-
-其它命令：`taurus-x version`、`taurus-x help`。
-
-## 组件
-
-| 组件 | 必选 | 作用 |
-|------|------|------|
-| common | ✅ | 日志 / JWT / 工具库 |
-| config | ✅ | 配置加载与环境变量替换 |
-| http | ✅ | HTTP 服务与中间件 |
-| storage | ✅ | MySQL + Redis |
-| consul | | 服务注册发现 |
-| opentelemetry | | 链路追踪 / 指标上报 |
-| tcp | | TCP 长连接服务 |
-| grpc | | gRPC 服务 |
-| milvus | | 向量库客户端池 |
-
-必选组件取消勾选也会被补回（底座依赖它们）。**未选中的可选组件在生成的项目里完全不存在**：
-不在 `go.mod`、不在 `internal/taurus`（`Components` 字段 / `Provide*` / `wire.Build`）、
-不在 `config/autoload/`、不在 `docker-compose.yml`、不在 `Dockerfile` 的 `EXPOSE`。
-
-## 生成的项目
-
-初始管理员账号为 `admin`，默认密码写在生成项目的 `README.md` 里；密码以
-`SHA-256(密码 + salt)` 的小写 hex 存入 `admin_user_logins`，**salt 与 JWT 密钥每次生成都随机**。
-建表与权限数据只走 `scripts/sql/init.sql`（**不开 GORM AutoMigrate**），其中含 12 张底座表
-与 74 条权限（12 菜单 + 21 按钮 + 41 接口）。
-
-> ⚠️ 生成项目的 `README.md`「已知风险与待办」章节列出了底座仍待修复的问题
-> （SHA-256 强度、JWT 弱默认值、日志未脱敏、`dept_code` 唯一索引缺陷等），**上线前先读**。
-
-## 本仓库结构
-
+```bash
+docker version
 ```
+
+```bash
+docker compose version
+```
+
+首次生成和构建需要下载 Go 包、前端依赖和容器镜像，请确保网络可访问相应源。构建耗时会受网络与缓存影响。
+
+## 3. 安装脚手架
+
+### 3.1 测试当前本机代码，推荐
+
+**当前尚未发布的改动，要从本地仓库构建；不要用 `@latest` 代替当前代码。**
+
+进入本仓库：
+
+```bash
+cd /Users/yelei/data/code/repos/taurus-x
+```
+
+把 CLI 编译到临时目录，不往仓库根目录放二进制：
+
+```bash
+mkdir -p /tmp/taurusx-bin && go build -o /tmp/taurusx-bin/taurus-x .
+```
+
+查看帮助：
+
+```bash
+/tmp/taurusx-bin/taurus-x help
+```
+
+查看版本：
+
+```bash
+/tmp/taurusx-bin/taurus-x version
+```
+
+> CLI 版本号不一定能区分本机未提交改动；测试当前工作区的可靠方式是重新构建上面的二进制。
+
+### 3.2 安装仓库已发布的版本
+
+当远程仓库已发布你需要的版本时，可以使用：
+
+```bash
+go install github.com/stones-hub/taurus-x@latest
+```
+
+安装后命令通常位于 `$(go env GOPATH)/bin`，需要该目录在 `PATH` 中。如果提示找不到命令，先检查安装目录，不必重复安装。
+
+**这条命令拿到的是远程版本，不包含本机尚未提交、推送的改动。**
+
+## 4. 生成你的项目
+
+以下统一使用项目名 **`my-admin`**，目录为 `/Users/yelei/data/code/repos/my-admin`，数据库名为 **`my_admin`**。
+
+> 换项目名时，请同步替换后续命令中的目录、容器名和数据库名。项目名中的 `-` 会在默认数据库名中转换为 `_`。
+
+在仓库父目录执行，避免把新 Git 项目嵌套在脚手架仓库里：
+
+```bash
+cd /Users/yelei/data/code/repos && /tmp/taurusx-bin/taurus-x new my-admin
+```
+
+按提示完成以下步骤：
+
+| 提示 | 第一次测试怎么填 |
+| --- | --- |
+| Go module 路径 | 可接受默认 `github.com/stones-hub/my-admin`；正式项目换成自己的仓库路径 |
+| 输出目录 | 接受默认 `./my-admin` |
+| 组件选择 | 只保留四个必选组件；上下移动，空格勾选，回车确认 |
+| 汇总确认 | 核对目录、module、组件后确认生成 |
+
+项目名只能使用字母、数字、下划线、短横线。输出目录必须不存在或为空，生成器不会覆盖已有项目。
+
+生成过程会自动：
+
+1. 渲染前后端与配置模板。
+2. 生成数据库初始化 SQL。
+3. 在后端执行 `go mod tidy`。
+4. 扫描 provider 并执行 Wire 代码生成，不需要全局安装 Wire。
+5. 打印下一步操作和初始管理员账号密码。
+
+**务必保存终端打印的初始密码。**
+
+- 初始用户名：`admin`。
+- 初始密码：每次随机生成，只在这次终端输出中打印一次。
+- 密码不会写入生成项目的 README 或明文配置中；SQL 里只保存散列。
+- 不要把包含初始密码的截图、终端记录公开或提交到 Git。
+- 如果生成过程失败，目录可能已生成部分内容，先看错误；不要直接往非空目录反复生成。
+
+进入生成项目：
+
+```bash
+cd /Users/yelei/data/code/repos/my-admin
+```
+
+主要目录如下：
+
+```text
+my-admin/
+├── backend/                 Go 后端、配置、Wire、后端 Makefile
+├── frontend/                Vue 前端
+├── scripts/sql/init.sql     初始表、角色、权限、管理员凭证散列
+├── docs/                    生成项目的开发与部署说明
+├── Dockerfile               前后端多阶段构建
+├── docker-compose.yml       所选组件的容器编排
+├── Makefile                 前后端快捷命令
+└── README.md                生成项目自己的说明
+```
+
+## 5. 方式一：Docker 启动，推荐首次测试
+
+**本节命令都在生成项目根目录执行，不是在 taurus-x 仓库执行。**
+
+适用场景：想先验证“生成后能不能登录”，暂时不需要前端热更新。建议只用必选组件。
+
+### 5.1 创建 Compose 环境配置
+
+用编辑器在生成项目根目录创建 **`.env`**，填入以下配置。它用于 Compose 变量替换，**不是** `backend/.env.local`。
+
+下面的密码只是示范，请自己替换；`MYSQL_PASSWORD` 和 `DB_DSN` 中的数据库密码必须相同：
+
+```dotenv
+MYSQL_ROOT_PASSWORD=ReplaceWithYourLocalRootPassword
+MYSQL_PASSWORD=ReplaceWithYourLocalDbPassword
+DB_DSN=my_admin:ReplaceWithYourLocalDbPassword@tcp(mysql:3306)/my_admin?charset=utf8mb4&parseTime=True&loc=Local
+JWT_SECRET=替换为下一条命令生成的随机值
+AUTHORIZATION=替换为另一个随机值
+```
+
+分别执行以下命令生成随机值，再用编辑器粘贴到对应字段中：
+
+```bash
+openssl rand -hex 32
+```
+
+```bash
+openssl rand -hex 24
+```
+
+注意：
+
+- `JWT_SECRET` 必须配置；留空、过短或弱值会导致启动失败。
+- 示例假设项目名为 `my-admin`，默认数据库与普通数据库用户名均为 `my_admin`。
+- `DB_DSN` 中使用 Compose 内部主机名 `mysql`，**不是** `127.0.0.1`。
+- 第一次测试建议使用字母数字密码，避免 `$`、`#`、引号等引发 Compose 插值或解析歧义。
+- `.env` 属于本机秘密文件，不要提交到 Git，也不要发到聊天或问题报告中。
+
+收紧文件权限：
+
+```bash
+chmod 600 .env
+```
+
+### 5.2 把测试入口改为本机独立端口
+
+模板默认发布 `9080:9080`。**这台机器的 9080 端口有其他项目使用，不要直接占用。**
+
+用编辑器打开生成项目的 `docker-compose.yml`，在 **`app` 服务的 `ports`** 中，把：
+
+```yaml
+- "9080:9080"
+```
+
+改成：
+
+```yaml
+- "127.0.0.1:19084:9080"
+```
+
+这样浏览器访问本机 `19084`，容器内仍使用 `9080`；只有本机能够访问这个测试入口。
+
+可先检查端口是否空闲（没有输出通常表示没有监听进程）：
+
+```bash
+lsof -nP -iTCP:19084 -sTCP:LISTEN
+```
+
+只选必选组件时，MySQL、Redis 默认仅在 Compose 网络内访问，不需要映射宿主机端口。
+
+### 5.3 准备日志目录
+
+应用容器以非 root 的 `1000:1000` 运行，宿主机挂载目录需允许它写入。
+
+```bash
+mkdir -p docker-data/logs
+```
+
+Linux 或需要调整属主的环境，按生成部署文档设置：
+
+```bash
+sudo chown -R 1000:1000 docker-data
+```
+
+该命令只针对当前生成项目的 `docker-data`，不要扩大到整个仓库或其他目录。macOS Docker 文件共享的权限表现可能不同；遇到问题先查看应用日志，不建议用 `chmod 777` 粗暴处理。
+
+### 5.4 检查配置并启动
+
+先验证 Compose 配置完整，避免把密码等解析结果打印出来：
+
+```bash
+docker compose config --quiet
+```
+
+构建镜像并启动：
+
+```bash
+docker compose up -d --build
+```
+
+首次启动要等待数据库初始化。查看服务状态：
+
+```bash
+docker compose ps
+```
+
+查看最近日志：
+
+```bash
+docker compose logs --tail=100 app mysql redis
+```
+
+分享日志前请自行脱敏，不要发完整环境配置、Token 或初始密码。
+
+### 5.5 打开页面并登录
+
+检查应用健康：
+
+```bash
+curl -fsS http://127.0.0.1:19084/health
+```
+
+打开浏览器：
+
+**http://127.0.0.1:19084/login**
+
+用 `admin` 和生成时打印的随机密码登录。页面能打开只代表静态页面可用，**成功登录并进入首页才算认证流程跑通**。
+
+第一次创建数据库卷时，MySQL 会自动执行 `scripts/sql/init.sql`。以后重启不会再次导入；修改 SQL 文件也不会自动修改已有数据库。
+
+### 5.6 停止、恢复、清空
+
+仅停止容器，保留数据：
+
+```bash
+docker compose stop
+```
+
+恢复已有服务：
+
+```bash
+docker compose up -d
+```
+
+删除本项目容器与网络，保留数据库卷：
+
+```bash
+docker compose down
+```
+
+**彻底清空本项目数据库、Redis 数据后重建：以下命令会删除数据，仅用于你自己的测试项目。**
+
+```bash
+docker compose down --volumes
+```
+
+再执行启动命令会重新初始化数据库，恢复到生成 SQL 中的初始状态。不要对已有真实业务数据的项目执行清卷操作。
+
+## 6. 方式二：本机开发启动
+
+适用场景：需要修改前后端、前端热更新。后端直接运行在本机；MySQL 和 Redis 自备。
+
+**不要使用、重置或清空其他项目正在运行的数据库。** 以下示例用独立容器与端口，不占 admin 项目资源。
+
+### 6.1 准备独立 MySQL 和 Redis
+
+本机已有可用的独立服务可跳过本步，按真实连接信息填写配置。
+
+示例创建测试 MySQL；`-e MYSQL_ROOT_PASSWORD` 从当前终端环境读取，不把密码直接写进命令。先在终端设置一个仅测试使用的值（注意命令历史；也可通过终端的安全输入方式设置）：
+
+```bash
+export MYSQL_ROOT_PASSWORD=ReplaceWithYourLocalRootPassword
+```
+
+```bash
+docker run -d --name my-admin-test-mysql -p 127.0.0.1:23309:3306 -e MYSQL_ROOT_PASSWORD -e MYSQL_DATABASE=my_admin mysql:8.0
+```
+
+启动独立 Redis：
+
+```bash
+docker run -d --name my-admin-test-redis -p 127.0.0.1:26382:6379 redis:7-alpine
+```
+
+确认 MySQL 已就绪；命令会提示输入数据库 root 密码：
+
+```bash
+docker exec -it my-admin-test-mysql mysqladmin -uroot -p ping
+```
+
+### 6.2 首次导入 SQL
+
+从生成项目根目录，把初始化 SQL 放到本次 MySQL 测试容器：
+
+```bash
+docker cp scripts/sql/init.sql my-admin-test-mysql:/tmp/my-admin-init.sql
+```
+
+导入，按提示输入刚才设置的数据库 root 密码：
+
+```bash
+docker exec -it my-admin-test-mysql mysql -uroot -p my_admin -e 'source /tmp/my-admin-init.sql'
+```
+
+清理容器内临时 SQL：
+
+```bash
+docker exec my-admin-test-mysql rm -f /tmp/my-admin-init.sql
+```
+
+这里只是本机测试容器的数据导入，不是生产部署方式。数据库账号在本节为测试 root；真实部署应使用最小权限业务账号。
+
+**不要重复向已有数据的库盲目导入初始化 SQL。** 表使用建表保护不等于所有初始化数据都可以重复执行。
+
+### 6.3 配置本机后端
+
+从生成项目根目录复制配置示例：
+
+```bash
+cp backend/.env.example backend/.env.local
+```
+
+用编辑器修改 `backend/.env.local` 中以下字段；其他字段保留示例结构即可：
+
+```dotenv
+SERVER_ADDRESS=127.0.0.1
+SERVER_PORT=19084
+DB_NAME=my_admin
+DB_DSN=root:ReplaceWithYourLocalRootPassword@tcp(127.0.0.1:23309)/my_admin?charset=utf8mb4&parseTime=True&loc=Local
+REDIS_HOST=127.0.0.1
+REDIS_PORT=26382
+REDIS_PASSWORD=
+JWT_SECRET=替换为openssl生成的随机值
+AUTHORIZATION=替换为另一个随机值
+```
+
+生成 JWT 密钥：
+
+```bash
+openssl rand -hex 32
+```
+
+设置配置文件权限：
+
+```bash
+chmod 600 backend/.env.local
+```
+
+配置注意：
+
+- 本机后端连接容器时使用 `127.0.0.1` 和映射端口，不使用 Compose 内部主机名 `mysql`。
+- 配置值会先做文本替换再解析，**不要给值额外加引号，不要包含 `}` 或换行**。
+- 空 Redis 密码写 `REDIS_PASSWORD=`，不要写成 `REDIS_PASSWORD=""`。
+- 本节后端改用了 `19084`，前端代理也必须对应修改。
+
+### 6.4 修改前端代理
+
+用编辑器打开 `frontend/vite.config.ts`，把 `/api` 代理的：
+
+```typescript
+target: 'http://127.0.0.1:9080',
+```
+
+改为：
+
+```typescript
+target: 'http://127.0.0.1:19084',
+```
+
+否则页面能打开，但登录请求会发往错误的后端。
+
+### 6.5 安装前端依赖
+
+进入前端目录：
+
+```bash
+cd /Users/yelei/data/code/repos/my-admin/frontend
+```
+
+使用固定版本 pnpm 安装，不需要全局安装：
+
+```bash
+npm exec --yes pnpm@10.34.7 -- install
+```
+
+### 6.6 分两个终端启动
+
+**终端一：启动后端。**
+
+```bash
+cd /Users/yelei/data/code/repos/my-admin/backend && make run
+```
+
+`make run` 会先执行 Wire，再读取 `.env.local` 启动后端。
+
+**终端二：启动前端。**
+
+```bash
+cd /Users/yelei/data/code/repos/my-admin/frontend && npm exec --yes pnpm@10.34.7 -- dev --host 127.0.0.1
+```
+
+打开前端终端实际打印的地址，通常是：
+
+**http://127.0.0.1:5173/login**
+
+如果 `5173` 已占用，Vite 可能选择其他端口，以终端显示为准。后端健康地址为 `http://127.0.0.1:19084/health`。
+
+测试结束，在两个终端分别按 `Ctrl+C` 停止服务。
+
+### 6.7 验证生产式前端托管
+
+先停止开发服务器，构建前端：
+
+```bash
+cd /Users/yelei/data/code/repos/my-admin/frontend && npm exec --yes pnpm@10.34.7 -- build
+```
+
+构建后端：
+
+```bash
+cd /Users/yelei/data/code/repos/my-admin/backend && make build
+```
+
+从 **backend 目录**运行编译产物：
+
+```bash
+cd /Users/yelei/data/code/repos/my-admin/backend && ./build/my-admin -config ./config -env .env.local
+```
+
+访问 **http://127.0.0.1:19084/login**。此时不依赖 Vite，前端文件来自 `frontend/dist`；不要只复制后端二进制而遗漏前端产物与配置。
+
+### 6.8 清理本节测试容器
+
+先确认容器确实是自己本节创建的，再删除：
+
+```bash
+docker rm -f -v my-admin-test-mysql my-admin-test-redis
+```
+
+这会删除本节测试容器及其关联匿名卷中的数据。不要替换成其他项目容器名。
+
+清除当前终端的测试密码变量：
+
+```bash
+unset MYSQL_ROOT_PASSWORD
+```
+
+## 7. 登录后怎么测试
+
+建议按这个顺序，先验证最小闭环，再增加组件或业务。
+
+| 步骤 | 操作 | 预期 |
+| --- | --- | --- |
+| 1 | 使用初始管理员登录 | 进入首页，无接口错误 |
+| 2 | 打开用户、角色、权限、部门页面 | 页面能加载，列表正常 |
+| 3 | 打开登录、访问、操作、前端错误日志 | 列表正常；没有数据时可以为空 |
+| 4 | 点击顶栏个人中心按钮 | 打开个人资料与改密表单 |
+| 5 | 用旧密码修改自己的密码 | 修改成功；旧会话后续请求失效，需要新密码重新登录 |
+| 6 | 新建测试角色并分配菜单、按钮、接口权限 | 保存成功，三类权限用途不同 |
+| 7 | 新建测试用户并分配该角色 | 使用不同的合法手机号，填写符合校验要求的密码 |
+| 8 | 用无痕窗口登录测试用户 | 只看到有权限的功能，不与管理员会话混用 |
+| 9 | 管理员禁用测试角色 | 普通用户后续请求不再获得该角色权限；菜单重新加载后相应更新 |
+| 10 | 管理员编辑该测试用户，只改昵称 | 已持有的禁用角色能回显并保留；不能新增未持有的禁用角色 |
+| 11 | 重新启用测试角色 | 关联仍保留时，其有效权限恢复 |
+
+补充说明：
+
+- 接口有些业务失败仍使用 HTTP 200，排查时还要看响应 JSON 的 `code` 和错误提示。
+- 新建用户的 `username`、`password`、`mobile` 都需要按实际表单填写；不要漏手机号。
+- 普通用户能改自己的密码，不意味着能管理别人的账号。
+- 普通管理员即使具有部分用户管理接口权限，也不能管理超级管理员账号。
+- 角色被禁用不等于删除关联；已有关系可以保留，启用后恢复，但仍受权限行状态约束。
+- 页面没有自动刷新时，可退出重新登录或刷新页面后再检查菜单，不要只看旧页面上已经渲染的按钮。
+
+如需反馈问题，请提供：操作步骤、期望结果、实际提示、浏览器控制台错误、脱敏后的相关服务日志。**不要提供密码、JWT、Cookie 或完整 `.env`。**
+
+## 8. 配置和命令速查
+
+### 配置文件分别管什么
+
+| 文件 | 用途 |
+| --- | --- |
+| 项目根目录 `.env` | Docker Compose 插值，例如数据库密码、JWT 密钥 |
+| `backend/.env.example` | 本机后端配置示例，不含可用 JWT 密钥 |
+| `backend/.env.local` | 本机直接运行后端时读取的实际配置，不提交 Git |
+| `backend/config/` | 应用配置模板，环境变量代入后加载 |
+| `frontend/vite.config.ts` | 开发服务器端口及后端代理地址 |
+| `scripts/sql/init.sql` | 首次建表、初始化角色权限和管理员散列 |
+
+### 生成项目根目录的 Makefile
+
+| 命令 | 用途 |
+| --- | --- |
+| `make backend-wire` | 重新生成后端依赖注入代码 |
+| `make backend-run` | Wire 后启动后端 |
+| `make backend-build` | Wire 后编译后端二进制 |
+| `make frontend-install` | 安装前端依赖，要求命令行能找到 pnpm |
+| `make frontend-dev` | 启动前端开发服务器，要求 pnpm |
+| `make frontend-build` | 前端类型检查与构建，要求 pnpm |
+| `make dev` | 同时启动前后端，要求 pnpm；本文推荐两终端，便于看日志和退出 |
+| `make build` | 编译后端与前端，要求 pnpm |
+
+Makefile 的提示文字使用默认端口；你改过配置时，应以实际监听地址为准。没有全局 pnpm 时，直接使用本文的 `npm exec --yes pnpm@10.34.7 -- ...`。
+
+## 9. 项目生成后如何开发
+
+1. **把生成项目当作独立项目管理**：进入它的目录，自行初始化 Git、配置自己的远程仓库；生成器不会自动替你提交或发布。
+2. **先跑通原始底座，再加业务**，避免把环境问题和新业务问题混在一起。
+3. 后端业务主要在 `backend/app/` 中扩展；新增依赖注入项后重新执行 Wire。
+4. 新业务表使用明确 SQL/迁移管理；本底座不开启 GORM AutoMigrate。
+5. 前端在 `frontend/src/` 中扩展页面、API 与路由；界面按钮隐藏不能替代后端接口权限校验。
+6. 增加菜单、按钮、接口权限时，同时维护权限数据和调用链。具体分层以生成项目 `docs/` 的开发文档为准。
+7. **生成后不会自动同步模板更新**。以后升级 taurus-x 不会直接修改已生成项目；已有项目需要审查后自行迁移改动，不要向非空项目重新生成覆盖。
+
+关于现有用户更新接口：`/admin/user/update` 不是通用 PATCH。只有 `role_ids` 支持选择性更新：不传或 `null` 表示不改角色，`[]` 表示清空角色；其他资料仍按完整表单提交。仅调整角色可用已有 `/admin/role/assign`。
+
+## 10. 常见问题
+
+### 生成时 `go mod tidy` 或 Wire 失败
+
+先确认 Go 版本、网络、错误日志和输出目录。生成器会保留部分文件，不会自动清理失败现场。没有正确生成 Wire 代码的项目不能当作生成成功。
+
+可以修复网络后在生成项目后端目录整理依赖并重跑 Wire；不要无脑清库或覆盖目录：
+
+```bash
+cd /Users/yelei/data/code/repos/my-admin/backend && go mod tidy && make wire
+```
+
+如需重新生成，使用新的空目录，或确认无需要保留的内容后自行清理旧测试目录。
+
+### `JWT_SECRET` 相关报错
+
+这是启动保护，不是要求关闭认证。生成随机密钥填入正确配置文件：Docker 用根目录 `.env`，本机运行用 `backend/.env.local`，再重新创建容器或重启本机后端。
+
+### 页面打开了，但登录失败
+
+按顺序检查：
+
+1. 使用的是本次生成时打印的密码，而不是另一个项目的随机密码。
+2. MySQL 是否导入了当前项目的 `init.sql`。
+3. 旧数据库卷是否保留了另一次生成的账号散列。
+4. 本机开发时，Vite 代理是否指向实际后端端口。
+5. Redis 是否可连接；会话认证依赖 Redis，故障时会拒绝请求。
+6. 浏览器请求响应的业务 `code`，不要只看 HTTP 状态。
+
+### 初始密码忘记了
+
+散列不能反推出明文。**还没有业务数据的测试项目，最简单的是重新生成新项目并使用新的独立数据库。**
+
+已有数据时不要删库，需要走经过审查的管理员密码恢复流程；不要随意改库绕过账号吊销逻辑，也不要把密码或散列公开给别人排查。
+
+### 端口被占用
+
+先查明是谁在使用，不要停掉不属于本项目的进程。Docker 修改宿主机映射的左侧端口；本机后端修改 `SERVER_PORT`，并同步改 Vite 代理。
+
+### 应用容器反复重启
+
+先看 `docker compose logs --tail=100 app`。常见原因是 JWT 未配置、数据库连接参数不一致、日志挂载目录不可写。基础服务的 `running` 状态不等于应用业务已就绪，应检查 `/health` 和实际登录。
+
+### 修改初始化 SQL 后数据库没有变化
+
+MySQL 仅在空数据目录首次初始化时执行脚本。已有库要用正式迁移；仅自己的无价值测试数据才考虑清卷重建。
+
+### 勾选 Milvus 后下载镜像失败
+
+当前模板固定的 `minio/minio:RELEASE.2024-08-17T01-24-54Z` 在本次环境不能匿名拉取，官方 Quay 同 tag 也未取得可用 manifest。**不是已确认“换前缀就能修好”。**
+
+首次测试请新生成一个只选必选组件的项目，不建议随手改成 `latest`、第三方镜像或认为仅关闭应用配置就能让 Compose 自动跳过依赖服务。
+
+### 构建出现 chunk 大小警告
+
+前端可能提示 chunk 超过 500 kB。警告不等于构建失败；以退出码和产物为准，后续可按实际需求拆包优化。
+
+## 11. 已知限制与安全提醒
+
+**当前不是“所有场景均已验证的生产成品”。**
+
+- 当前代码的基础 Docker 组合已在本机原生 arm64 验证；不等于 amd64 或所有跨平台产物均已实际运行。
+- Dockerfile 使用 BuildKit 目标平台编译；构建成功不等于目标机器运行成功，跨架构交付需另行验收。
+- 全选 Compose 仍被 MinIO 下载阻塞；Consul、Milvus、OTEL 的真实连接未完成整体验收。
+- OTEL 默认关闭，需要你配置并启动 collector；TCP/gRPC 也不是选中后就自动带业务服务。
+- 真实 MySQL 并发交错、完整安全故障矩阵等仍有未验证边界；普通功能通过不代表这些边界已通过。
+- 密码散列目前仍是 `SHA-256(password + salt)`，不是 bcrypt/Argon2id；生成项目 README 还列有其他安全与功能待办，上生产前必须逐项评估。
+- Redis 会话白名单缺失或故障会拒绝认证；改密等操作会吊销旧会话。这些现象不能简单理解为“登录偶尔不稳定”。
+- 初始密码、JWT 密钥、数据库密码、Token、Cookie 不进 Git、不写入公开问题报告。
+- 只在本机测试时尽量绑定 `127.0.0.1`；不要把临时数据库、缓存和测试后台暴露到公网。
+
+进一步阅读：[方案](docs/方案.md)、[安全审计](docs/安全审计.md)、[验收记录](docs/T2验收记录.md)、[当前交接](HANDOVER.md)。
+
+## 12. 维护脚手架本身
+
+本节面向修改 taurus-x 模板的人，普通使用者可跳过。
+
+### 仓库结构
+
+```text
 taurus-x/
 ├── main.go
-├── internal/
-│   ├── cli/              # 命令行入口与交互（survey）
-│   ├── components/       # 组件注册表（名称 / 包路径 / 版本 / 是否必选）
-│   └── generator/        # 渲染逻辑 + 组合测试
-└── templates/
-    ├── templates.go      # go:embed all:project
-    └── project/          # 项目模板树
+├── internal/cli/             命令行入口与交互
+├── internal/components/      组件名称、版本与必选标记
+├── internal/generator/       模板渲染、过滤、生成器测试
+└── templates/project/        被嵌入CLI的项目模板
 ```
 
-模板约定：**只有 `.tmpl` 后缀的文件走 `text/template` 渲染，其余原样复制**。
-Vue/TS/CSS 里的 `{{ }}` 是 Vue 插值，这些文件一律不加 `.tmpl`；而所有 `.go`、`go.mod`
-必须加 `.tmpl`（它们要替换 module 路径）。`gitignore` 在模板里不带点，输出时由
-`renameOnOutput` 还原成 `.gitignore`（否则会干扰本仓库自身）。
+只有 `.tmpl` 后缀走 Go `text/template` 渲染，其他文件原样复制。Vue 中的 `{{ }}` 不能误当 Go 模板；Go 源码与 module 配置需要替换项目路径时使用 `.tmpl`。模板中的 `gitignore` 输出时会还原成 `.gitignore`。
 
-## 开发
+修改模板后必须重新构建 CLI，旧二进制不会自动带上新模板。
+
+### 检查与测试
+
+从脚手架仓库执行静态检查：
 
 ```bash
 go vet ./...
-go test ./...     # 三种组件组合各跑一遍：生成 → go mod tidy → wire → go build → go vet
 ```
 
-组合测试产物写在 `/tmp/taurusx-test-*`，不落仓库。测试同时断言：
-无业务残留（CRM / 订单 / 财务 / 资源 / 任务 / 地点关键词与 `excelize` / `gomail` 依赖）、
-无凭证文件与内网标识串、未选组件不泄漏、`init.sql` 的表与接口权限 path 齐全、
-模板占位全部渲染完。
-
-前端构建需手动验证（测试里不跑，避免拉依赖）：
+执行测试：
 
 ```bash
-cd /tmp/taurusx-test-all/frontend
-pnpm install && pnpm build
+go test -count=1 ./...
 ```
+
+生成器测试覆盖必选、全选、典型组合，执行生成、依赖整理、Wire、后端 build/vet/test，并检查组件裁剪、模板残留、权限/路由一致性、安全回归及 Docker 跨平台文本约束。
+
+测试不自动完成前端构建、真实数据库业务验收、Docker 镜像构建、浏览器验收或并发验证。这些应单独对当前新候选执行，不用旧候选的结果冒充。
+
+遇到本机 Go 缓存权限问题，可为单次命令指定缓存目录，不改系统配置：
+
+```bash
+GOCACHE=/tmp/gocache-taurusx go test -count=1 ./...
+```
+
+本仓库正式交付形态是 CLI 二进制；生成项目则由使用者按自己的 Git、发布和部署流程管理。

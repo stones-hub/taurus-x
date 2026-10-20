@@ -45,6 +45,26 @@ func (r *AdminRoleRepository) FindByRoleIDAnyStatus(ctx context.Context, roleID 
 	return r.firstBy(ctx, "role_id = ?", roleID)
 }
 
+// FindByRoleIDForShare 当前读单个启用角色（SELECT ... FOR SHARE）。
+//
+// 用共享锁而不是排他锁：身份判定只读角色行、不改它，拿排他锁会无谓地挡住角色管理，
+// 还会把死锁面扩大到角色模块。共享锁已经足够拿到当前读 + 判定期间这一行不被改。
+//
+// 注意：**当前没有生产调用方**。身份与入参判定一律改用
+// FindByRoleIDAnyStatusForShare —— 状态是策略判定的输入，不是查询条件
+// （在查询里过滤 status 会让「保留一个已持有的禁用角色」变成「角色ID不存在」）。
+// 这里保留它是因为「当前读某个启用角色」是个合法的查询原语，且已有 SQL 形状测试；
+// 要用它之前先确认你真的想让禁用的角色在结果里直接消失。
+func (r *AdminRoleRepository) FindByRoleIDForShare(ctx context.Context, roleID uint64) (*model.AdminRole, error) {
+	return r.firstLocking(ctx, lockForShare, "role_id = ? and status = 1", roleID)
+}
+
+// FindByRoleIDAnyStatusForShare 当前读单个角色、不过滤 status（SELECT ... FOR SHARE）。
+// 已禁用的 super_admin 同样是「这个账号是超管」的证据，所以身份判定不能过滤状态。
+func (r *AdminRoleRepository) FindByRoleIDAnyStatusForShare(ctx context.Context, roleID uint64) (*model.AdminRole, error) {
+	return r.firstLocking(ctx, lockForShare, "role_id = ?", roleID)
+}
+
 // ListActive 查询所有启用状态的角色
 func (r *AdminRoleRepository) ListActive(ctx context.Context) ([]model.AdminRole, error) {
 	return r.findBy(ctx, "status = 1")

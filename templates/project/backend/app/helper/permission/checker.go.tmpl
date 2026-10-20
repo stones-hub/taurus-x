@@ -17,8 +17,15 @@ func NewChecker(roleService RoleServiceIface) *Checker {
 	return &Checker{roleService: roleService}
 }
 
-// CheckAPIPermission 检查用户是否有访问指定接口的权限
-// 超级管理员直接放行；否则遍历用户接口权限（permission_type=3 且 path 匹配且启用）。
+// CheckAPIPermission 检查用户是否有访问指定接口的权限。
+//
+// 超级管理员直接放行（IsUserSuperAdmin 要求 super_admin 角色启用中）；否则遍历
+// 用户的**有效权限**（permission_type=3 且 path 精确相等且权限行启用）。
+//
+// 有效权限由 roleService.GetUserAllPermissions 给出，它只算**启用角色**名下的权限 ——
+// 角色一旦被禁用，它独占的接口立刻不通；该账号的其他启用角色也挂着的接口不受影响。
+// 任何一步查询出错都返回 error，由中间件拒绝该请求（fail closed），不按「没权限但
+// 也不报错」或「出错就放行」处理。
 func (c *Checker) CheckAPIPermission(ctx context.Context, userID uint64, apiPath string) (bool, error) {
 	if c.roleService == nil {
 		return false, nil

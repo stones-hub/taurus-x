@@ -4,10 +4,12 @@ package helper
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"fmt"
 	"log"
 	"math/big"
 	"strconv"
+	"strings"
 	"time"
 
 	"{{ .Module }}/internal/taurus"
@@ -54,8 +56,10 @@ func (m *VerificationCodeManager) SendSMSCode(ctx context.Context, mobile string
 		return "", fmt.Errorf("生成验证码失败: %v", err)
 	}
 
-	// TODO: 接入第三方短信服务
-	log.Printf("发送短信验证码到 %s: %s\n", mobile, code)
+	// TODO: 接入第三方短信服务。
+	// 绝不要把验证码写进日志：日志会落盘、会进日志平台，等于验证码公开。
+	// 这里只记录「发给了谁」，手机号也做掩码。
+	log.Printf("发送短信验证码到 %s\n", MaskMobile(mobile))
 
 	key := fmt.Sprintf("verification_code:mobile:%s", mobile)
 	if err := taurus.Container.Redis.Set(ctx, key, code, m.expires); err != nil {
@@ -74,9 +78,26 @@ func (m *VerificationCodeManager) VerifyCode(ctx context.Context, loginType, log
 	if cached == "" {
 		return false, fmt.Errorf("验证码不存在或已过期")
 	}
-	if cached != inputCode {
+	// 定长比较，避免按字节短路泄露「前几位猜对了」的时序信息
+	if subtle.ConstantTimeCompare([]byte(cached), []byte(inputCode)) != 1 {
 		return false, fmt.Errorf("验证码错误")
 	}
 	_ = taurus.Container.Redis.Del(ctx, key)
 	return true, nil
+}
+
+// MaskMobile 手机号掩码（138****8000），用于日志输出。
+// 非 11 位的输入按「保留首尾各 1 位」处理，短到无法掩码时整体打掉。
+func MaskMobile(mobile string) string {
+	n := len(mobile)
+	switch {
+	case n == 0:
+		return ""
+	case n >= 11:
+		return mobile[:3] + strings.Repeat("*", n-7) + mobile[n-4:]
+	case n > 2:
+		return mobile[:1] + strings.Repeat("*", n-2) + mobile[n-1:]
+	default:
+		return strings.Repeat("*", n)
+	}
 }

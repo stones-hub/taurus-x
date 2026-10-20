@@ -123,7 +123,22 @@ func (c *DeptController) DeleteDept(w http.ResponseWriter, r *http.Request) {
 	OK(w, map[string]string{"status": "success"})
 }
 
-// GetDeptUserList 部门员工列表（POST /admin/option/dept-users）
+// GetDeptUserOptions 部门员工选项（POST /admin/option/dept-users，最小字段）
+func (c *DeptController) GetDeptUserOptions(w http.ResponseWriter, r *http.Request) {
+	var req dto.DeptUserListRequest
+	if !BindJSON(w, r, &req) {
+		return
+	}
+	req.Normalize()
+	resp, err := c.DeptService.GetDeptUserOptions(r.Context(), req.DeptID, req.PageNo, req.PageSize)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	OK(w, resp)
+}
+
+// GetDeptUserList 部门员工列表（POST /admin/dept/user-list，受接口权限保护）
 func (c *DeptController) GetDeptUserList(w http.ResponseWriter, r *http.Request) {
 	var req dto.DeptUserListRequest
 	if !BindJSON(w, r, &req) {

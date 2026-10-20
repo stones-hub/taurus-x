@@ -1,0 +1,198 @@
+package middleware
+
+import (
+	"net/url"
+	"strings"
+	"testing"
+)
+
+// 日志脱敏是「日志里不能出现明文口令」这条要求的唯一实现点，
+// 访问日志与操作日志都走 redactBody / redactQuery（见 access_log.go、operation_log.go）。
+//
+// 这里的用例都用合成值，并且断言「明文不出现」而不是「等于某个字符串」：
+// 换占位符、改字段顺序都不该让这些用例失效，真把明文漏出去才失败。
+
+const (
+	testPlainPassword = "Synthetic-Pw-0001"
+	testPlainToken    = "synthetic.jwt.token.0001"
+	testPlainCode     = "135790"
+)
+
+// TestRedactBody_JSONSensitiveFields 登录/改密/验证码这些接口的请求体字段必须被打掉。
+func TestRedactBody_JSONSensitiveFields(t *testing.T) {
+	cases := []struct {
+		name  string
+		body  string
+		plain []string
+	}{
+		{
+			name:  "登录请求",
+			body:  `{"login_value":"someuser","password":"` + testPlainPassword + `"}`,
+			plain: []string{testPlainPassword},
+		},
+		{
+			name:  "改密请求（下划线命名）",
+			body:  `{"old_password":"` + testPlainPassword + `","new_password":"` + testPlainPassword + `2"}`,
+			plain: []string{testPlainPassword},
+		},
+		{
+			name:  "改密请求（驼峰命名）",
+			body:  `{"oldPassword":"` + testPlainPassword + `","newPassword":"` + testPlainPassword + `2"}`,
+			plain: []string{testPlainPassword},
+		},
+		{
+			name:  "登录响应里的 Token",
+			body:  `{"code":200,"data":{"token":"` + testPlainToken + `","refresh_token":"` + testPlainToken + `r"}}`,
+			plain: []string{testPlainToken},
+		},
+		{
+			name:  "短信验证码（字符串 code）",
+			body:  `{"login_value":"13800000000","code":"` + testPlainCode + `"}`,
+			plain: []string{testPlainCode},
+		},
+		{
+			name:  "验证码字段的其它写法",
+			body:  `{"verify_code":"` + testPlainCode + `","sms_code":"` + testPlainCode + `","captcha":"` + testPlainCode + `"}`,
+			plain: []string{testPlainCode},
+		},
+		{
+			name:  "salt 不能进日志",
+			body:  `{"salt":"0123456789abcdef0123456789abcdef"}`,
+			plain: []string{"0123456789abcdef0123456789abcdef"},
+		},
+		{
+			name:  "嵌套对象",
+			body:  `{"data":{"user":{"password":"` + testPlainPassword + `"}}}`,
+			plain: []string{testPlainPassword},
+		},
+		{
+			name:  "数组里的对象",
+			body:  `[{"password":"` + testPlainPassword + `"},{"token":"` + testPlainToken + `"}]`,
+			plain: []string{testPlainPassword, testPlainToken},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got := redactBody("application/json", tc.body)
+			for _, plain := range tc.plain {
+				if strings.Contains(got, plain) {
+					t.Errorf("脱敏后仍含明文 %q: %s", plain, got)
+				}
+			}
+			if !strings.Contains(got, redactedPlaceholder) {
+				t.Errorf("脱敏后应出现占位符 %s，实际: %s", redactedPlaceholder, got)
+			}
+		})
+	}
+}
+
+// TestRedactBody_KeepsNonSensitiveFields 脱敏不能把排查需要的字段一起糊掉，
+// 否则日志失去价值、下一个人就会把脱敏关掉。
+func TestRedactBody_KeepsNonSensitiveFields(t *testing.T) {
+	body := `{"code":200,"message":"ok","data":{"user_id":1024,"role_code":"super_admin","dept_code":"D001","permission_code":"api.admin.user.list"}}`
+	got := redactBody("application/json", body)
+
+	for _, keep := range []string{"200", "ok", "1024", "super_admin", "D001", "api.admin.user.list"} {
+		if !strings.Contains(got, keep) {
+			t.Errorf("非敏感字段 %q 被误脱敏: %s", keep, got)
+		}
+	}
+	if strings.Contains(got, redactedPlaceholder) {
+		t.Errorf("不该出现脱敏占位符: %s", got)
+	}
+}
+
+// TestRedactBody_Form 表单编码的请求体同样要脱敏。
+func TestRedactBody_Form(t *testing.T) {
+	body := url.Values{
+		"login_value": {"someuser"},
+		"password":    {testPlainPassword},
+	}.Encode()
+
+	got := redactBody("application/x-www-form-urlencoded", body)
+	if strings.Contains(got, testPlainPassword) {
+		t.Errorf("表单脱敏后仍含明文口令: %s", got)
+	}
+	if !strings.Contains(got, "someuser") {
+		t.Errorf("表单里的非敏感字段应保留: %s", got)
+	}
+}
+
+// TestRedactBody_UnparseableFallback 解析不了但含敏感字段名时整体打掉，
+// 宁可丢可读性也不要漏明文。
+func TestRedactBody_UnparseableFallback(t *testing.T) {
+	body := `password: ` + testPlainPassword + ` (这不是 JSON 也不是表单`
+	got := redactBody("text/plain", body)
+	if strings.Contains(got, testPlainPassword) {
+		t.Errorf("无法解析的内容含敏感字段名时应整体脱敏，实际: %s", got)
+	}
+}
+
+// TestRedactBody_Empty 空体原样返回，不要凭空造出占位符。
+func TestRedactBody_Empty(t *testing.T) {
+	for _, body := range []string{"", "   ", "\n"} {
+		if got := redactBody("application/json", body); got != body {
+			t.Errorf("空体应原样返回，输入 %q 得到 %q", body, got)
+		}
+	}
+}
+
+// TestRedactQuery URL query 里的 token 也要打掉
+// （RefreshToken 已不再从 query 取 Token，但第三方链接仍可能带上）。
+func TestRedactQuery(t *testing.T) {
+	raw := url.Values{
+		"token":    {testPlainToken},
+		"page_no":  {"1"},
+		"keyword":  {"hello"},
+		"password": {testPlainPassword},
+	}.Encode()
+
+	got := redactQuery(raw)
+	for _, plain := range []string{testPlainToken, testPlainPassword} {
+		if strings.Contains(got, plain) {
+			t.Errorf("query 脱敏后仍含明文 %q: %s", plain, got)
+		}
+	}
+	if !strings.Contains(got, "page_no=1") || !strings.Contains(got, "keyword=hello") {
+		t.Errorf("query 里的非敏感参数应保留: %s", got)
+	}
+
+	if got := redactQuery(""); got != "" {
+		t.Errorf("空 query 应原样返回，实际 %q", got)
+	}
+}
+
+// TestRedactQuery_Unparseable 解析不了的 query 含敏感字段名时整体打掉。
+func TestRedactQuery_Unparseable(t *testing.T) {
+	raw := "token=" + testPlainToken + ";%zz"
+	if got := redactQuery(raw); strings.Contains(got, testPlainToken) {
+		t.Errorf("无法解析的 query 含敏感字段名时应整体脱敏，实际: %s", got)
+	}
+}
+
+// TestIsSensitiveKey_NumericCodeNotRedacted 统一响应里的 {"code":200} 是数字状态码，
+// 不能被当成验证码糊掉；字符串 code 才是验证码。
+func TestIsSensitiveKey_NumericCodeNotRedacted(t *testing.T) {
+	if isSensitiveKey("code", false) {
+		t.Error("数字类型的 code 是响应状态码，不应脱敏")
+	}
+	if !isSensitiveKey("code", true) {
+		t.Error("字符串类型的 code 是验证码，必须脱敏")
+	}
+}
+
+// TestNormalizeKey 字段名归一化：大小写、下划线、短横线都要命中同一条规则。
+func TestNormalizeKey(t *testing.T) {
+	for _, key := range []string{"old_password", "oldPassword", "Old-Password", "OLD_PASSWORD"} {
+		if !isSensitiveKey(key, true) {
+			t.Errorf("字段名 %q 应被识别为敏感字段", key)
+		}
+	}
+	for _, key := range []string{"role_code", "dept_code", "permission_code", "username", "realname"} {
+		if isSensitiveKey(key, true) {
+			t.Errorf("字段名 %q 是正常业务字段，不应被识别为敏感字段", key)
+		}
+	}
+}

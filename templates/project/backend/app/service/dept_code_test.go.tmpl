@@ -1,0 +1,100 @@
+package service
+
+import (
+	"strings"
+	"testing"
+)
+
+// 部门编码可空：MySQL 唯一索引允许多个 NULL，所以「没填编码」必须落成 NULL 而不是 ''，
+// 否则第二个不填编码的部门会撞 uk_dept_code 建不出来。
+// 同时非空编码仍然必须受唯一约束，不能为了修这个 bug 把约束去掉。
+
+func TestNormalizeDeptCode(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  *string // nil 表示期望 NULL
+	}{
+		{name: "空串 → NULL", input: "", want: nil},
+		{name: "纯空格 → NULL", input: "   ", want: nil},
+		{name: "制表符换行 → NULL", input: "\t\n ", want: nil},
+		{name: "正常编码原样保留", input: "D001", want: strPtr("D001")},
+		{name: "两侧空格被去掉", input: "  D001  ", want: strPtr("D001")},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got := normalizeDeptCode(tc.input)
+			switch {
+			case tc.want == nil && got != nil:
+				t.Fatalf("期望 NULL，实际 %q", *got)
+			case tc.want != nil && got == nil:
+				t.Fatalf("期望 %q，实际 NULL", *tc.want)
+			case tc.want != nil && *got != *tc.want:
+				t.Fatalf("期望 %q，实际 %q", *tc.want, *got)
+			}
+		})
+	}
+}
+
+// TestNormalizeDeptCode_MultipleBlankAreAllNull 连续创建多个不填编码的部门时，
+// 每个都必须是 NULL —— 这正是「第二次创建失败」那个缺陷的根因。
+func TestNormalizeDeptCode_MultipleBlankAreAllNull(t *testing.T) {
+	for i, input := range []string{"", " ", "", "\t"} {
+		if got := normalizeDeptCode(input); got != nil {
+			t.Errorf("第 %d 个空编码应为 NULL，实际 %q", i+1, *got)
+		}
+	}
+}
+
+// TestDeptCodeText 对外输出把 NULL 显示成空串，前端不用处理 null。
+func TestDeptCodeText(t *testing.T) {
+	if got := deptCodeText(nil); got != "" {
+		t.Errorf("NULL 应输出空串，实际 %q", got)
+	}
+	if got := deptCodeText(strPtr("D001")); got != "D001" {
+		t.Errorf("期望 D001，实际 %q", got)
+	}
+	if got := deptCodeText(strPtr("")); got != "" {
+		t.Errorf("空串指针应输出空串，实际 %q", got)
+	}
+}
+
+// TestClampLen 登录日志的 IP / UA / 失败原因都按列宽截断，
+// 否则一个超长 User-Agent 会让整条登录日志写失败（登录失败日志尤其不能丢）。
+func TestClampLen(t *testing.T) {
+	if got := clampLen("short", 45); got != "short" {
+		t.Errorf("未超长应原样返回，实际 %q", got)
+	}
+
+	long := strings.Repeat("a", maxLoginUserAgentLen+100)
+	got := clampLen(long, maxLoginUserAgentLen)
+	if len(got) != maxLoginUserAgentLen {
+		t.Errorf("期望截断到 %d 字节，实际 %d", maxLoginUserAgentLen, len(got))
+	}
+
+	// 多字节字符不能被切成半个（切断后写库会报 invalid utf8 或存成乱码）
+	cn := strings.Repeat("中", 40) // 120 字节
+	got = clampLen(cn, maxLoginIPLen)
+	if len(got) > maxLoginIPLen {
+		t.Errorf("截断后不应超过 %d 字节，实际 %d", maxLoginIPLen, len(got))
+	}
+	for _, r := range got {
+		if r == '�' {
+			t.Fatalf("截断把多字节字符切断了: %q", got)
+		}
+	}
+	if want := maxLoginIPLen / 3 * 3; len(got) != want {
+		t.Errorf("期望按整字符截断到 %d 字节，实际 %d", want, len(got))
+	}
+
+	if got := clampLen("anything", 0); got != "anything" {
+		t.Errorf("max<=0 表示不截断，实际 %q", got)
+	}
+	if got := clampLen("", 45); got != "" {
+		t.Errorf("空串应原样返回，实际 %q", got)
+	}
+}
+
+func strPtr(s string) *string { return &s }

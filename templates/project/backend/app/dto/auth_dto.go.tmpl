@@ -8,13 +8,6 @@ type LoginRequest struct {
 	Password string `json:"password" form:"password"`
 }
 
-// RegisterRequest 注册请求
-type RegisterRequest struct {
-	Username string `json:"username" form:"username"`
-	Password string `json:"password" form:"password"`
-	Email    string `json:"email" form:"email"`
-}
-
 // LoginResponse 登录响应（对齐前端 LoginResponse：token/user/expires_at）
 type LoginResponse struct {
 	Token     string    `json:"token"`

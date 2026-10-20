@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -25,6 +26,8 @@ const (
 type JWTClaims struct {
 	UID      string `json:"uid"`
 	Username string `json:"username"`
+	// JTI 本次 Token 的唯一标识，会话白名单与精确吊销都靠它
+	JTI string `json:"jti"`
 }
 
 // JWTMiddleware JWT 鉴权中间件
@@ -48,7 +51,7 @@ func JWTMiddleware() func(next http.Handler) http.Handler {
 				return
 			}
 
-			jwtClaims := JWTClaims{UID: claims.UID, Username: claims.Username}
+			jwtClaims := JWTClaims{UID: claims.UID, Username: claims.Username, JTI: claims.JTI}
 			ctx := context.WithValue(r.Context(), JWTTokenClaimsKey, jwtClaims)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
@@ -69,41 +72,116 @@ func GetJWTToken(r *http.Request) string {
 	return ""
 }
 
-// GenerateJWTToken 生成 JWT 令牌
-func GenerateJWTToken(uid, username string) (string, error) {
+// signJWT 只负责签名并回读 jti，不碰会话白名单。
+// 单独拆出来是为了让「签发」与「登记」的顺序/版本来源可以被独立推理与测试。
+func signJWT(uid, username string) (token, jti string, ttl time.Duration, err error) {
 	expireHours := taurus.Container.Config.GetInt("http.jwt.expire_hours")
 	if expireHours <= 0 {
 		expireHours = 24
 	}
-	return tcrypt.GenerateTokenWithExpiration(
+	ttl = time.Duration(expireHours) * time.Hour
+	secret := taurus.Container.Config.GetString("http.jwt.secret")
+
+	token, err = tcrypt.GenerateTokenWithExpiration(
 		uid,
 		username,
 		taurus.Container.Config.GetString("http.jwt.issuer"),
-		taurus.Container.Config.GetString("http.jwt.secret"),
-		time.Duration(expireHours)*time.Hour,
+		secret,
+		ttl,
 	)
+	if err != nil {
+		return "", "", 0, err
+	}
+
+	// jti 由签发库生成，回读一次拿到它
+	claims, err := tcrypt.ParseTokenWithSecret(token, secret)
+	if err != nil {
+		return "", "", 0, err
+	}
+	return token, claims.Id, ttl, nil
 }
 
-// ValidateJWTToken 验证 JWT 令牌
+// GenerateJWTToken 生成 JWT 令牌，并以 authVersion 把它登记进会话白名单。
+// 登记失败时不返回 Token：宁可登录失败，也不要发出一个「无法被吊销」的 Token。
+//
+// authVersion 必须来自「校验凭证与账号状态的那一次数据库读取」（同一个一致性快照），
+// 不能在这里重新读一遍：
+//   - 若改密在该快照之前提交，旧密码根本过不了校验；
+//   - 若改密在该快照之后提交，当前版本已经变了，本次登记的版本立即失配，会话无效。
+//
+// 两种情况都不存在「旧凭证换到可用会话」的窗口。反过来，如果在登记时现读版本，
+// 旧凭证的并发登录就会登记到新版本上，这正是不能只把自增提前到 SQL 之前的原因。
+func GenerateJWTToken(uid, username string, authVersion int64) (string, error) {
+	userID, err := strconv.ParseUint(uid, 10, 64)
+	if err != nil {
+		return "", fmt.Errorf("签发 Token 失败: 用户 ID 非法")
+	}
+	token, jti, ttl, err := signJWT(uid, username)
+	if err != nil {
+		return "", err
+	}
+	if err := AuthSessionStore().RegisterSession(userID, jti, ttl, authVersion); err != nil {
+		return "", fmt.Errorf("签发 Token 失败: %w", err)
+	}
+	return token, nil
+}
+
+// ValidateJWTToken 验证 JWT 令牌签名与有效期（不含会话白名单校验，
+// 白名单由 SessionValidatorMiddleware 负责）
 func ValidateJWTToken(token string) (*JWTClaims, *tcrypt.Claims, error) {
 	c, err := tcrypt.ParseTokenWithSecret(token, taurus.Container.Config.GetString("http.jwt.secret"))
 	if err != nil {
 		return nil, nil, err
 	}
-	return &JWTClaims{UID: c.Uid, Username: c.Username}, c, nil
+	return &JWTClaims{UID: c.Uid, Username: c.Username, JTI: c.Id}, c, nil
 }
 
-// RefreshJWTToken 刷新 JWT 令牌
+// RefreshJWTToken 刷新 JWT 令牌：校验旧 Token 仍在白名单内，签发新 Token 后吊销旧的。
 func RefreshJWTToken(w http.ResponseWriter, token string) (string, error) {
 	claims, err := tcrypt.ParseTokenWithSecret(token, taurus.Container.Config.GetString("http.jwt.secret"))
 	if err != nil {
 		return "", err
 	}
-	newToken, err := GenerateJWTToken(claims.Uid, claims.Username)
+	userID, err := strconv.ParseUint(claims.Uid, 10, 64)
+	if err != nil {
+		return "", fmt.Errorf("刷新 Token 失败: 用户 ID 非法")
+	}
+	newToken, err := rotateSession(AuthSessionStore(), userID, claims.Id, func() (string, string, time.Duration, error) {
+		return signJWT(claims.Uid, claims.Username)
+	})
 	if err != nil {
 		return "", err
 	}
 	SetJWTToken(w, newToken)
+	return newToken, nil
+}
+
+// rotateSession 把旧会话轮换成新会话，是刷新 Token 的全部安全逻辑。
+//
+// 关键一点：新会话沿用**旧会话校验时拿到的那个认证版本**，绝不重新读当前版本。
+// 否则会留下这样的窗口 —— 旧 Token 校验通过，紧接着管理员改密/禁用提交，
+// 刷新却按新版本登记，于是刚被吊销的会话借刷新续了命。沿用旧版本后，
+// 这种并发下新 Token 的版本已经落后，下一次校验必然被拒。
+//
+// 顺序也是刻意的：先登记新的、再吊销旧的。登记失败时旧会话保持可用（刷新失败
+// 不该把人踢下线），而不会出现「旧的已吊销、新的没发出来」。
+func rotateSession(s SessionStore, userID uint64, oldJTI string,
+	sign func() (token, jti string, ttl time.Duration, err error)) (string, error) {
+	authVersion, err := s.ValidateSession(userID, oldJTI)
+	if err != nil {
+		return "", err
+	}
+	newToken, newJTI, ttl, err := sign()
+	if err != nil {
+		return "", err
+	}
+	if err := s.RegisterSession(userID, newJTI, ttl, authVersion); err != nil {
+		return "", fmt.Errorf("刷新 Token 失败: %w", err)
+	}
+	// 新 Token 已登记成功，旧的立即失效，避免一次刷新留下两个可用 Token
+	if err := s.RevokeSession(oldJTI); err != nil {
+		return "", err
+	}
 	return newToken, nil
 }
 

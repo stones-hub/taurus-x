@@ -1,7 +1,7 @@
 # 系统版本
 version: "${VERSION:v1.0.0}"
 app_name: "${APP_NAME:{{ .ProjectName }}}"
-pprof_enabled: true
+pprof_enabled: ${PPROF_ENABLED:false} # pprof 默认关闭；需要时在本机临时打开（只监听 127.0.0.1:6060）
 
 # Go 运行时配置
 go:

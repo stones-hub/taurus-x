@@ -16,6 +16,13 @@
 ### 1. 贫血 Model
 - 实体只含「字段 + `TableName()`」，不 import gorm、不写 `DB()`。
 - gorm 约束用普通 struct tag（如 `gorm:"column:xxx;not null;index:idx_status"`），字段 JSON tag 用 snake_case。
+- **零值有业务含义的列，禁止写 `gorm:"default:..."`**（如 `0=失败` / `0=禁用` / `0=未读`）：
+  GORM 在 `Create` 时把零值当成「调用方没赋值」并用 tag 里的默认值替换它，
+  于是显式写入的 0 会变成默认值，接口照常成功、只有库里的数据是错的。
+  底座踩过一次：`admin_user_login_logs.login_status` 带了 `default:1`，
+  所有登录失败都被记成成功（见 `app/model/admin_user_login_log.go` 的注释与
+  `app/repo/admin_user_login_log_repo_test.go` 的回归测试）。
+  需要默认值就只写在建表 SQL 里，并让应用层每次都显式带上该列。
 
 ### 2. 自建仓储（baseRepository）
 - 自建 `baseRepository[T TableNamer]`，`TableNamer` 只要求 `TableName()`。
@@ -82,11 +89,155 @@
 
 ### 10. 路由 path 对齐 + 中间件链
 - 业务接口 path 必须与 `admin_permissions.path` 完全一致（`CheckAPIPermission` 按 path 精确匹配 `permission_type=3`，`super_admin` 放行）。
-- 标准链：`Recovery → JWT → PasswordChangeValidator → Permission → CSRF`。
-- 两条链（定义于 `app/routes/routes.go`）：
-  - `userBaseChain`：**不含** Permission —— 用于「自己改自己」与下拉选项。
-  - `userProtectedChain`：**含** Permission —— 用于业务 list / CRUD。
-- `set-password`（无需旧密码）与 `change-password`（需旧密码）是**两个独立接口**。
+- **三条链**（定义于 `app/routes/routes.go`，顺序即执行顺序，以 `routes.go` 为准）：
+
+  | 链 | 中间件顺序 | 用途 |
+  |----|-----------|------|
+  | `userBaseChain` | `Recovery → BodyLimit → JWT → SessionValidator → AccessLog → CSRF` | 「读自己」与下拉选项；**不含** Permission、**不含** OperationLog |
+  | `userSelfServiceChain` | `Recovery → BodyLimit → JWT → SessionValidator → AccessLog → OperationLog → CSRF` | 「自己改自己」的写操作；**不含** Permission，但要操作留痕 |
+  | `userProtectedChain` | `Recovery → BodyLimit → JWT → SessionValidator → AccessLog → Permission → OperationLog → CSRF` | 业务 list / CRUD，**受接口权限校验** |
+
+- 三条链都以 `BodyLimit` 限制请求体、都挂 `AccessLog`、都以 `CSRF` 收尾；
+  差别只在 **Permission**（是否校验接口权限）和 **OperationLog**（是否记操作日志）。
+- `SessionValidator` 紧跟 `JWT`：JWT 只验签名，会话是否已被吊销（改密 / 禁用 / 登出）
+  由 `SessionValidator` 比对 `admin_users.auth_version` 判定，二者缺一不可。
+- 不走这三条链的例外（各自单独定义，别往链里塞）：
+  - `/auth/login`：`Recovery → BodyLimit → RateLimit("login") → AccessLog`（无 JWT，带登录限流）；
+  - `/auth/logout`：`Recovery → BodyLimit → AccessLog`（无 JWT、**故意不限流**，Token 过期也要能清会话）；
+  - `/admin/user/bind-mobile`、`unbind-mobile`：在基础链的 `BodyLimit` 之后额外插
+    `RateLimit("verify_code")`。
+- 改密只有两个入口，不要再加第三个：`change-password`（自助，**必须带旧密码**，走
+  `userSelfServiceChain` 不挂 Permission）与 `/admin/user/update` 的 `password` 字段
+  （管理员重置他人，走 `userProtectedChain` 受接口权限校验，并额外受下面的目标账号保护）。
+
+### 10.1 目标账号保护（有接口权限 ≠ 能动这个账号）
+- Permission 中间件只回答「这个人能不能调这个接口」，**不回答「能不能动这个账号」**。
+  两者混为一谈的结果是：任何配了 `user/update`、`user/update-status`、`user/delete`
+  权限的普通管理员都能改超管资料、重置超管密码、禁用或删除超管 —— 等于绕过超管。
+- 规则：**非 `super_admin` 不得对持有 `super_admin` 角色的目标账号执行任何管理写入**
+  （资料 / 密码 / 状态 / 角色）。超管管理普通账号、普通管理员管理普通账号、本人自助
+  改密都不受影响。
+- 实现在 `app/service/user_guard.go` 的 `guardUserWrite`，四条硬约束：
+  1. 操作人身份只认 JWT 带上来的 `user_id`；目标身份只认库里的 `admin_user_roles`
+     关联表 —— 入参的 `role_ids` / `is_system` 是调用方给的，不作为身份依据；
+  2. 事实必须在**执行写入的那个事务**里读，且判定排在**任何写入之前**；
+  3. 事实必须是**加锁当前读**的结果，不是事务快照（见下面的身份锁协议）；
+  4. 身份查询出错或查不到一律拒绝（fail closed）。
+- 新增「写用户」的接口时，在 `RunInTx` 的**第一行**调用 `guardUserWrite`，不要在事务外
+  先查一遍再写，也不要把判定放到写入之后 —— 前面已经提交的资料和密码撤不回来。
+- 判定口径故意不对称：`holdsEnabledSuperAdmin`（操作人**有没有**超管权力）要求角色
+  启用中；`HoldsSuperAdminRole`（目标**是否受保护**）不看角色状态。两边都偏安全。
+
+### 10.2 身份锁协议（同一个事务 ≠ 已防并发）
+- **「在同一个事务里读」不等于「读到的是当前事实」。** MySQL 默认 REPEATABLE READ，
+  事务里第一次普通 `SELECT` 建立一致性快照，之后的普通 `SELECT` 都读那份快照：
+  别的事务刚提交的「把超管角色授给目标」根本看不见，判定依据是一份过期身份。
+  换成 READ COMMITTED 也不够 —— 普通读不加锁，「读完之后、写之前」照样能被改。
+- 所以所有改账号或账号角色的入口统一走一套协议，顺序不能变：
+
+  ```
+  锁稳定用户行（FOR UPDATE）→ 当前读身份事实（FOR UPDATE / FOR SHARE）→ 判定 → 才写
+  ```
+
+- 锁锚在 `admin_users` 的主键行上，**不是**角色关联行：账号可能一条关联行都没有
+  （新建账号、首次赋角色），锚在关联行上时「目标没有关联行」就等于没锁。
+- 操作人和目标**两行都锁**：目标是否受保护、操作人是否还是超管，两边都参与判定。
+- 加锁顺序固定按 `user_id` **升序**、同一 ID 只锁一次（`sortedUniqueUserIDs`）：
+  交叉管理（A 改 B 的同时 B 改 A）两笔要的是同一组锁、同一个顺序，不会各持一半互等；
+  操作自己时只锁一次，身份也只当前读一次。
+- 唯一加锁入口是 `lockUserRowsAscending`；自助改密走 `lockSelfUserRow`，它不做身份
+  判定，只为让「先 `admin_users` 再 `admin_user_logins`」这个顺序与管理员重置密码一致，
+  否则同一账号上两条路径就是一对相反锁序。
+- 锁等待超时 / 死锁回滚一律返回失败并整笔回滚，**不做任何隐式重试**。
+- 角色事实读用 `FOR SHARE`（`FindByRoleIDAnyStatusForShare`）：判定只读角色行，
+  拿排他锁会无谓挡住角色管理、并把死锁面扩大到角色模块。读角色事实**不按 status
+  过滤**：状态是策略判定的输入（见 10.3），不是查询条件。
+- 角色关联的整体替换按 `user_id` 条件删一次（`DeleteByUserID`），**不要**「先查出关联行
+  再按主键逐行删」—— 后者只删得掉自己快照里的行，快照之后新增的关联行会留下来，
+  替换完就多出一个本次没打算赋的角色。
+- 角色自身的身份影响已在角色侧堵住：`super_admin` 是系统角色且编码是保留值，
+  `CheckRoleMutable` 不许改名 / 改状态 / 删除它，`role_code` 没有任何接口可以修改。
+- **未验证边界**：以上是代码层面的锁协议与顺序约束。单元测试能证明语句顺序、
+  加锁子句、绑定参数和「拒绝时零写入」，证不了真实 MySQL 下的并发交错结果
+  （可见性、锁等待、死锁回滚）。那部分需要在真库上验证，不要当成已验证结论。
+
+### 10.3 角色关联的更新语义（仅 role_ids 选择性 + 禁用角色）
+- **选择性更新只有 `role_ids` 这一个字段**。`/admin/user/update` 的其余字段
+  （`realname`、`nickname`、`email`、`mobile`、`status`、`password` 等）仍是
+  **完整表单语义**：前端提交的是整张表单，服务端按收到的值覆盖。所以
+  **不要把这个端点描述成 PATCH**，它不是；只有 `role_ids` 这一段按「有没有传」
+  区分行为。想改某个资料字段而不动其它字段，仍然要把其它字段的当前值一起回传。
+- 只想改角色、不动资料，请走已有的 `/admin/role/assign`（`UpdateUserRoles`），
+  不要为此扩 `UpdateUser` 的语义，也不要把资料字段改成指针做整表单部分更新 ——
+  那是另一次改造，不在当前范围内。
+- `role_ids` 按 JSON 形态分四种行为：
+
+  | 请求体 | 行为 |
+  |--------|------|
+  | 没有 `role_ids` 字段 | 不校验、不替换，完全不碰 `admin_user_roles` |
+  | `"role_ids": null` | 同「没有这个字段」，**不清空** |
+  | `"role_ids": []` | 清空该账号的角色关联 |
+  | `"role_ids": [1,2]` | 按安全校验整体替换 |
+
+- 判定依据是 `dto.UpdateUserRequest.RolesProvided()`，即切片的 **nil 性**，
+  **不是长度**：`encoding/json` 对「字段缺失」和 `null` 都留下 nil 切片，对 `[]`
+  给出非 nil 的空切片。写成 `len(RoleIDs) == 0` 就把「没传」和「显式清空」混成一种，
+  于是一次「只改昵称」的保存会把该账号的角色全部撤销。给其它 DTO 加「可选集合字段」
+  时照这个办：**不要**在解码前给切片预置默认值，也不要换成非 nil able 的类型。
+- 选择性更新只作用于角色这一段：**目标账号保护、身份锁、`auth_version` 原子变更
+  与本次改不改角色无关，始终执行**。「不传 `role_ids`」不是绕过账号保护的口子。
+- 角色状态策略（`CheckRoleStatusAssignable`）：
+  - 目标**已经持有**的禁用角色可以原样保留，也可以被明确取消；
+  - 本次**新增**的禁用角色一律拒绝（对超管同样生效 —— 这是数据正确性约束，
+    不是权限大小问题；要赋它先把角色启用）。
+- 对应地，编辑页的角色列表必须包含「该账号持有中但已被禁用」的角色：
+  `GetUserRolesAndPermissions` 以库里的 `admin_user_roles` 为准，把启用列表之外的
+  持有角色补查出来（`FindByRoleIDAnyStatus`）并标记选中；前端把它显示为「已禁用」、
+  可取消但不可勾选。只列启用角色的话，这条关联在页面上不存在，整体替换就把它删了。
+- `/admin/role/assign`（`UpdateUserRoles`）是**整体替换**语义，`role_ids` 为空即清空。
+  要表达「本次不动角色」不要给它传空切片，而是干脆不调它。
+
+### 10.4 禁用角色的权限语义
+- **被禁用的角色不贡献任何接口、菜单、按钮权限。** 关联行**可以保留也可以移除**：
+  保留是为了启用后自然恢复、编辑页也能回显并保持勾选；明确提交一个不含它的新集合
+  同样允许（见 10.3 的状态策略）。禁用期间它名下的权限一条都不算。
+- 过滤只写在一个地方：`repo.FindUserPermissions` 的那条联表查询
+  （`admin_user_roles ur → admin_roles r → admin_role_permissions rp → admin_permissions p`，
+  `WHERE ur.user_id = ? AND r.status = 1 AND p.status = 1`）。
+  非超管「实际被授权了哪些权限」只有这一个出口：
+  - 接口权限校验：`middleware.PermissionMiddleware` → `helper/permission.Checker`
+    → `AdminRoleService.GetUserAllPermissions`；
+  - 菜单与按钮下发：`AdminRoleService.GetUserMenusAndButtons`（同一出口，取两次）。
+
+  **不要在调用方另开一条「从 `admin_role_permissions` 自己拼权限」的路**，
+  否则过滤条件分叉，就会出现「接口已经不通了，菜单却还在」这种半截效果。
+- **「唯一出口」说的是唯一的授权来源，不是「整个请求只查一次库」。**
+  上面那条查询返回的是**被直接授权的权限行**（有效叶子）；`parent_id != 0` 的子菜单
+  要挂上菜单树还需要祖先节点，由 `collectMenuParentRecursive` 按 `parent_id`
+  再查一次 `admin_permissions`（`FindByPermissionID`，SQL 不带状态条件）。
+  这次补查**只补结构、不扩授权**，靠两条约束夹住：
+  - 递归起点全部来自有效权限查询的结果 —— **没有有效后代就不会发生补查**，
+    所以「角色被禁用后借祖先补查让菜单冒出来」这条路不存在；
+  - **祖先自身必须启用**（Go 侧 `parent.Status != 1` 就地停住，既不收集也不再上溯），
+    于是禁用的祖先不补出来，它下面那条有效子菜单会成为挂不上根的孤儿节点，
+    由 `buildFrontendMenuTree` 丢弃。
+- 两个 `status = 1` 是两件不同的事，都必须有：`r.status = 1` 是角色被禁用，
+  `p.status = 1` 是权限行自身被禁用。角色重新启用后权限自然恢复，
+  但**仍受权限行自身状态控制** —— 权限行是禁用的，启用角色也拿不到它。
+- 多角色取并集的口径：禁用角色**独占**的权限随它一起消失，
+  而同一条权限只要还有另一个启用角色挂着，就照常有效（`DISTINCT` 负责去重）。
+- 「有没有超管权力」（`IsUserSuperAdmin`）要求 `super_admin` 角色**启用中**，
+  与这条过滤同一口径。注意它和「目标账号是否受保护」（`HoldsSuperAdminRole`，
+  刻意**不看**状态）方向相反：给权力要严，保护要宽。
+- 权限查询出错一律 fail closed：`Checker` 把错误原样上抛，中间件回 500 且不执行
+  后续 handler —— 一次数据库抖动不能变成一次放行。
+- 不引入权限缓存：每次校验都查库。要加缓存必须同时设计禁用角色的失效路径，
+  那是另一次改造。
+- **未验证边界**：单元测试证明的是「执行到数据库的语句带着这两个过滤条件」
+  （MySQL dialector + DryRun 的语句形状断言）和「真实调用链只从这个出口取数」
+  （sqlmock 期望表：多查一次就撞上未预期的语句）。
+  sqlmock **不执行也不理解 SQL**，「MySQL 真的按这些条件过滤出了正确的并集」
+  仍需真库验证，不要当成已验证结论。
 
 ### 11. 响应判定（前端）
 - 前端判成功看 `body.code` 是否在 2xx 区间，**不看 HTTP 状态码**（`httpx.SendResponse` 对 400/401/403/404/500 都返回 HTTP 200 + body.code）。
@@ -109,7 +260,7 @@
   ```
 
 ### 14. 前端路由对齐 + 菜单链接
-- 前端路由 path 用 `page/xxx.html` 形式（如 `page/profile/profile.html`、`set-password.html`、`page/account/permission.html`）。
+- 前端路由 path 用 `page/xxx.html` 形式（如 `page/profile/profile.html`、`page/account/permission.html`）。
 - 菜单 link 无前导 `/`，由 `normalizeLink` 补 `/`。
 - 表格内 switch 修改成功后调用 `loadTableData()` 刷新。
 

@@ -128,7 +128,6 @@ async function onSubmit() {
         role_code: form.role_code.trim(),
         description: form.description.trim(),
         sort_order: Number(form.sort_order) || 0,
-        is_system: form.is_system || 0,
         permission_ids: permissionIds,
       })
       ElMessage.success('新增角色成功')
@@ -220,4 +219,3 @@ onMounted(loadPermissionTree)
     </el-card>
   </div>
 </template>
-

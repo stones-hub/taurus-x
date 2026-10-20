@@ -84,30 +84,63 @@ func RegisterRoutes() {
 		Handler: http.HandlerFunc(spaHandler),
 	})
 
-	// 认证路由（无需 JWT）：登录 / 登出
+	// 登录（无需 JWT）：单独一组，挂请求体上限与登录专用限流，抗口令爆破
 	taurus.Container.Http.AddRouterGroup(router.RouteGroup{
-		Prefix:     "/auth",
-		Middleware: []router.MiddlewareFunc{recovery(), tmid.AccessLogMiddleware()},
+		Prefix: "/auth",
+		Middleware: []router.MiddlewareFunc{
+			recovery(),
+			tmid.BodyLimitMiddleware(),
+			tmid.NamedRateLimitMiddleware("login"),
+			tmid.AccessLogMiddleware(),
+		},
 		Routes: []router.Router{
 			{Path: "/login", Handler: http.HandlerFunc(app.Core.AuthController.Login)},
+		},
+	})
+
+	// 登出（无需 JWT，Token 过期也要能清理会话）。
+	// 故意不限流：登出被挡住会把已失效的会话留在白名单里，比被刷接口更糟。
+	taurus.Container.Http.AddRouterGroup(router.RouteGroup{
+		Prefix: "/auth",
+		Middleware: []router.MiddlewareFunc{
+			recovery(),
+			tmid.BodyLimitMiddleware(),
+			tmid.AccessLogMiddleware(),
+		},
+		Routes: []router.Router{
 			{Path: "/logout", Handler: http.HandlerFunc(app.Core.AuthController.Logout)},
 		},
 	})
 
-	// 基础用户链：JWT + 改密校验 + 访问日志 + CSRF（不校验接口权限，供「自己改自己」的基础功能）
+	// 基础用户链：JWT + 会话校验 + 访问日志 + CSRF（不校验接口权限，供「读自己」的基础功能）
 	userBaseChain := []router.MiddlewareFunc{
 		recovery(),
+		tmid.BodyLimitMiddleware(),
 		tmid.JWTMiddleware(),
-		tmid.PasswordChangeValidatorMiddleware(),
+		tmid.SessionValidatorMiddleware(),
 		tmid.AccessLogMiddleware(),
+		tmid.CSRFMiddleware(),
+	}
+
+	// 自助写操作链：基础链 + 操作日志，但**不挂** Permission。
+	// 这些接口只能改 JWT 里的那个用户自己，不涉及他人账号，
+	// 挂接口权限会导致「没有用户管理权限的普通用户改不了自己的密码」。
+	userSelfServiceChain := []router.MiddlewareFunc{
+		recovery(),
+		tmid.BodyLimitMiddleware(),
+		tmid.JWTMiddleware(),
+		tmid.SessionValidatorMiddleware(),
+		tmid.AccessLogMiddleware(),
+		tmid.OperationLogMiddleware(),
 		tmid.CSRFMiddleware(),
 	}
 
 	// 完整权限链：+ Permission + 操作日志（受接口权限校验的写操作）
 	userProtectedChain := []router.MiddlewareFunc{
 		recovery(),
+		tmid.BodyLimitMiddleware(),
 		tmid.JWTMiddleware(),
-		tmid.PasswordChangeValidatorMiddleware(),
+		tmid.SessionValidatorMiddleware(),
 		tmid.AccessLogMiddleware(),
 		tmid.PermissionMiddleware(),
 		tmid.OperationLogMiddleware(),
@@ -134,13 +167,30 @@ func RegisterRoutes() {
 		},
 	})
 
-	// 当前用户受接口权限保护的写操作（/admin/user/*，走权限校验）
+	// 当前用户自助写操作：只能改 JWT 里的自己，不挂接口权限
 	taurus.Container.Http.AddRouterGroup(router.RouteGroup{
 		Prefix:     "/admin/user",
-		Middleware: userProtectedChain,
+		Middleware: userSelfServiceChain,
 		Routes: []router.Router{
 			{Path: "/change-password", Handler: http.HandlerFunc(app.Core.UserController.ChangePassword)},
-			{Path: "/set-password", Handler: http.HandlerFunc(app.Core.UserController.SetPassword)},
+		},
+	})
+
+	// 手机号绑定/解绑：要校验短信验证码，额外挂验证码校验限流（抗 6 位码枚举）
+	taurus.Container.Http.AddRouterGroup(router.RouteGroup{
+		Prefix: "/admin/user",
+		Middleware: []router.MiddlewareFunc{
+			recovery(),
+			tmid.BodyLimitMiddleware(),
+			tmid.NamedRateLimitMiddleware("verify_code"),
+			tmid.JWTMiddleware(),
+			tmid.SessionValidatorMiddleware(),
+			tmid.AccessLogMiddleware(),
+			tmid.PermissionMiddleware(),
+			tmid.OperationLogMiddleware(),
+			tmid.CSRFMiddleware(),
+		},
+		Routes: []router.Router{
 			{Path: "/bind-mobile", Handler: http.HandlerFunc(app.Core.UserController.BindMobile)},
 			{Path: "/unbind-mobile", Handler: http.HandlerFunc(app.Core.UserController.UnbindMobile)},
 		},
@@ -160,10 +210,16 @@ func RegisterRoutes() {
 		},
 	})
 
-	// 发送验证码（无需 JWT，供登录/绑定/解绑共用）
+	// 发送验证码（无需 JWT，供登录/绑定/解绑共用）。
+	// 短信有真金白银的成本，单独一套更紧的限流桶；并记访问日志（验证码已脱敏）。
 	taurus.Container.Http.AddRouterGroup(router.RouteGroup{
-		Prefix:     "/admin/user",
-		Middleware: []router.MiddlewareFunc{recovery()},
+		Prefix: "/admin/user",
+		Middleware: []router.MiddlewareFunc{
+			recovery(),
+			tmid.BodyLimitMiddleware(),
+			tmid.NamedRateLimitMiddleware("send_code"),
+			tmid.AccessLogMiddleware(),
+		},
 		Routes: []router.Router{
 			{Path: "/send-code", Handler: http.HandlerFunc(app.Core.UserController.SendCode)},
 		},
@@ -189,11 +245,16 @@ func RegisterRoutes() {
 		},
 	})
 
-	// 前端错误上报（公共路由，无需登录）
+	// 前端错误上报（公共路由，无需登录）。
+	// 唯一的匿名写入口：必须限制请求体大小并限流，否则谁都能往日志表里灌数据。
 	taurus.Container.Http.AddRouter(router.Router{
-		Path:       "/report-front-error",
-		Handler:    http.HandlerFunc(app.Core.LogController.ReportFrontError),
-		Middleware: []router.MiddlewareFunc{recovery()},
+		Path:    "/report-front-error",
+		Handler: http.HandlerFunc(app.Core.LogController.ReportFrontError),
+		Middleware: []router.MiddlewareFunc{
+			recovery(),
+			tmid.BodyLimitMiddleware(),
+			tmid.NamedRateLimitMiddleware("front_error"),
+		},
 	})
 
 	// 角色管理（RBAC）
@@ -247,14 +308,17 @@ func RegisterRoutes() {
 		},
 	})
 
-	// 选项（/admin/option/*，无接口权限校验，供下拉选项使用）
+	// 选项（/admin/option/*，只做登录校验、不做接口权限校验，供下拉选项使用）。
+	// 正因为不校验接口权限，这里只能挂「最小字段」的专用 Handler：
+	// 不要直接复用 /admin/user/list、/admin/dept/user-list 这类带手机号、邮箱、
+	// 最后登录 IP 的管理端列表接口。
 	taurus.Container.Http.AddRouterGroup(router.RouteGroup{
 		Prefix:     "/admin/option",
 		Middleware: userBaseChain,
 		Routes: []router.Router{
 			{Path: "/depts", Handler: http.HandlerFunc(app.Core.DeptController.GetAllDepts)},
-			{Path: "/dept-users", Handler: http.HandlerFunc(app.Core.DeptController.GetDeptUserList)},
-			{Path: "/users", Handler: http.HandlerFunc(app.Core.UserController.GetUserList)},
+			{Path: "/dept-users", Handler: http.HandlerFunc(app.Core.DeptController.GetDeptUserOptions)},
+			{Path: "/users", Handler: http.HandlerFunc(app.Core.UserController.GetUserOptions)},
 		},
 	})
 }

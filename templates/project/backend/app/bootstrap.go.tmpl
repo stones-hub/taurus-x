@@ -24,6 +24,7 @@ import (
 
 	"{{ .Module }}/app/command"
 	"{{ .Module }}/app/crontab"
+	"{{ .Module }}/app/helper"
 	"{{ .Module }}/app/hooks"
 	"{{ .Module }}/internal/taurus"
 )
@@ -179,6 +180,9 @@ func init() {
 	}
 	cleanups = append(cleanups, cleanup)
 
+	// 安全启动自检：密钥没配好就不要起服务
+	checkSecurityConfig()
+
 	// 设置 Go 相关配置
 	setGoConfig()
 
@@ -201,6 +205,18 @@ func init() {
 
 	// 启动命令行工具
 	command.StartCommand()
+}
+
+// checkSecurityConfig 启动前的安全配置自检。
+// 校验不过直接 log.Fatalf 退出：带着弱密钥跑起来的服务等于没有认证。
+//
+// 刻意不看 http.jwt.enabled：那个开关只决定 JWTMiddleware 是否拦请求，
+// 而登录签发 / 刷新 / 解析 Token 始终在用 http.jwt.secret。
+// 按开关跳过自检，等于允许密钥没配好就提供签名功能。
+func checkSecurityConfig() {
+	if err := helper.ValidateStartupSecurity(taurus.Container.Config.GetString); err != nil {
+		log.Fatalf("%s启动自检失败: %v%s\n", Red, err, Reset)
+	}
 }
 
 func runPprofServer() {

@@ -17,9 +17,30 @@ func NewAdminUserRoleRepositoryWithDB(db *gorm.DB) *AdminUserRoleRepository {
 	return &AdminUserRoleRepository{baseRepository: newBaseRepository[model.AdminUserRole](db)}
 }
 
-// FindByUserID 根据用户 ID 查找用户角色关联
+// FindByUserID 根据用户 ID 查找用户角色关联。
+//
+// 刻意**不按角色状态过滤**：关联表只回答「这个账号挂着哪些角色」。角色被禁用时
+// 关联要原样留着 —— 否则启用后恢复不了，编辑页也回显不出这条关联（一次「改昵称」
+// 的整体替换就把它删了）。「禁用角色不贡献权限」是在 FindUserPermissions 那条
+// 有效权限查询里过滤的，不在这里。
 func (r *AdminUserRoleRepository) FindByUserID(ctx context.Context, userID uint64) ([]model.AdminUserRole, error) {
 	return r.findBy(ctx, "user_id = ?", userID)
+}
+
+// LockByUserID 当前读并锁定某用户的全部角色关联（SELECT ... FOR UPDATE）。
+//
+// 身份判定只能用它，不能用 FindByUserID：普通读在 REPEATABLE READ 下拿的是事务
+// 快照，别的事务刚提交的「授予超管」看不见，于是判定依据是一份过期身份。
+func (r *AdminUserRoleRepository) LockByUserID(ctx context.Context, userID uint64) ([]model.AdminUserRole, error) {
+	return r.findLocking(ctx, lockForUpdate, "user_id = ?", userID)
+}
+
+// DeleteByUserID 按 user_id 条件删除该用户的全部角色关联。
+//
+// 不走「先查出关联行、再按主键逐行删」：那种写法只删得掉自己那份快照里的行，
+// 快照之外新增的关联行会留下来，整体替换完会多出一个本次没打算赋的角色。
+func (r *AdminUserRoleRepository) DeleteByUserID(ctx context.Context, userID uint64) error {
+	return r.db.WithContext(ctx).Where("user_id = ?", userID).Delete(&model.AdminUserRole{}).Error
 }
 
 // FindByRoleID 根据角色 ID 查找用户角色关联
@@ -27,16 +48,35 @@ func (r *AdminUserRoleRepository) FindByRoleID(ctx context.Context, roleID uint6
 	return r.findBy(ctx, "role_id = ?", roleID)
 }
 
-// FindUserPermissions 联表查询用户所有权限（去重、仅启用）
-// admin_user_roles -> admin_role_permissions -> admin_permissions
+// FindUserPermissions 联表查询用户的**有效权限**（去重）。
+//
+// admin_user_roles ur -> admin_roles r -> admin_role_permissions rp -> admin_permissions p
+//
+// 这是非超管用户「实际拥有哪些接口 / 菜单 / 按钮」的唯一事实来源：接口权限校验
+// （helper/permission.Checker）与菜单、按钮下发（service.GetUserMenusAndButtons）
+// 都从它出发，所以过滤条件只能在这里写一次，不能散到各个调用方去。
+//
+// 两个 status = 1 是两件不同的事，都必须有：
+//   - r.status = 1：**被禁用的角色不贡献任何权限**。关联行仍然留在 admin_user_roles
+//     里（启用后权限自然恢复，编辑页也要靠它回显，见 service.GetUserRolesAndPermissions），
+//     但禁用期间它名下的权限一律不算。少了这个条件，「禁用角色」就只是在角色列表里
+//     灰了一下，持有它的人该能点的照样能点、该能调的接口照样能调。
+//   - p.status = 1：权限行自身被禁用时不生效（原有语义，不变）。
+//
+// 多角色取并集由 DISTINCT 完成，并集的口径也因此是对的：禁用角色**独占**的权限
+// 会随它一起消失，而同一条权限只要还有另一个启用角色挂着，它照常留在结果里。
+//
+// 注意这里不加锁：权限校验是高频只读路径，持锁会让读互相阻塞。授权判定要用的
+// 「当前读」身份事实走的是另一条路（LockByUserID + FOR SHARE 角色行）。
 func (r *AdminUserRoleRepository) FindUserPermissions(ctx context.Context, userID uint64) ([]model.AdminPermissions, error) {
 	var perms []model.AdminPermissions
 	err := r.db.WithContext(ctx).
 		Table("admin_user_roles ur").
 		Select("DISTINCT p.*").
+		Joins("JOIN admin_roles r ON r.role_id = ur.role_id").
 		Joins("JOIN admin_role_permissions rp ON rp.role_id = ur.role_id").
 		Joins("JOIN admin_permissions p ON p.permission_id = rp.permission_id").
-		Where("ur.user_id = ? AND p.status = 1", userID).
+		Where("ur.user_id = ? AND r.status = 1 AND p.status = 1", userID).
 		Find(&perms).Error
 	return perms, err
 }

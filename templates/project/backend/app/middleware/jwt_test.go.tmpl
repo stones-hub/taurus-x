@@ -1,0 +1,184 @@
+package middleware
+
+import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"{{ .Module }}/app/helper/store"
+)
+
+// TestGetJWTToken_Priority 提取顺序必须是 Cookie -> jwt_token 头 -> Bearer，
+// 且三者同时存在且值不同时结果唯一确定。
+//
+// 这条顺序是全局唯一的真源：登出要吊销的必须是「请求真正通过认证的那个 Token」，
+// 所以 controller 不能自己再写一套反向优先级的提取逻辑（旧实现 Authorization
+// 优先，导致同时带 Cookie 和 Bearer 时，认证用 Cookie、登出却吊销 Bearer）。
+func TestGetJWTToken_Priority(t *testing.T) {
+	cases := []struct {
+		name   string
+		cookie string
+		header string
+		bearer string
+		want   string
+	}{
+		{"只有 Cookie", "cookie-token", "", "", "cookie-token"},
+		{"只有 jwt_token 头", "", "header-token", "", "header-token"},
+		{"只有 Bearer", "", "", "bearer-token", "bearer-token"},
+		{"Cookie 与 Bearer 不同时以 Cookie 为准", "cookie-token", "", "bearer-token", "cookie-token"},
+		{"Cookie 与头都有时以 Cookie 为准", "cookie-token", "header-token", "bearer-token", "cookie-token"},
+		{"无 Cookie 时头优先于 Bearer", "", "header-token", "bearer-token", "header-token"},
+		{"什么都没有", "", "", "", ""},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/admin/logout", nil)
+			if tc.cookie != "" {
+				req.AddCookie(&http.Cookie{Name: JWTTokenKey, Value: tc.cookie})
+			}
+			if tc.header != "" {
+				req.Header.Set(JWTTokenKey, tc.header)
+			}
+			if tc.bearer != "" {
+				req.Header.Set("Authorization", "Bearer "+tc.bearer)
+			}
+			if got := GetJWTToken(req); got != tc.want {
+				t.Fatalf("GetJWTToken = %q，期望 %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestGetJWTToken_IgnoresQueryAndMalformedAuthorization query 里的 token 不认
+// （会进访问日志、Referer 和浏览器历史），不带 Bearer 前缀的 Authorization 也不认。
+func TestGetJWTToken_IgnoresQueryAndMalformedAuthorization(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/admin/user/list?jwt_token=from-query", nil)
+	if got := GetJWTToken(req); got != "" {
+		t.Fatalf("query 里的 token 不应被接受，实际 %q", got)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/admin/user/list", nil)
+	req.Header.Set("Authorization", "raw-token-without-scheme")
+	if got := GetJWTToken(req); got != "" {
+		t.Fatalf("没有 Bearer 前缀的 Authorization 不应被接受，实际 %q", got)
+	}
+}
+
+// fakeSign 返回固定的新 Token / jti，避免测试依赖签名库与配置容器。
+func fakeSign(token, jti string) func() (string, string, time.Duration, error) {
+	return func() (string, string, time.Duration, error) {
+		return token, jti, time.Hour, nil
+	}
+}
+
+// TestRotateSession_CarriesOldVersionForward 刷新必须沿用旧会话校验时拿到的认证版本，
+// 不能重新读当前版本。
+func TestRotateSession_CarriesOldVersionForward(t *testing.T) {
+	fake := newFakeSessionStore()
+	fake.login(t, 7, "jti-old")
+	oldVersion := fake.currentVersion(7)
+
+	newToken, err := rotateSession(fake, 7, "jti-old", fakeSign("new-token", "jti-new"))
+	if err != nil {
+		t.Fatalf("刷新应成功，实际: %v", err)
+	}
+	if newToken != "new-token" {
+		t.Fatalf("应返回新签发的 Token，实际 %q", newToken)
+	}
+
+	last := fake.registers[len(fake.registers)-1]
+	if last.jti != "jti-new" || last.version != oldVersion {
+		t.Fatalf("新会话应以旧版本 %d 登记，实际 jti=%s version=%d", oldVersion, last.jti, last.version)
+	}
+	if len(fake.revokes) != 1 || fake.revokes[0] != "jti-old" {
+		t.Fatalf("旧会话应被吊销，实际 %v", fake.revokes)
+	}
+	if _, err := fake.ValidateSession(7, "jti-new"); err != nil {
+		t.Fatalf("刷新出来的新会话应可用，实际: %v", err)
+	}
+}
+
+// TestRotateSession_RefreshDoesNotOutliveConcurrentPasswordChange 复现刷新竞态：
+// 旧 Token 校验通过后、新 Token 登记前发生改密（认证版本自增），
+// 刷新出来的新 Token 必须同样失效 —— 否则刷新成了绕过吊销的后门。
+func TestRotateSession_RefreshDoesNotOutliveConcurrentPasswordChange(t *testing.T) {
+	fake := newFakeSessionStore()
+	fake.login(t, 7, "jti-old")
+
+	// sign 阶段模拟「改密事务在刷新中途提交」
+	sign := func() (string, string, time.Duration, error) {
+		fake.bumpVersion(7)
+		return "new-token", "jti-new", time.Hour, nil
+	}
+
+	if _, err := rotateSession(fake, 7, "jti-old", sign); err != nil {
+		t.Fatalf("刷新本身不该失败（失效由校验兜住）: %v", err)
+	}
+	if _, err := fake.ValidateSession(7, "jti-new"); !errors.Is(err, store.ErrSessionRevoked) {
+		t.Fatalf("跨过改密的刷新结果必须失效，实际: %v", err)
+	}
+}
+
+// TestRotateSession_RejectsRevokedOrUnavailable 旧会话已失效 / 存储不可用时
+// 不得签发新 Token，也不得吊销任何东西。
+func TestRotateSession_RejectsRevokedOrUnavailable(t *testing.T) {
+	t.Run("旧会话已吊销", func(t *testing.T) {
+		fake := newFakeSessionStore()
+		signed := false
+		sign := func() (string, string, time.Duration, error) {
+			signed = true
+			return "new-token", "jti-new", time.Hour, nil
+		}
+		if _, err := rotateSession(fake, 7, "jti-gone", sign); !errors.Is(err, store.ErrSessionRevoked) {
+			t.Fatalf("已吊销会话不能刷新，实际: %v", err)
+		}
+		if signed {
+			t.Fatal("校验未通过时不应签发新 Token")
+		}
+	})
+
+	t.Run("存储不可用", func(t *testing.T) {
+		fake := newFakeSessionStore()
+		fake.login(t, 7, "jti-old")
+		fake.unavailable = true
+		if _, err := rotateSession(fake, 7, "jti-old", fakeSign("new-token", "jti-new")); !errors.Is(err, store.ErrSessionStoreUnavailable) {
+			t.Fatalf("存储不可用时刷新应 fail closed，实际: %v", err)
+		}
+	})
+
+	t.Run("改密后旧 Token 不能刷新", func(t *testing.T) {
+		fake := newFakeSessionStore()
+		fake.login(t, 7, "jti-old")
+		fake.bumpVersion(7) // 改密已提交
+		if _, err := rotateSession(fake, 7, "jti-old", fakeSign("new-token", "jti-new")); !errors.Is(err, store.ErrSessionRevoked) {
+			t.Fatalf("改密后旧 Token 不该还能刷新，实际: %v", err)
+		}
+	})
+}
+
+// TestRotateSession_RegisterFailureKeepsOldSession 新会话登记失败时旧会话保持可用：
+// 刷新失败不该把人踢下线，更不该留下「旧的已吊销、新的没发出来」的状态。
+func TestRotateSession_RegisterFailureKeepsOldSession(t *testing.T) {
+	fake := newFakeSessionStore()
+	fake.login(t, 7, "jti-old")
+
+	// 登记阶段不可用：sign 之后把存储切成故障
+	sign := func() (string, string, time.Duration, error) {
+		fake.unavailable = true
+		return "new-token", "jti-new", time.Hour, nil
+	}
+	if _, err := rotateSession(fake, 7, "jti-old", sign); err == nil {
+		t.Fatal("登记失败时刷新必须报错")
+	}
+
+	fake.unavailable = false
+	if len(fake.revokes) != 0 {
+		t.Fatalf("登记失败时不应吊销旧会话，实际 %v", fake.revokes)
+	}
+	if _, err := fake.ValidateSession(7, "jti-old"); err != nil {
+		t.Fatalf("登记失败后旧会话应仍可用，实际: %v", err)
+	}
+}

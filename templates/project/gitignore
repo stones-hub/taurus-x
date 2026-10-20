@@ -20,6 +20,3 @@ backend/build/
 
 # 日志
 logs/
-
-# 上传文件运行时产物（用户上传的文件不进仓库；公章等静态资源在 backend/assets/）
-backend/downloads/

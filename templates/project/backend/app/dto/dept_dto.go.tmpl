@@ -106,6 +106,25 @@ type DeptUserResponse struct {
 	AddTime   string `json:"add_time"`
 }
 
+// UserOptionItem 用户选项（下拉选人用）。
+//
+// 只有「选人」必需的三个字段。手机号、邮箱、最后登录 IP 一律不进选项接口：
+// /admin/option/* 只做登录校验、不做接口权限校验，任何登录用户都能调，
+// 返回全量通讯录等于把它敞开给所有人。
+type UserOptionItem struct {
+	UserID   uint64 `json:"user_id"`
+	Username string `json:"username"`
+	Realname string `json:"realname"`
+}
+
+// UserOptionListResponse 用户选项列表响应
+type UserOptionListResponse struct {
+	PageNo      int               `json:"page_no"`
+	PageSize    int               `json:"page_size"`
+	ResultTotal int64             `json:"result_total"`
+	List        []*UserOptionItem `json:"list"`
+}
+
 // DeptUserListRequest 部门员工列表查询请求
 type DeptUserListRequest struct {
 	DeptID uint64 `json:"dept_id"`

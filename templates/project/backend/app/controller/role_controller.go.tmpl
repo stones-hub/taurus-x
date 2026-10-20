@@ -151,12 +151,17 @@ func (c *RoleController) GetUserRolesAndPermissions(w http.ResponseWriter, r *ht
 
 // UpdateUserRoles 更新用户角色
 func (c *RoleController) UpdateUserRoles(w http.ResponseWriter, r *http.Request) {
+	operatorID, ok := middleware.CurrentUserIDFromJWT(r)
+	if !ok {
+		Fail(w, http.StatusUnauthorized, "未授权访问")
+		return
+	}
 	var req dto.AssignUserRolesRequest
 	if !BindJSON(w, r, &req) {
 		return
 	}
-	if err := c.RoleService.UpdateUserRoles(r.Context(), req.UserID, req.RoleIDs); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+	if err := c.RoleService.UpdateUserRoles(r.Context(), operatorID, req.UserID, req.RoleIDs); err != nil {
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})

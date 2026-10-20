@@ -1,0 +1,181 @@
+package middleware
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/stones-hub/taurus-pro-common/pkg/util/tlimit"
+)
+
+// seedTrustedProxies 预热 ClientIP 的可信代理缓存。
+// ClientIP 首次调用会去读 taurus.Container 的配置，而单测里没有初始化容器；
+// 这里先把缓存填成「空名单」（等价于默认的直连部署）。sync.Once 保证幂等。
+func seedTrustedProxies() {
+	trustedProxiesOnce.Do(func() { trustedProxiesList = nil })
+}
+
+// TestServeRateLimited_BlocksOverBudget 超出单 IP 配额后必须返回 429 且**不进入** handler。
+// 限流挂了但请求照样打到业务上，等于没限流。
+func TestServeRateLimited_BlocksOverBudget(t *testing.T) {
+	seedTrustedProxies()
+
+	const capacity = 3
+	// fillInterval 给足够长，保证测试过程中不会回令牌
+	limiter := tlimit.NewCompositeRateLimiter(capacity, 1000, time.Hour)
+
+	calls := 0
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+	})
+
+	newReq := func(ip string) *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+		req.RemoteAddr = ip + ":40000"
+		return req
+	}
+
+	for i := 0; i < capacity; i++ {
+		rec := httptest.NewRecorder()
+		serveRateLimited(rec, newReq("203.0.113.10"), limiter, next)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("第 %d 次请求应放行，实际状态码 %d", i+1, rec.Code)
+		}
+	}
+	if calls != capacity {
+		t.Fatalf("前 %d 次请求都应进入 handler，实际 %d 次", capacity, calls)
+	}
+
+	rec := httptest.NewRecorder()
+	serveRateLimited(rec, newReq("203.0.113.10"), limiter, next)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("超额请求应返回 429，实际 %d", rec.Code)
+	}
+	if calls != capacity {
+		t.Errorf("超额请求不应进入 handler，handler 共被调用 %d 次", calls)
+	}
+}
+
+// TestServeRateLimited_ForgedHeaderCannotResetBudget 客户端自带的转发头不能换到新配额。
+// 否则随便改个 X-Real-IP 就能把登录限流绕过去，限流形同虚设。
+func TestServeRateLimited_ForgedHeaderCannotResetBudget(t *testing.T) {
+	seedTrustedProxies()
+
+	const capacity = 2
+	limiter := tlimit.NewCompositeRateLimiter(capacity, 1000, time.Hour)
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+
+	// 同一个真实对端，先把配额用光
+	for i := 0; i < capacity; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+		req.RemoteAddr = "203.0.113.10:40000"
+		rec := httptest.NewRecorder()
+		serveRateLimited(rec, req, limiter, next)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("第 %d 次请求应放行，实际 %d", i+1, rec.Code)
+		}
+	}
+
+	// 换着伪造转发头，配额不应被重置
+	for i, forged := range []string{"1.2.3.4", "5.6.7.8", "9.10.11.12"} {
+		req := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+		req.RemoteAddr = "203.0.113.10:40000"
+		req.Header.Set("X-Real-IP", forged)
+		req.Header.Set("X-Forwarded-For", forged)
+		rec := httptest.NewRecorder()
+		serveRateLimited(rec, req, limiter, next)
+		if rec.Code != http.StatusTooManyRequests {
+			t.Errorf("第 %d 个伪造来源（%s）仍应被限流，实际 %d", i+1, forged, rec.Code)
+		}
+	}
+}
+
+// TestServeRateLimited_SeparateIPsHaveOwnBudget 一个 IP 被限流不能连坐其它 IP。
+func TestServeRateLimited_SeparateIPsHaveOwnBudget(t *testing.T) {
+	seedTrustedProxies()
+
+	limiter := tlimit.NewCompositeRateLimiter(1, 1000, time.Hour)
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+
+	serve := func(ip string) int {
+		req := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+		req.RemoteAddr = ip + ":40000"
+		rec := httptest.NewRecorder()
+		serveRateLimited(rec, req, limiter, next)
+		return rec.Code
+	}
+
+	if code := serve("203.0.113.10"); code != http.StatusOK {
+		t.Fatalf("第一个 IP 的首次请求应放行，实际 %d", code)
+	}
+	if code := serve("203.0.113.10"); code != http.StatusTooManyRequests {
+		t.Fatalf("第一个 IP 超额后应被限流，实际 %d", code)
+	}
+	if code := serve("203.0.113.11"); code != http.StatusOK {
+		t.Errorf("另一个 IP 不应被连坐，实际 %d", code)
+	}
+}
+
+// TestSensitiveRateLimitDefaults 登录、验证码发送/校验、前端错误上报
+// 这四个敏感接口必须都有内置默认桶：漏一个就等于那条路由裸奔。
+func TestSensitiveRateLimitDefaults(t *testing.T) {
+	for _, name := range []string{"login", "send_code", "verify_code", "front_error"} {
+		rule, ok := sensitiveRateLimitDefaults[name]
+		if !ok {
+			t.Errorf("敏感接口 %q 缺少内置限流默认值", name)
+			continue
+		}
+		if rule.IPCapacity <= 0 || rule.GlobalCapacity <= 0 || rule.FillSeconds <= 0 {
+			t.Errorf("敏感接口 %q 的默认限流参数无效: %+v", name, rule)
+		}
+	}
+}
+
+// TestResolveSensitiveRule 配置缺失时用内置默认值，配置存在时覆盖默认值。
+func TestResolveSensitiveRule(t *testing.T) {
+	// 配置全部返回 0（未配置）→ 用默认值
+	noConfig := func(string) int { return 0 }
+	got := resolveSensitiveRule("login", noConfig)
+	if got != sensitiveRateLimitDefaults["login"] {
+		t.Errorf("未配置时应取内置默认值，期望 %+v，实际 %+v", sensitiveRateLimitDefaults["login"], got)
+	}
+
+	// 配置存在 → 逐项覆盖
+	withConfig := func(key string) int {
+		switch key {
+		case "http.rate_limit.sensitive.login.ip_capacity":
+			return 5
+		case "http.rate_limit.sensitive.login.global_capacity":
+			return 50
+		case "http.rate_limit.sensitive.login.fill_interval":
+			return 30
+		}
+		return 0
+	}
+	got = resolveSensitiveRule("login", withConfig)
+	want := rateLimitRule{IPCapacity: 5, GlobalCapacity: 50, FillSeconds: 30}
+	if got != want {
+		t.Errorf("配置应覆盖默认值，期望 %+v，实际 %+v", want, got)
+	}
+
+	// 只配一项，其余仍走默认值
+	partial := func(key string) int {
+		if key == "http.rate_limit.sensitive.send_code.ip_capacity" {
+			return 1
+		}
+		return 0
+	}
+	got = resolveSensitiveRule("send_code", partial)
+	def := sensitiveRateLimitDefaults["send_code"]
+	if got.IPCapacity != 1 || got.GlobalCapacity != def.GlobalCapacity || got.FillSeconds != def.FillSeconds {
+		t.Errorf("部分配置时其余项应保留默认值，默认 %+v，实际 %+v", def, got)
+	}
+
+	// 未知名字且无配置 → 全 0，调用方（newSensitiveLimiter）据此返回 nil 并放行，
+	// 这是有意的：未登记的名字不该凭空造出一个限流桶。
+	if got := resolveSensitiveRule("not_registered", noConfig); got != (rateLimitRule{}) {
+		t.Errorf("未登记的名字且无配置时应为零值，实际 %+v", got)
+	}
+}

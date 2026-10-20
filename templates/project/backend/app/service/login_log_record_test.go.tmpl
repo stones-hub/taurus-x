@@ -1,0 +1,80 @@
+package service
+
+import (
+	"strings"
+	"testing"
+	"time"
+)
+
+// 登录日志的 login_status 必须忠实记录：失败 0、成功 1。
+// 这里只盯「落库前的记录长什么样」；真正经过 GORM Create 生成 INSERT 的回归测试
+// 在 app/repo/admin_user_login_log_repo_test.go（历史故障就发生在那一层：
+// model 上的 gorm default 把失败的 0 换成了默认的 1）。
+
+func TestNewLoginLogRecord_StatusKept(t *testing.T) {
+	at := time.Date(2024, 5, 6, 7, 8, 9, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name   string
+		status int8
+		reason string
+	}{
+		{name: "失败保持 0", status: LoginStatusFailure, reason: "密码错误"},
+		{name: "成功保持 1", status: LoginStatusSuccess, reason: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := newLoginLogRecord(7, "password", "10.0.0.1", "curl/8", tc.status, tc.reason, at)
+			if got.LoginStatus != tc.status {
+				t.Fatalf("LoginStatus = %d, 期望 %d", got.LoginStatus, tc.status)
+			}
+			if got.UserID != 7 || got.LoginType != "password" || got.LoginIP != "10.0.0.1" || got.UserAgent != "curl/8" {
+				t.Errorf("基础字段被改写: %+v", got)
+			}
+			if got.FailureReason != tc.reason {
+				t.Errorf("FailureReason = %q, 期望 %q", got.FailureReason, tc.reason)
+			}
+			if !got.LoginTime.Equal(at) {
+				t.Errorf("LoginTime = %v, 期望 %v", got.LoginTime, at)
+			}
+		})
+	}
+}
+
+// 失败日志常由账号不存在触发，此时 userID=0 也必须落库，且状态仍是 0。
+func TestNewLoginLogRecord_UnknownUserFailure(t *testing.T) {
+	got := newLoginLogRecord(0, "password", "", "", LoginStatusFailure, "用户不存在", time.Now())
+	if got.UserID != 0 {
+		t.Errorf("UserID = %d, 期望 0", got.UserID)
+	}
+	if got.LoginStatus != LoginStatusFailure {
+		t.Errorf("LoginStatus = %d, 期望 %d（失败）", got.LoginStatus, LoginStatusFailure)
+	}
+}
+
+// 超长字段必须先截断再落库：MySQL 严格模式下写超长值直接报错，
+// 那样「登录失败没留痕」会成为新的盲区。
+func TestNewLoginLogRecord_ClampsOverlongFields(t *testing.T) {
+	got := newLoginLogRecord(
+		1, "password",
+		strings.Repeat("a", maxLoginIPLen+10),
+		strings.Repeat("b", maxLoginUserAgentLen+10),
+		LoginStatusFailure,
+		strings.Repeat("密", maxFailureReasonLen),
+		time.Now(),
+	)
+	if len(got.LoginIP) > maxLoginIPLen {
+		t.Errorf("LoginIP 长度 %d 超过上限 %d", len(got.LoginIP), maxLoginIPLen)
+	}
+	if len(got.UserAgent) > maxLoginUserAgentLen {
+		t.Errorf("UserAgent 长度 %d 超过上限 %d", len(got.UserAgent), maxLoginUserAgentLen)
+	}
+	if len(got.FailureReason) > maxFailureReasonLen {
+		t.Errorf("FailureReason 长度 %d 超过上限 %d", len(got.FailureReason), maxFailureReasonLen)
+	}
+	if got.FailureReason == "" {
+		t.Error("FailureReason 被截成了空串：失败原因不能整条丢掉")
+	}
+	if got.LoginStatus != LoginStatusFailure {
+		t.Errorf("截断逻辑污染了状态: LoginStatus = %d", got.LoginStatus)
+	}
+}

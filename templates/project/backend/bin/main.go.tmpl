@@ -8,6 +8,7 @@ import (
 
 	"{{ .Module }}/app"
 	"{{ .Module }}/app/helper/permission"
+	authstore "{{ .Module }}/app/helper/store"
 	tmid "{{ .Module }}/app/middleware"
 	"{{ .Module }}/app/routes"
 )
@@ -15,6 +16,7 @@ import (
 func main() {
 	setGlobalTimezone()
 	initPermissionDependency()
+	initAuthVersionDependency()
 	routes.RegisterRoutes()
 	app.Run()
 }
@@ -38,4 +40,20 @@ func initPermissionDependency() {
 	}
 	tmid.SetPermissionChecker(permission.NewChecker(app.Core.AdminRoleService))
 	log.Println("✅ 权限检查器注入成功")
+}
+
+// initAuthVersionDependency 注入认证版本权威来源（admin_users.auth_version）。
+//
+// 会话校验要拿「用户当前认证版本」和 Token 登记时的版本比对，权威值在数据库里。
+// 接口声明在 app/helper/store、实现在 app/repo，靠这里注入打破依赖方向冲突
+// （repo 依赖 app/helper，而认证中间件不能依赖 repo）。
+//
+// 没注入时会话校验一律 fail closed（而不是退化成「不校验版本」），所以这里
+// 注入失败必须直接退出：起来的服务会把每个请求都拒掉，不如启动就说清原因。
+func initAuthVersionDependency() {
+	if app.Core == nil || app.Core.Store == nil {
+		log.Fatal("❌ Core 或 Store 未初始化，认证版本来源注入失败")
+	}
+	authstore.SetAuthVersionResolver(app.Core.Store.User())
+	log.Println("✅ 认证版本来源注入成功")
 }

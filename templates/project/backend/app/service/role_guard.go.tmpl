@@ -1,0 +1,133 @@
+// 角色相关的授权判定：把「谁能动哪些角色」的规则集中在这里。
+//
+// 这些函数都是纯函数（只看传入的事实，不碰数据库），方便单测覆盖越权场景。
+// 业务方法负责把事实查出来，判定交给这里。
+package service
+
+import (
+	"errors"
+
+	"{{ .Module }}/app/constants"
+	"{{ .Module }}/app/model"
+)
+
+// ErrForbidden 越权操作。controller 用 errors.Is 识别并返回 403。
+var ErrForbidden = errors.New("权限不足，拒绝该操作")
+
+// reservedRoleCodes 保留角色编码：不允许通过接口新建或占用。
+// super_admin 是初始化 SQL 写死的最高权限角色，谁都不能再造一个同名的。
+var reservedRoleCodes = map[string]bool{
+	constants.SuperAdminRoleCode: true,
+}
+
+// RoleFact 角色判定要素。
+// 只取决策需要的字段，这样判定逻辑不依赖 model 也不依赖数据库。
+//
+// Status 必须跟着一起取：判定「这个账号是不是超管」时**不能**过滤状态
+// （禁用的 super_admin 同样是超管证据，见 user_guard.go），但判定「这次能不能
+// 把这个角色赋上去」时又必须看状态（不许新增已禁用角色）。两个口径都要用到它，
+// 所以统一在事实里带出来，而不是在某个查询里用 `status = 1` 悄悄过滤掉。
+type RoleFact struct {
+	RoleID   uint64
+	RoleCode string
+	IsSystem int8
+	Status   int8
+}
+
+// RoleFactOf 从 model 取判定要素。
+func RoleFactOf(role *model.AdminRole) RoleFact {
+	if role == nil {
+		return RoleFact{}
+	}
+	return RoleFact{RoleID: role.RoleID, RoleCode: role.RoleCode, IsSystem: role.IsSystem, Status: role.Status}
+}
+
+// IsProtectedRole 判断角色是否受保护（系统角色或保留编码）。
+func IsProtectedRole(f RoleFact) bool {
+	return f.IsSystem == 1 || reservedRoleCodes[f.RoleCode]
+}
+
+// CheckNewRoleCode 校验新建角色使用的编码。
+// 拒绝保留编码：否则任何能建角色的人都可以造一个 role_code=super_admin 的角色，
+// 而权限判定是按 role_code 认超管的。
+func CheckNewRoleCode(roleCode string) error {
+	if reservedRoleCodes[roleCode] {
+		return errors.New("角色编码为系统保留值，不可使用")
+	}
+	return nil
+}
+
+// CheckRoleMutable 判断角色是否允许被改动（改名/改权限/改状态/删除）。
+// 系统角色一律拒绝：禁用 super_admin 等于把系统锁死。
+func CheckRoleMutable(role *model.AdminRole, action string) error {
+	if role == nil {
+		return errors.New("角色不存在")
+	}
+	if IsProtectedRole(RoleFactOf(role)) {
+		return errors.New("系统角色不能" + action)
+	}
+	return nil
+}
+
+// CheckRoleAssignmentAllowed 判断「把 next 这组角色赋给某个用户」是否允许。
+//
+// current 是目标用户当前的角色集合，next 是目标集合。
+// 超级管理员不受限；其他人只能增删普通角色：
+// 一旦这次变更涉及受保护角色（增或删），直接拒绝。
+//
+// 为什么连「删」也要拦：否则有分配权限的人可以把超管的 super_admin 角色摘掉，
+// 等效于破坏系统角色。
+func CheckRoleAssignmentAllowed(operatorIsSuperAdmin bool, current, next []RoleFact) error {
+	if operatorIsSuperAdmin {
+		return nil
+	}
+
+	currentIDs := make(map[uint64]bool, len(current))
+	for _, f := range current {
+		currentIDs[f.RoleID] = true
+	}
+	nextIDs := make(map[uint64]bool, len(next))
+	for _, f := range next {
+		nextIDs[f.RoleID] = true
+	}
+
+	// 新增的受保护角色
+	for _, f := range next {
+		if !currentIDs[f.RoleID] && IsProtectedRole(f) {
+			return ErrForbidden
+		}
+	}
+	// 被移除的受保护角色
+	for _, f := range current {
+		if !nextIDs[f.RoleID] && IsProtectedRole(f) {
+			return ErrForbidden
+		}
+	}
+	return nil
+}
+
+// CheckRoleStatusAssignable 判断这次角色替换有没有「新增一个已禁用的角色」。
+//
+// current 是目标用户当前真实持有的角色（来自库里的关联表 + 角色行，不看前端），
+// next 是本次要替换成的目标集合。规则：
+//   - 已经持有的禁用角色**可以保留**：用户管理的编辑页会把现有关联一并带上来提交，
+//     如果这里拒绝，运维一旦禁用某个角色，持有它的账号就连改个昵称都存不下去；
+//     更早的实现是用「只查启用角色」的方式间接拒绝，结果是保存时报「角色ID不存在」。
+//   - 本次**新增**的禁用角色一律拒绝：禁用就是「这个角色暂时不可用」，
+//     不能借编辑页把它悄悄挂到新账号上。
+//   - 取消勾选（从 next 里去掉）始终允许，禁用角色也能被明确移除。
+//
+// 这条规则对超管同样生效：它不是权限大小问题，而是「禁用中的角色不该被新赋出去」
+// 这个数据正确性约束。超管要赋它，先把角色启用。
+func CheckRoleStatusAssignable(current, next []RoleFact) error {
+	currentIDs := make(map[uint64]bool, len(current))
+	for _, f := range current {
+		currentIDs[f.RoleID] = true
+	}
+	for _, f := range next {
+		if f.Status != constants.RoleStatusEnabled && !currentIDs[f.RoleID] {
+			return errors.New("角色已禁用，不能新增该角色")
+		}
+	}
+	return nil
+}

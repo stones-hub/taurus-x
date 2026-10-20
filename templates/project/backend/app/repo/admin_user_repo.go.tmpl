@@ -2,6 +2,7 @@ package repo
 
 import (
 	"context"
+	"errors"
 
 	"gorm.io/gorm"
 
@@ -20,6 +21,17 @@ func NewAdminUserRepositoryWithDB(db *gorm.DB) *AdminUserRepository {
 // FindByUserID 根据用户 ID 查找用户
 func (r *AdminUserRepository) FindByUserID(ctx context.Context, userID uint64) (*model.AdminUser, error) {
 	return r.firstBy(ctx, "user_id = ?", userID)
+}
+
+// LockByUserID 锁定并当前读用户行（SELECT ... FOR UPDATE）。
+//
+// 这是「身份锁协议」的锚点（见 app/service/user_guard.go）：admin_users 的主键行是
+// 一个账号唯一稳定存在的那一行。角色关联行可能一行都没有（新建账号、首次赋角色），
+// 把锁锚在关联行上时「目标没有关联行」就等于没锁，并发授予角色照样能插进来。
+//
+// 未找到返回 (nil, nil)：调用方必须按「拒绝」处理，不能当成「普通账号」放过去。
+func (r *AdminUserRepository) LockByUserID(ctx context.Context, userID uint64) (*model.AdminUser, error) {
+	return r.firstLocking(ctx, lockForUpdate, "user_id = ?", userID)
 }
 
 // User 返回用户仓储
@@ -51,4 +63,47 @@ func (r *AdminUserRepository) ListByKeyword(ctx context.Context, page, pageSize 
 		q = q.Where("status = ?", status)
 	}
 	return r.page(q, page, pageSize, "user_id DESC")
+}
+
+// CurrentAuthVersion 读取用户当前认证版本（会话校验的权威来源）。
+//
+// 实现 app/helper/store.AuthVersionResolver：用户不存在返回 (0, nil)，
+// 由调用方按已吊销处理（版本从 1 起算，0 永远不是合法版本）。
+func (r *AdminUserRepository) CurrentAuthVersion(ctx context.Context, userID uint64) (int64, error) {
+	if r.db == nil {
+		return 0, errors.New("database is not initialized")
+	}
+	var versions []int64
+	if err := r.db.WithContext(ctx).Model(&model.AdminUser{}).
+		Where("user_id = ?", userID).
+		Limit(1).
+		Pluck("auth_version", &versions).Error; err != nil {
+		return 0, err
+	}
+	if len(versions) == 0 {
+		return 0, nil
+	}
+	return versions[0], nil
+}
+
+// BumpAuthVersion 自增认证版本，使该用户此前签发的所有 Token 立即失效。
+//
+// 必须和触发吊销的那次业务变更（改密、重置密码、禁用、删除）放在**同一个事务**里：
+// 分两步做就会留出「密码已改、吊销没写成功」的窗口，旧 Token 在那段时间照常可用。
+// 用 SQL 表达式自增而非「读出来 +1 再写回」，避免并发变更互相覆盖。
+func (r *AdminUserRepository) BumpAuthVersion(ctx context.Context, userID uint64) error {
+	if r.db == nil {
+		return errors.New("database is not initialized")
+	}
+	res := r.db.WithContext(ctx).Model(&model.AdminUser{}).
+		Where("user_id = ?", userID).
+		UpdateColumn("auth_version", gorm.Expr("auth_version + 1"))
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		// 没命中行说明用户不存在：让外层事务回滚，不要留下「改了凭证没吊销」的状态
+		return errors.New("吊销会话失败: 用户不存在")
+	}
+	return nil
 }

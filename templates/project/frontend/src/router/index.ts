@@ -36,12 +36,6 @@ const routes: RouteRecordRaw[] = [
         name: 'profile',
         component: () => import('../views/profile/index.vue'),
       },
-      // 设置/重置密码
-      {
-        path: 'page/profile/set-password.html',
-        name: 'set-password',
-        component: () => import('../views/profile/set-password.vue'),
-      },
       // 权限管理
       {
         path: 'page/account/permission.html',

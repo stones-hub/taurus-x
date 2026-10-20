@@ -1,0 +1,357 @@
+package service
+
+import (
+	"errors"
+	"testing"
+
+	"{{ .Module }}/app/constants"
+	"{{ .Module }}/app/model"
+)
+
+// 系统角色保护是「非超级管理员不得获得或破坏超管身份」这条要求的判定点。
+// 这些用例都是行为级断言（给定事实 → 允许/拒绝），不依赖数据库，也不靠搜字符串。
+
+func TestIsProtectedRole(t *testing.T) {
+	cases := []struct {
+		name string
+		fact RoleFact
+		want bool
+	}{
+		{
+			name: "系统角色标记",
+			fact: RoleFact{RoleID: 1, RoleCode: "ops", IsSystem: 1},
+			want: true,
+		},
+		{
+			name: "保留编码（即使 is_system 被改成 0）",
+			fact: RoleFact{RoleID: 2, RoleCode: constants.SuperAdminRoleCode, IsSystem: 0},
+			want: true,
+		},
+		{
+			name: "普通角色",
+			fact: RoleFact{RoleID: 3, RoleCode: "editor", IsSystem: 0},
+			want: false,
+		},
+		{
+			name: "零值（角色不存在）",
+			fact: RoleFact{},
+			want: false,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsProtectedRole(tc.fact); got != tc.want {
+				t.Errorf("期望 %v，实际 %v", tc.want, got)
+			}
+		})
+	}
+}
+
+// TestRoleFactOf nil 角色不能 panic，也不能被当成受保护角色。
+func TestRoleFactOf(t *testing.T) {
+	if got := RoleFactOf(nil); got != (RoleFact{}) {
+		t.Errorf("nil 角色应得到零值，实际 %+v", got)
+	}
+
+	role := &model.AdminRole{RoleID: 7, RoleCode: "editor", IsSystem: 1}
+	want := RoleFact{RoleID: 7, RoleCode: "editor", IsSystem: 1}
+	if got := RoleFactOf(role); got != want {
+		t.Errorf("期望 %+v，实际 %+v", want, got)
+	}
+}
+
+// TestCheckNewRoleCode 新建角色不能占用 super_admin：
+// 权限判定是按 role_code 认超管的，放过去等于任何能建角色的人都能提权。
+func TestCheckNewRoleCode(t *testing.T) {
+	if err := CheckNewRoleCode(constants.SuperAdminRoleCode); err == nil {
+		t.Error("新建角色占用 super_admin 编码应被拒绝")
+	}
+	for _, code := range []string{"editor", "ops", "super_admin_x", "SUPER_ADMIN", ""} {
+		if err := CheckNewRoleCode(code); err != nil {
+			t.Errorf("普通角色编码 %q 应允许，实际被拒: %v", code, err)
+		}
+	}
+}
+
+// TestCheckRoleMutable 系统角色不能改名/改权限/禁用/删除。
+func TestCheckRoleMutable(t *testing.T) {
+	cases := []struct {
+		name    string
+		role    *model.AdminRole
+		wantErr bool
+	}{
+		{
+			name:    "nil 角色",
+			role:    nil,
+			wantErr: true,
+		},
+		{
+			name:    "系统角色",
+			role:    &model.AdminRole{RoleID: 1, RoleCode: constants.SuperAdminRoleCode, IsSystem: 1},
+			wantErr: true,
+		},
+		{
+			name:    "is_system=0 但编码是保留值",
+			role:    &model.AdminRole{RoleID: 1, RoleCode: constants.SuperAdminRoleCode, IsSystem: 0},
+			wantErr: true,
+		},
+		{
+			name:    "非超管编码但标记为系统角色",
+			role:    &model.AdminRole{RoleID: 2, RoleCode: "ops", IsSystem: 1},
+			wantErr: true,
+		},
+		{
+			name:    "普通角色",
+			role:    &model.AdminRole{RoleID: 3, RoleCode: "editor", IsSystem: 0},
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			err := CheckRoleMutable(tc.role, "删除")
+			if tc.wantErr && err == nil {
+				t.Error("应被拒绝，实际放行")
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("应放行，实际被拒: %v", err)
+			}
+		})
+	}
+}
+
+// TestCheckRoleAssignmentAllowed_NonSuperAdmin 非超管改角色集合时：
+// 只要这次变更涉及受保护角色（加或减），一律拒绝。
+func TestCheckRoleAssignmentAllowed_NonSuperAdmin(t *testing.T) {
+	var (
+		superAdmin = RoleFact{RoleID: 1, RoleCode: constants.SuperAdminRoleCode, IsSystem: 1}
+		sysOps     = RoleFact{RoleID: 2, RoleCode: "ops", IsSystem: 1}
+		editor     = RoleFact{RoleID: 10, RoleCode: "editor", IsSystem: 0}
+		viewer     = RoleFact{RoleID: 11, RoleCode: "viewer", IsSystem: 0}
+	)
+
+	cases := []struct {
+		name    string
+		current []RoleFact
+		next    []RoleFact
+		wantErr bool
+	}{
+		{
+			name:    "给别人加超管角色",
+			current: []RoleFact{editor},
+			next:    []RoleFact{editor, superAdmin},
+			wantErr: true,
+		},
+		{
+			name:    "给自己加超管角色（空 → 超管）",
+			current: nil,
+			next:    []RoleFact{superAdmin},
+			wantErr: true,
+		},
+		{
+			name:    "摘掉别人的超管角色",
+			current: []RoleFact{superAdmin, editor},
+			next:    []RoleFact{editor},
+			wantErr: true,
+		},
+		{
+			name:    "把目标用户的角色清空（原本含超管）",
+			current: []RoleFact{superAdmin},
+			next:    nil,
+			wantErr: true,
+		},
+		{
+			name:    "加其它系统角色",
+			current: []RoleFact{editor},
+			next:    []RoleFact{editor, sysOps},
+			wantErr: true,
+		},
+		{
+			name:    "摘掉其它系统角色",
+			current: []RoleFact{sysOps, editor},
+			next:    []RoleFact{editor},
+			wantErr: true,
+		},
+		{
+			name:    "只动普通角色：加",
+			current: []RoleFact{editor},
+			next:    []RoleFact{editor, viewer},
+			wantErr: false,
+		},
+		{
+			name:    "只动普通角色：减",
+			current: []RoleFact{editor, viewer},
+			next:    []RoleFact{viewer},
+			wantErr: false,
+		},
+		{
+			name:    "只动普通角色：换一批",
+			current: []RoleFact{editor},
+			next:    []RoleFact{viewer},
+			wantErr: false,
+		},
+		{
+			name:    "没有变化",
+			current: []RoleFact{editor},
+			next:    []RoleFact{editor},
+			wantErr: false,
+		},
+		{
+			name:    "目标用户本来就有超管角色，本次不动它（仍保留）",
+			current: []RoleFact{superAdmin, editor},
+			next:    []RoleFact{superAdmin, viewer},
+			wantErr: false,
+		},
+		{
+			name:    "伪造 is_system=0 的 super_admin 也要拦住",
+			current: []RoleFact{editor},
+			next:    []RoleFact{editor, {RoleID: 99, RoleCode: constants.SuperAdminRoleCode, IsSystem: 0}},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			err := CheckRoleAssignmentAllowed(false, tc.current, tc.next)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("应被拒绝，实际放行")
+				}
+				// controller 靠 errors.Is(err, ErrForbidden) 返回 403，
+				// 换成普通 error 会被当成 500。
+				if !errors.Is(err, ErrForbidden) {
+					t.Errorf("越权应返回 ErrForbidden，实际 %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("应放行，实际被拒: %v", err)
+			}
+		})
+	}
+}
+
+// TestCheckRoleAssignmentAllowed_SuperAdmin 超管自己不受限（底座的既有语义）。
+func TestCheckRoleAssignmentAllowed_SuperAdmin(t *testing.T) {
+	superAdmin := RoleFact{RoleID: 1, RoleCode: constants.SuperAdminRoleCode, IsSystem: 1}
+	editor := RoleFact{RoleID: 10, RoleCode: "editor", IsSystem: 0}
+
+	if err := CheckRoleAssignmentAllowed(true, []RoleFact{editor}, []RoleFact{editor, superAdmin}); err != nil {
+		t.Errorf("超管加超管角色应允许，实际 %v", err)
+	}
+	if err := CheckRoleAssignmentAllowed(true, []RoleFact{superAdmin}, nil); err != nil {
+		t.Errorf("超管摘超管角色应允许，实际 %v", err)
+	}
+}
+
+// TestCheckRoleStatusAssignable 禁用角色的赋予规则：已持有可保留、可取消，新增一律拒绝。
+//
+// 三件事必须同时成立，少一件都会变成一个真实的故障：
+//   - 保留不放行 → 运维一禁用某个角色，持有它的账号连改昵称都存不下去
+//     （编辑页会把现有关联一并提交回来）；
+//   - 取消不放行 → 禁用角色一旦挂上就摘不掉；
+//   - 新增放行 → 「禁用」失去意义，可以借编辑页把它悄悄挂到别的账号上。
+//
+// 注意这个函数**没有操作人参数**，也就是说超管没有豁免口。这是刻意的：
+// 它约束的不是权力大小，而是「禁用中的角色不该被新赋出去」这个数据正确性。
+// 哪天给它加上 operatorIsSuperAdmin 开关，就得先回答「超管为什么需要绕过它」——
+// 真要赋这个角色，先把角色启用即可。
+func TestCheckRoleStatusAssignable(t *testing.T) {
+	enabled := RoleFact{RoleID: 10, RoleCode: "editor", Status: constants.RoleStatusEnabled}
+	disabled := RoleFact{RoleID: 11, RoleCode: "legacy_ops", Status: constants.RoleStatusDisabled}
+	otherDisabled := RoleFact{RoleID: 12, RoleCode: "retired", Status: constants.RoleStatusDisabled}
+
+	cases := []struct {
+		name    string
+		current []RoleFact
+		next    []RoleFact
+		wantErr bool
+	}{
+		{
+			name:    "保留已持有的禁用角色",
+			current: []RoleFact{disabled},
+			next:    []RoleFact{disabled},
+			wantErr: false,
+		},
+		{
+			name:    "保留已持有的禁用角色，同时加一个启用角色",
+			current: []RoleFact{disabled},
+			next:    []RoleFact{disabled, enabled},
+			wantErr: false,
+		},
+		{
+			name:    "取消已持有的禁用角色（明确移除）",
+			current: []RoleFact{enabled, disabled},
+			next:    []RoleFact{enabled},
+			wantErr: false,
+		},
+		{
+			name:    "清空全部角色（含禁用角色）",
+			current: []RoleFact{enabled, disabled},
+			next:    nil,
+			wantErr: false,
+		},
+		{
+			name:    "新增一个禁用角色",
+			current: []RoleFact{enabled},
+			next:    []RoleFact{enabled, disabled},
+			wantErr: true,
+		},
+		{
+			name:    "新账号（当前无任何角色）直接新增禁用角色",
+			current: nil,
+			next:    []RoleFact{disabled},
+			wantErr: true,
+		},
+		{
+			name: "换一个禁用角色：摘掉持有的那个、挂上另一个",
+			// 「总数没变」不代表没新增，判定必须按 RoleID 逐个看
+			current: []RoleFact{disabled},
+			next:    []RoleFact{otherDisabled},
+			wantErr: true,
+		},
+		{
+			name:    "只动启用角色",
+			current: []RoleFact{enabled},
+			next:    []RoleFact{enabled},
+			wantErr: false,
+		},
+		{
+			name:    "新增启用角色",
+			current: nil,
+			next:    []RoleFact{enabled},
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			err := CheckRoleStatusAssignable(tc.current, tc.next)
+			if tc.wantErr && err == nil {
+				t.Fatal("应被拒绝，实际放行")
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("应放行，实际被拒: %v", err)
+			}
+		})
+	}
+}
+
+// TestCheckRoleStatusAssignable_NoSuperAdminExemption 超管也不能新增已禁用的角色。
+//
+// 单独一条是为了把这个口径钉死：这个函数签名里没有操作人，调用方
+// （AdminRoleService.UpdateUserRoles / AdminUserService.UpdateUser）也都是
+// 无条件调用，不存在「操作人是超管就跳过」的分支。
+func TestCheckRoleStatusAssignable_NoSuperAdminExemption(t *testing.T) {
+	disabled := RoleFact{RoleID: 11, RoleCode: "legacy_ops", Status: constants.RoleStatusDisabled}
+
+	// 即使目标当前持有超管角色、操作人也是超管，这一组事实里仍然没有操作人这一维度
+	if err := CheckRoleStatusAssignable(nil, []RoleFact{disabled}); err == nil {
+		t.Fatal("新增已禁用的角色必须被拒绝，不分操作人身份")
+	}
+}

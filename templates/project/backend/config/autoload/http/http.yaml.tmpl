@@ -12,6 +12,16 @@ http:
   # 主机 IP 白名单（留空 = 不启用 host 中间件拦截；配 CIDR 或精确 IP）
   host_white_list: []
 
+  # 可信反向代理（逗号分隔的 IP 或 CIDR）。
+  # 只有直连对端命中这里时，后端才采信 X-Forwarded-For / X-Real-IP；
+  # 默认 none = 直连部署，转发头一律不采信，客户端伪造 X-Real-IP 无效。
+  # 放在 Nginx 后面时填代理地址，例如 TRUSTED_PROXIES=127.0.0.1,172.18.0.0/16
+  # （解析时会丢弃不是合法 IP / CIDR 的条目，所以 none 等同于空名单）
+  trusted_proxies: ${TRUSTED_PROXIES:none}
+
+  # 请求体大小上限（字节）。底座没有文件上传接口，默认 1MiB；0 表示不限制。
+  max_body_bytes: ${MAX_BODY_BYTES:1048576}
+
   # 限流配置
   rate_limit:
     composite:
@@ -23,14 +33,33 @@ http:
       enabled: true
       capacity: 10          # 令牌桶容量
       fill_interval: 1      # 填充令牌间隔（秒）
+    # 敏感接口的独立限流桶（每个路由组一套，互不挤占）。
+    # 语义：单 IP 突发上限 ip_capacity 次，之后每 fill_interval 秒回一个令牌。
+    sensitive:
+      login:                  # 登录：抗口令爆破
+        ip_capacity: 10
+        global_capacity: 200
+        fill_interval: 6
+      send_code:              # 验证码发送：按短信成本收紧
+        ip_capacity: 3
+        global_capacity: 60
+        fill_interval: 60
+      verify_code:            # 验证码校验：抗 6 位码枚举
+        ip_capacity: 10
+        global_capacity: 200
+        fill_interval: 30
+      front_error:            # 前端错误上报：无需登录的公共写入口
+        ip_capacity: 30
+        global_capacity: 300
+        fill_interval: 2
 
   # JWT配置
   jwt:
     enabled: true
     # 同上，占位符不加引号。
-    # ⚠️ 下面的 your-secret-key 是弱默认值：.env 里没设 JWT_SECRET 时会用它，
-    #    等于任何人都能自己签发合法 token。部署前必须设 JWT_SECRET（openssl rand -hex 32）。
-    secret: ${JWT_SECRET:your-secret-key}
+    # 没有可用的弱默认值：下面的占位值会被启动自检拒绝（见 app/helper/startup_check.go），
+    # 必须在 .env.local 里设置 JWT_SECRET（至少 32 字符，建议 openssl rand -hex 32）。
+    secret: ${JWT_SECRET:JWT_SECRET_NOT_CONFIGURED}
     issuer: "{{ .ProjectName }}"              # JWT签发者
     expire_hours: 24                          # JWT过期时间（小时）
-    secure: false                             # JWT是否启用HTTPS
+    secure: ${JWT_COOKIE_SECURE:false}        # Cookie 是否仅限 HTTPS（生产启用 HTTPS 后设为 true）

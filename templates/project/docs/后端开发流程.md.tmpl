@@ -221,11 +221,23 @@ taurus.Container.Http.AddRouterGroup(router.RouteGroup{
 **路由挂载区分（重点）**：
 - **下拉选项接口**挂 `/admin/option/*`（`userBaseChain`，无 Permission 校验），供前端 `useOptions` 做数据源；**业务 list/CRUD 接口绝不挂到 `/admin/option` 下**（这会绕过权限校验）。
 - **业务 list/CRUD** 挂各自前缀（`userProtectedChain`，含 Permission 校验）。
-- 两条链定义（`routes.go` 顶部）：
-  - `userBaseChain` = `Recovery → JWT → PasswordChangeValidator → CSRF`（无 Permission）
-  - `userProtectedChain` = `Recovery → JWT → PasswordChangeValidator → Permission → CSRF`
+- 三条链定义（`routes.go` 的 `RegisterRoutes` 顶部，顺序即执行顺序）：
+  - `userBaseChain` = `Recovery → BodyLimit → JWT → SessionValidator → AccessLog → CSRF`
+    （无 Permission、无 OperationLog；用于「读自己」与下拉选项）
+  - `userSelfServiceChain` = `Recovery → BodyLimit → JWT → SessionValidator → AccessLog → OperationLog → CSRF`
+    （无 Permission，但要操作留痕；用于「自己改自己」，如 `change-password`）
+  - `userProtectedChain` = `Recovery → BodyLimit → JWT → SessionValidator → AccessLog → Permission → OperationLog → CSRF`
+    （受接口权限校验；业务 list / CRUD 用这条）
+  - 三条链都带 `BodyLimit` + `AccessLog` + `CSRF`，差别只在 Permission 与 OperationLog；
+    `SessionValidator` 必须紧跟 `JWT`（JWT 只验签名，会话吊销由它比对
+    `admin_users.auth_version` 判定）。新业务模块**直接复用这三条链，不要自己拼新链**。
 - 业务接口 path 必须与 `admin_permissions.path`（`permission_type=3` 的 path）一致，否则 RBAC 精确匹配失败、无权限的人打不开接口。
-- **下拉选项接口也常复用业务 list 的 handler**（如 `/admin/option/notices` 复用 `GetNoticeList`，只是挂了 `userBaseChain`）。
+- **下拉选项接口必须写专用的最小字段 handler，不要复用业务 list 的 handler**。
+  `/admin/option/*` 挂的是 `userBaseChain`（**无 Permission 校验**），任何登录用户都能调；
+  业务 list handler 返回的是完整业务字段（手机号、邮箱、状态、部门、备注……），
+  一旦被复用到 option 下，等于把「只有有权限的人能看的明细」开放给了所有登录用户。
+  正确做法见 `AdminUserService.GetUserOptions` → `dto.UserOptionItem{UserID, Username, Realname}`：
+  独立的 service 方法 + 独立的 DTO，只返回「选人/选项」必需的 id 与展示名。
 
 改完重新生成 Wire 并构建：
 
@@ -235,7 +247,7 @@ make wire        # 重新生成 Wire DI（新增 controller/service 后必跑）
 go build ./...   # 构建
 ```
 
-✅ 验收：后端 build 通过；每个接口 path 与 `admin_permissions.path` 一致；下拉选项确认走 `/admin/option/*`（userBaseChain）。
+✅ 验收：后端 build 通过；每个接口 path 与 `admin_permissions.path` 一致；下拉选项确认走 `/admin/option/*`（userBaseChain），且用的是只返回最小字段的专用 handler。
 
 ---
 

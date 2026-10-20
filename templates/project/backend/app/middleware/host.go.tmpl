@@ -9,11 +9,14 @@ import (
 	"{{ .Module }}/internal/taurus"
 )
 
-// HostMiddleware 主机 IP 白名单校验中间件
+// HostMiddleware 主机 IP 白名单校验中间件。
+//
+// 判定只用 ClientIP：直连对端不在 http.trusted_proxies 里时，
+// 转发头（X-Real-IP / X-Forwarded-For）一律不采信，
+// 否则客户端自己伪造一个白名单 IP 就能绕过这道校验。
 func HostMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ips := tnet.GetAllRemoteIPs(r)
-		if !isAllowedHost(ips) {
+		if !isAllowedHost(ClientIP(r)) {
 			httpx.SendResponse(w, http.StatusForbidden, "访问被拒绝: 未授权主机.", nil)
 			return
 		}
@@ -22,12 +25,9 @@ func HostMiddleware(next http.Handler) http.Handler {
 }
 
 // isAllowedHost 判断来源 IP 是否在允许列表中
-func isAllowedHost(ips []string) bool {
-	allowedHosts := taurus.Container.Config.GetStringSlice("http.host_white_list")
-	for _, ip := range ips {
-		if tnet.IsIPAllowed(ip, allowedHosts) {
-			return true
-		}
+func isAllowedHost(ip string) bool {
+	if ip == "" {
+		return false
 	}
-	return false
+	return tnet.IsIPAllowed(ip, taurus.Container.Config.GetStringSlice("http.host_white_list"))
 }

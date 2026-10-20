@@ -1,0 +1,97 @@
+// 启动自检：把「配置没配对就不该启动」的安全前提集中在这里。
+package helper
+
+import (
+	"fmt"
+	"strings"
+)
+
+// minJWTSecretLength JWT 签名密钥的最小长度。
+// HS256 的安全强度取决于密钥长度，32 字符（openssl rand -hex 32 为 64 字符）是下限。
+const minJWTSecretLength = 32
+
+// weakJWTSecrets 明确拒绝的弱密钥：示例值、占位值和常见口令。
+// 这些值一旦进生产，等于任何人都能自己签发合法 Token。
+var weakJWTSecrets = map[string]bool{
+	"jwt_secret_not_configured": true,
+	"your-secret-key":           true,
+	"your_secret_key":           true,
+	"yoursecretkey":             true,
+	"secret":                    true,
+	"changeme":                  true,
+	"change-me":                 true,
+	"change_me":                 true,
+	"jwt-secret":                true,
+	"jwt_secret":                true,
+	"test":                      true,
+	"password":                  true,
+	"123456":                    true,
+	"example":                   true,
+	"placeholder":               true,
+	"todo":                      true,
+}
+
+// ValidateJWTSigningKey 校验 JWT 签名密钥是否可用于启动。
+//
+// 返回 error 表示拒绝启动。拒绝的情形：
+//   - 没配置（空串，或配置占位符没被环境变量替换掉）
+//   - 长度不足 minJWTSecretLength
+//   - 命中已知弱值 / 示例值
+//   - 只有一种字符（aaaa... 这类）
+func ValidateJWTSigningKey(secret string) error {
+	trimmed := strings.TrimSpace(secret)
+	if trimmed == "" {
+		return fmt.Errorf("JWT 签名密钥未配置：请在 .env.local 设置 JWT_SECRET（openssl rand -hex 32）")
+	}
+	// 占位符没被替换说明环境变量没生效
+	if strings.Contains(trimmed, "${") || strings.Contains(trimmed, "}") {
+		return fmt.Errorf("JWT 签名密钥仍是未替换的配置占位符：请在 .env.local 设置 JWT_SECRET")
+	}
+
+	lower := strings.ToLower(trimmed)
+	if weakJWTSecrets[lower] {
+		return fmt.Errorf("JWT 签名密钥是示例/弱默认值，拒绝启动：请在 .env.local 设置 JWT_SECRET（openssl rand -hex 32）")
+	}
+	if len(trimmed) < minJWTSecretLength {
+		return fmt.Errorf("JWT 签名密钥过短（%d 字符，至少需要 %d 字符）：请在 .env.local 设置 JWT_SECRET（openssl rand -hex 32）",
+			len(trimmed), minJWTSecretLength)
+	}
+	if isSingleCharRepeat(trimmed) {
+		return fmt.Errorf("JWT 签名密钥是单一字符重复，熵过低，拒绝启动：请在 .env.local 设置 JWT_SECRET（openssl rand -hex 32）")
+	}
+	return nil
+}
+
+// isSingleCharRepeat 判断字符串是否由同一个字符重复构成。
+func isSingleCharRepeat(s string) bool {
+	if s == "" {
+		return false
+	}
+	first := s[0]
+	for i := 1; i < len(s); i++ {
+		if s[i] != first {
+			return false
+		}
+	}
+	return true
+}
+
+// JWTSecretConfigKey JWT 签名密钥的配置键。
+const JWTSecretConfigKey = "http.jwt.secret"
+
+// ValidateStartupSecurity 启动前的安全配置自检总入口。
+//
+// 它**无条件**校验 JWT 签名密钥，刻意不读 http.jwt.enabled：
+// 后台的 Token 签发（登录）、刷新、解析都直接用 http.jwt.secret，
+// 并不经过 JWTMiddleware 的开关。所以把 enabled=false 当成「不需要密钥」是错的 ——
+// 那只会关掉请求侧的鉴权中间件，签名功能照旧，带着弱密钥/空密钥跑起来的服务
+// 等于任何人都能自签合法 Token。
+//
+// 以 getString 取配置而不是直接读全局容器，是为了让这条契约能被测试覆盖
+// （单测里没有组件容器）。
+func ValidateStartupSecurity(getString func(key string) string) error {
+	if getString == nil {
+		return fmt.Errorf("启动自检失败：配置读取器为空")
+	}
+	return ValidateJWTSigningKey(getString(JWTSecretConfigKey))
+}

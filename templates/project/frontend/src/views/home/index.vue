@@ -139,6 +139,11 @@ function onLogout() {
   router.replace('/login')
 }
 
+// 进入个人中心（已有的 profile 路由，不是新页面）
+function onProfile() {
+  router.push({ name: 'profile' })
+}
+
 onMounted(() => {
   if (!auth.user) {
     auth.loadMe()
@@ -177,8 +182,15 @@ onMounted(() => {
         </div>
       </nav>
       <div class="topbar-right">
-        <span class="user-name">{{ displayName }}</span>
-        <div class="avatar">{{ displayName.charAt(0).toUpperCase() }}</div>
+        <!--
+          个人中心入口：复用已有的 profile 路由，不新增页面、不新增菜单权限。
+          用原生 <button> 而不是给 <div> 挂 @click —— 这样 Tab 能聚焦、
+          Enter/Space 能触发，无障碍与键盘操作都是浏览器默认行为，不用自己补 keydown。
+        -->
+        <button type="button" class="user-entry" title="个人中心" aria-label="个人中心" @click="onProfile">
+          <span class="user-name">{{ displayName }}</span>
+          <span class="avatar">{{ displayName.charAt(0).toUpperCase() }}</span>
+        </button>
         <el-button text :icon="SwitchButton" @click="onLogout">退出</el-button>
       </div>
     </header>
@@ -288,6 +300,25 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+/* 个人中心入口：按钮只做「可点可聚焦」的容器，视觉沿用原来的用户名 + 头像 */
+.user-entry {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 2px;
+  border: none;
+  border-radius: 20px;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+}
+.user-entry:hover .user-name {
+  color: #6366f1;
+}
+.user-entry:focus-visible {
+  outline: 2px solid #6366f1;
+  outline-offset: 2px;
 }
 .user-name {
   font-size: 13px;

@@ -9,7 +9,7 @@ type AdminDept struct {
 	DeptID      uint64    `json:"dept_id" gorm:"primaryKey;autoIncrement;column:dept_id;comment:部门ID"`
 	DeptName    string    `json:"dept_name" gorm:"size:100;not null;column:dept_name;comment:部门名称"`
 	ParentID    uint64    `json:"parent_id" gorm:"index:idx_parent_id;not null;default:0;column:parent_id;comment:父部门ID"`
-	DeptCode    string    `json:"dept_code" gorm:"uniqueIndex:uk_dept_code;size:50;not null;default:'';column:dept_code;comment:部门编码"`
+	DeptCode    *string   `json:"dept_code" gorm:"uniqueIndex:uk_dept_code;size:50;column:dept_code;comment:部门编码，可空；唯一约束只约束非空值"`
 	Description string    `json:"description" gorm:"size:255;not null;default:'';column:description;comment:部门描述"`
 	SortOrder   int       `json:"sort_order" gorm:"not null;default:0;column:sort_order;comment:排序"`
 	DeptSource  int8      `json:"dept_source" gorm:"index:idx_dept_source;not null;default:1;column:dept_source;comment:部门来源：1自主创建，2企业微信同步，3其他SSO"`

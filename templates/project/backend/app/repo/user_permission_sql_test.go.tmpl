@@ -1,0 +1,110 @@
+// 有效权限查询的 SQL 形状测试：**禁用角色不贡献权限**这件事只能由 SQL 保证。
+//
+// 为什么必须测语句本身：过滤发生在数据库里，Go 代码拿到的只是「数据库给了几行」。
+// 用 sqlmock 喂几行回来，不管实现过不过滤角色状态都能构造出一样的结果 ——
+// 那种测试证不了修复。真正的断言只能落在「这条语句到底带没带角色状态条件」上。
+//
+// 用真实的 MySQL dialector + DryRun：和生产同一套 SQL 构建，只构建不执行，
+// 既不连数据库，也不拿 SQLite 当替身。
+//
+// 边界：这里证明的是「语句带了 r.status / p.status 条件、按 user_id 绑定、做了去重」。
+// 「MySQL 真的按这个条件过滤出了正确的并集」属于真库行为，不在本测试范围内。
+package repo
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"gorm.io/gorm"
+)
+
+// captureUserPermissionsStatement 走真实仓储的 FindUserPermissions，
+// 返回 GORM 实际构建出的 Statement（语句文本 + 绑定参数）。
+func captureUserPermissionsStatement(t *testing.T, userID uint64) *gorm.Statement {
+	t.Helper()
+	db := newDryRunDB(t)
+
+	var captured *gorm.Statement
+	if err := db.Callback().Query().After("gorm:query").Register("test:capture_user_perms", func(tx *gorm.DB) {
+		if tx.Statement != nil && tx.Statement.SQL.Len() > 0 {
+			captured = tx.Statement
+		}
+	}); err != nil {
+		t.Fatalf("注册 query 回调失败: %v", err)
+	}
+
+	if _, err := NewAdminUserRoleRepositoryWithDB(db).FindUserPermissions(context.Background(), userID); err != nil {
+		t.Fatalf("FindUserPermissions 执行失败: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("没有捕获到语句：FindUserPermissions 没有走到 GORM 回调")
+	}
+	return captured
+}
+
+// TestUserPermissionSQL_DisabledRolesContributeNothing 有效权限查询必须同时过滤
+// 角色状态与权限状态，并且联了角色表 —— 没有 join 角色表就根本无从过滤。
+func TestUserPermissionSQL_DisabledRolesContributeNothing(t *testing.T) {
+	stmt := captureUserPermissionsStatement(t, 7)
+	sql := stmt.SQL.String()
+
+	for _, want := range []struct {
+		fragment string
+		why      string
+	}{
+		{"admin_user_roles", "权限的起点是用户的角色关联"},
+		{"admin_roles", "必须联角色表：角色状态只在这张表上，不联它就过滤不了禁用角色"},
+		{"admin_role_permissions", "角色到权限的关联"},
+		{"admin_permissions", "权限行本身"},
+		{"r.status = 1", "被禁用的角色不贡献任何接口/菜单/按钮权限 —— 本次修的就是缺这个条件"},
+		{"p.status = 1", "被禁用的权限行本身不生效（原有语义，不能被顺手删掉）"},
+		{"ur.user_id = ?", "按用户过滤，且用绑定参数而不是拼字符串"},
+		{"DISTINCT", "多角色会把同一条权限查出多次，并集必须去重"},
+	} {
+		if !strings.Contains(sql, want.fragment) {
+			t.Errorf("语句缺少 %q（%s）。SQL: %s", want.fragment, want.why, sql)
+		}
+	}
+
+	// 绑定参数只应该有 user_id：两个状态条件是写死的常量，不是可变输入
+	// （做成参数就意味着调用方可以传 0 把过滤关掉）。
+	if len(stmt.Vars) != 1 {
+		t.Fatalf("绑定参数应只有 user_id 一个，实际 %d 个: %v。SQL: %s", len(stmt.Vars), stmt.Vars, sql)
+	}
+	if got, ok := stmt.Vars[0].(uint64); !ok || got != 7 {
+		t.Errorf("唯一的绑定参数应是 user_id=7，实际 %#v", stmt.Vars[0])
+	}
+
+	// 权限校验是高频只读路径，不该持锁（会让读互相阻塞）。
+	if strings.Contains(sql, "FOR UPDATE") || strings.Contains(sql, "FOR SHARE") {
+		t.Errorf("有效权限查询带上了加锁子句，高频只读路径会互相阻塞。SQL: %s", sql)
+	}
+}
+
+// TestUserPermissionSQL_AssociationReadKeepsDisabledRoles 与上一条配对：
+// 角色**关联**的读刻意不按状态过滤。
+//
+// 两条查询的分工是这次修复的核心：关联保留（禁用角色启用后权限自然恢复、编辑页
+// 也靠它回显并保持勾选），权限不给（禁用期间它名下的权限一条都不算）。
+// 哪条写反了都是事故：关联里过滤状态会把禁用角色的关联在保存时静默删掉，
+// 有效权限里不过滤状态就等于禁用角色根本没被禁用。
+func TestUserPermissionSQL_AssociationReadKeepsDisabledRoles(t *testing.T) {
+	ctx := context.Background()
+
+	sql := captureSQL(t, func(db *gorm.DB) error {
+		_, err := NewAdminUserRoleRepositoryWithDB(db).FindByUserID(ctx, 7)
+		return err
+	})
+
+	if !strings.Contains(sql, "admin_user_roles") {
+		t.Fatalf("查询没有落在 admin_user_roles 上。SQL: %s", sql)
+	}
+	if strings.Contains(sql, "status") {
+		t.Errorf("关联读按状态过滤了：禁用角色的关联会从编辑页消失，一次保存就把它删掉，启用后也恢复不了。SQL: %s", sql)
+	}
+	// "admin_user_roles" 里不含 "admin_roles" 这个子串，所以这条是真的在查有没有联角色表
+	if strings.Contains(sql, "admin_roles") {
+		t.Errorf("关联读联上了角色表：它只该回答「这个账号挂着哪些角色」，状态过滤属于有效权限查询。SQL: %s", sql)
+	}
+}

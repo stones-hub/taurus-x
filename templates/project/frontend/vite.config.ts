@@ -19,11 +19,6 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ''),
       },
-      // 上传文件下载/预览代理（后端 /downloads/ 静态服务）
-      '/downloads': {
-        target: 'http://127.0.0.1:9080',
-        changeOrigin: true,
-      },
     },
   },
 })
