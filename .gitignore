@@ -11,3 +11,10 @@
 
 # Pi 执行器证据
 .pi/evidence/
+
+# AI 协作文档（只留本机，不进公开仓库）
+/AGENTS.md
+/CLAUDE.md
+/HANDOVER.md
+/.pi/
+/docs/

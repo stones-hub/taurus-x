@@ -8,7 +8,7 @@
 >
 > 基础组合已经在本机 ARM Docker 环境验证过：生成 → 构建 → 启动 → 初始化数据库 → 管理员登录 → 读取身份 → 登出。
 > 勾选 `milvus` 的完整 Docker 启动仍受 MinIO 镜像下载问题阻塞，不建议第一次测试时全选。
-> 这不代表所有平台、可选组件或生产场景都已验证。详细证据见 [T2 验收记录](docs/T2验收记录.md)。
+> 这不代表所有平台、可选组件或生产场景都已验证，详见 [第 11 节](#11-已知限制与安全提醒)。
 
 ## 目录
 
@@ -99,14 +99,26 @@ docker compose version
 
 ## 3. 安装脚手架
 
-### 3.1 测试当前本机代码，推荐
-
-**当前尚未发布的改动，要从本地仓库构建；不要用 `@latest` 代替当前代码。**
-
-进入本仓库：
+### 3.1 用 go install 安装，推荐
 
 ```bash
-cd /Users/yelei/data/code/repos/taurus-x
+go install github.com/stones-hub/taurus-x@latest
+```
+
+安装后命令通常位于 `$(go env GOPATH)/bin`，需要该目录在 `PATH` 中。如果提示找不到命令，先检查安装目录，不必重复安装。
+
+查看帮助：
+
+```bash
+taurus-x help
+```
+
+### 3.2 从源码构建
+
+需要修改模板，或要使用尚未发布的改动时，从源码构建：
+
+```bash
+git clone https://github.com/stones-hub/taurus-x.git && cd taurus-x
 ```
 
 把 CLI 编译到临时目录，不往仓库根目录放二进制：
@@ -115,42 +127,20 @@ cd /Users/yelei/data/code/repos/taurus-x
 mkdir -p /tmp/taurusx-bin && go build -o /tmp/taurusx-bin/taurus-x .
 ```
 
-查看帮助：
+之后用 `/tmp/taurusx-bin/taurus-x` 代替下文的 `taurus-x`。
 
-```bash
-/tmp/taurusx-bin/taurus-x help
-```
-
-查看版本：
-
-```bash
-/tmp/taurusx-bin/taurus-x version
-```
-
-> CLI 版本号不一定能区分本机未提交改动；测试当前工作区的可靠方式是重新构建上面的二进制。
-
-### 3.2 安装仓库已发布的版本
-
-当远程仓库已发布你需要的版本时，可以使用：
-
-```bash
-go install github.com/stones-hub/taurus-x@latest
-```
-
-安装后命令通常位于 `$(go env GOPATH)/bin`，需要该目录在 `PATH` 中。如果提示找不到命令，先检查安装目录，不必重复安装。
-
-**这条命令拿到的是远程版本，不包含本机尚未提交、推送的改动。**
+> 模板通过 `embed` 打进二进制，改模板后必须重新构建；CLI 版本号不能区分本机未提交改动。
 
 ## 4. 生成你的项目
 
-以下统一使用项目名 **`my-admin`**，目录为 `/Users/yelei/data/code/repos/my-admin`，数据库名为 **`my_admin`**。
+以下统一使用项目名 **`my-admin`**，数据库名为 **`my_admin`**。
 
 > 换项目名时，请同步替换后续命令中的目录、容器名和数据库名。项目名中的 `-` 会在默认数据库名中转换为 `_`。
 
-在仓库父目录执行，避免把新 Git 项目嵌套在脚手架仓库里：
+在你存放代码的目录执行。如果是从源码构建的，**不要在 taurus-x 仓库内部执行**，避免把新项目嵌套进脚手架仓库：
 
 ```bash
-cd /Users/yelei/data/code/repos && /tmp/taurusx-bin/taurus-x new my-admin
+taurus-x new my-admin
 ```
 
 按提示完成以下步骤：
@@ -183,8 +173,10 @@ cd /Users/yelei/data/code/repos && /tmp/taurusx-bin/taurus-x new my-admin
 进入生成项目：
 
 ```bash
-cd /Users/yelei/data/code/repos/my-admin
+cd my-admin
 ```
+
+**后文命令如无特别说明，都在生成项目根目录 `my-admin` 下执行。**
 
 主要目录如下：
 
@@ -246,7 +238,7 @@ chmod 600 .env
 
 ### 5.2 把测试入口改为本机独立端口
 
-模板默认发布 `9080:9080`。**这台机器的 9080 端口有其他项目使用，不要直接占用。**
+模板默认发布 `9080:9080`，并监听所有网卡。本机测试建议改成只监听 `127.0.0.1`；如果 9080 已被其他服务占用，也需要换端口。
 
 用编辑器打开生成项目的 `docker-compose.yml`，在 **`app` 服务的 `ports`** 中，把：
 
@@ -362,7 +354,7 @@ docker compose down --volumes
 
 适用场景：需要修改前后端、前端热更新。后端直接运行在本机；MySQL 和 Redis 自备。
 
-**不要使用、重置或清空其他项目正在运行的数据库。** 以下示例用独立容器与端口，不占 admin 项目资源。
+**不要使用、重置或清空其他项目正在运行的数据库。** 以下示例用独立容器与端口，不影响你已有的数据库。
 
 ### 6.1 准备独立 MySQL 和 Redis
 
@@ -475,14 +467,16 @@ target: 'http://127.0.0.1:19084',
 
 进入前端目录：
 
-```bash
-cd /Users/yelei/data/code/repos/my-admin/frontend
-```
-
 使用固定版本 pnpm 安装，不需要全局安装：
 
 ```bash
-npm exec --yes pnpm@10.34.7 -- install
+cd frontend && npm exec --yes pnpm@10.34.7 -- install
+```
+
+安装完成后回到项目根目录：
+
+```bash
+cd ..
 ```
 
 ### 6.6 分两个终端启动
@@ -490,7 +484,7 @@ npm exec --yes pnpm@10.34.7 -- install
 **终端一：启动后端。**
 
 ```bash
-cd /Users/yelei/data/code/repos/my-admin/backend && make run
+cd backend && make run
 ```
 
 `make run` 会先执行 Wire，再读取 `.env.local` 启动后端。
@@ -498,8 +492,10 @@ cd /Users/yelei/data/code/repos/my-admin/backend && make run
 **终端二：启动前端。**
 
 ```bash
-cd /Users/yelei/data/code/repos/my-admin/frontend && npm exec --yes pnpm@10.34.7 -- dev --host 127.0.0.1
+cd frontend && npm exec --yes pnpm@10.34.7 -- dev --host 127.0.0.1
 ```
+
+两个终端都要先进入 `my-admin` 项目根目录再执行。
 
 打开前端终端实际打印的地址，通常是：
 
@@ -514,19 +510,21 @@ cd /Users/yelei/data/code/repos/my-admin/frontend && npm exec --yes pnpm@10.34.7
 先停止开发服务器，构建前端：
 
 ```bash
-cd /Users/yelei/data/code/repos/my-admin/frontend && npm exec --yes pnpm@10.34.7 -- build
+cd frontend && npm exec --yes pnpm@10.34.7 -- build && cd ..
 ```
 
 构建后端：
 
 ```bash
-cd /Users/yelei/data/code/repos/my-admin/backend && make build
+cd backend && make build
 ```
 
 从 **backend 目录**运行编译产物：
 
+接上一步，仍在 `backend` 目录中执行：
+
 ```bash
-cd /Users/yelei/data/code/repos/my-admin/backend && ./build/my-admin -config ./config -env .env.local
+./build/my-admin -config ./config -env .env.local
 ```
 
 访问 **http://127.0.0.1:19084/login**。此时不依赖 Vite，前端文件来自 `frontend/dist`；不要只复制后端二进制而遗漏前端产物与配置。
@@ -616,6 +614,22 @@ Makefile 的提示文字使用默认端口；你改过配置时，应以实际�
 
 关于现有用户更新接口：`/admin/user/update` 不是通用 PATCH。只有 `role_ids` 支持选择性更新：不传或 `null` 表示不改角色，`[]` 表示清空角色；其他资料仍按完整表单提交。仅调整角色可用已有 `/admin/role/assign`。
 
+### Wire 生成文件怎么管
+
+`backend/app/wire.go`、`backend/app/wire_gen.go`、`backend/internal/taurus/wire_gen.go` 是依赖注入的生成代码：
+
+- **与操作系统、CPU 架构无关**。内容只取决于选了哪些组件、写了哪些 controller/service，不含任何平台相关代码；在 macOS 生成、提交的文件，可以直接在 Ubuntu、ARM 或 AMD 上编译。区分平台的是编译阶段的 `GOOS/GOARCH`，Dockerfile 已按目标平台编译。
+- **生成文件要提交到 Git**（Wire 官方推荐做法）。部署机和 Docker 构建不需要安装 Wire，也不需要为此联网。
+- 生成项目时已自动执行一次；`make run`、`make build` 也会先自动重新生成。
+- **Docker 构建不会执行 Wire**，只使用仓库里已有的生成文件。新增或删除 controller/service 后，必须先执行 `make wire`、确认 `go build ./...` 通过，并把生成文件一起提交；否则镜像可能编译失败或漏掉新服务。
+- 不要手工修改这些文件，下次 `make wire` 会覆盖。
+
+在生成项目根目录重新生成并检查：
+
+```bash
+cd backend && make wire && go build ./...
+```
+
 ## 10. 常见问题
 
 ### 生成时 `go mod tidy` 或 Wire 失败
@@ -625,7 +639,7 @@ Makefile 的提示文字使用默认端口；你改过配置时，应以实际�
 可以修复网络后在生成项目后端目录整理依赖并重跑 Wire；不要无脑清库或覆盖目录：
 
 ```bash
-cd /Users/yelei/data/code/repos/my-admin/backend && go mod tidy && make wire
+cd backend && go mod tidy && make wire
 ```
 
 如需重新生成，使用新的空目录，或确认无需要保留的内容后自行清理旧测试目录。
@@ -687,7 +701,7 @@ MySQL 仅在空数据目录首次初始化时执行脚本。已有库要用正�
 - 初始密码、JWT 密钥、数据库密码、Token、Cookie 不进 Git、不写入公开问题报告。
 - 只在本机测试时尽量绑定 `127.0.0.1`；不要把临时数据库、缓存和测试后台暴露到公网。
 
-进一步阅读：[方案](docs/方案.md)、[安全审计](docs/安全审计.md)、[验收记录](docs/T2验收记录.md)、[当前交接](HANDOVER.md)。
+进一步阅读：生成项目自带的 `README.md`（含「已知风险与待办」）和 `docs/` 下的开发、部署文档。
 
 ## 12. 维护脚手架本身
 
