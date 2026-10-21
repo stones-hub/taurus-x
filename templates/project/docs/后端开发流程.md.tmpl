@@ -222,13 +222,14 @@ taurus.Container.Http.AddRouterGroup(router.RouteGroup{
 - **下拉选项接口**挂 `/admin/option/*`（`userBaseChain`，无 Permission 校验），供前端 `useOptions` 做数据源；**业务 list/CRUD 接口绝不挂到 `/admin/option` 下**（这会绕过权限校验）。
 - **业务 list/CRUD** 挂各自前缀（`userProtectedChain`，含 Permission 校验）。
 - 三条链定义（`routes.go` 的 `RegisterRoutes` 顶部，顺序即执行顺序）：
-  - `userBaseChain` = `Recovery → BodyLimit → JWT → SessionValidator → AccessLog → CSRF`
+  - `userBaseChain` = `Recovery → BodyLimit → AdminRateLimit → JWT → SessionValidator → AccessLog → CSRF`
     （无 Permission、无 OperationLog；用于「读自己」与下拉选项）
-  - `userSelfServiceChain` = `Recovery → BodyLimit → JWT → SessionValidator → AccessLog → OperationLog → CSRF`
+  - `userSelfServiceChain` = `Recovery → BodyLimit → AdminRateLimit → JWT → SessionValidator → AccessLog → OperationLog → CSRF`
     （无 Permission，但要操作留痕；用于「自己改自己」，如 `change-password`）
-  - `userProtectedChain` = `Recovery → BodyLimit → JWT → SessionValidator → AccessLog → Permission → OperationLog → CSRF`
+  - `userProtectedChain` = `Recovery → BodyLimit → AdminRateLimit → JWT → SessionValidator → AccessLog → Permission → OperationLog → CSRF`
     （受接口权限校验；业务 list / CRUD 用这条）
-  - 三条链都带 `BodyLimit` + `AccessLog` + `CSRF`，差别只在 Permission 与 OperationLog；
+  - 三条链都带 `BodyLimit` + `AdminRateLimit` + `AccessLog` + `CSRF`，差别只在 Permission 与 OperationLog；
+    `AdminRateLimit` 是三条链**共用的同一个**按 IP 限流器（同一 IP 对全部后台接口共享一份额度），排在 JWT 之前；
     `SessionValidator` 必须紧跟 `JWT`（JWT 只验签名，会话吊销由它比对
     `admin_users.auth_version` 判定）。新业务模块**直接复用这三条链，不要自己拼新链**。
 - 业务接口 path 必须与 `admin_permissions.path`（`permission_type=3` 的 path）一致，否则 RBAC 精确匹配失败、无权限的人打不开接口。

@@ -83,6 +83,8 @@ func TestGenerate_Combinations(t *testing.T) {
 			assertPasswordHashing(t, outDir)
 			assertSystemPermissionOnlyPromotable(t, outDir)
 			assertRateLimiterBounded(t, outDir)
+			assertAdminRateLimit(t, outDir)
+			assertFrontendErrorHandling(t, outDir)
 			assertLogRetentionWiring(t, outDir)
 			assertEnvFileFailFast(t, outDir)
 			assertSQLLogNoLeak(t, outDir)
@@ -1105,7 +1107,7 @@ func assertRateLimiterBounded(t *testing.T, outDir string) {
 		t.Error("rate_limit.go 仍在用 tlimit.CompositeRateLimiter 类型")
 	}
 	if n := strings.Count(rateLimit, "newIPRateLimiter("); n != 2 {
-		t.Errorf("rate_limit.go 里构造 ipRateLimiter 的地方应有 2 处（敏感接口 + 全局限流），实际 %d 处", n)
+		t.Errorf("rate_limit.go 里构造 ipRateLimiter 的地方应有 2 处（敏感接口 + 后台接口），实际 %d 处", n)
 	}
 
 	// 2. 记录数有上限，且有摊还式回收
@@ -1152,11 +1154,8 @@ func assertRateLimiterBounded(t *testing.T, outDir string) {
 
 	// 5. 配置键名不变：改了名字等于线上配置静默失效
 	for _, key := range []string{
-		"http.rate_limit.composite.enabled",
-		"http.rate_limit.composite.ip_capacity",
-		"http.rate_limit.composite.global_capacity",
-		"http.rate_limit.composite.fill_interval",
-		"http.rate_limit.basic.enabled",
+		"http.rate_limit.admin.burst",
+		"http.rate_limit.admin.per_second",
 		"http.rate_limit.sensitive.",
 	} {
 		if !strings.Contains(rateLimit, key) {
@@ -1167,6 +1166,384 @@ func assertRateLimiterBounded(t *testing.T, outDir string) {
 	// 6. 生成项目自带回收与并发的单元测试
 	if _, err := os.Stat(filepath.Join(mwDir, "ip_rate_limiter_test.go")); err != nil {
 		t.Errorf("生成项目缺少 app/middleware/ip_rate_limiter_test.go: %v", err)
+	}
+}
+
+// assertAdminRateLimit 后台接口按 IP 限流（T6）。
+//
+// 改动前只有登录 / 验证码 / 错误上报四处挂了限流，/admin/** 本身完全没有限流：
+// 任何一个拿到 Token 的账号（或任何一个无 Token 的脚本）都能全速打后台接口。
+// 这里断言：**所有** /admin/** 路由组都计入后台额度（全集扫描，不维护白名单）、
+// 挂在 JWT 之前、各条链共用一个限流器实例、配置键与默认值到位、启动阶段就校验配置、
+// 超限响应与留痕（429 + Retry-After + 中文提示在 data + 节流日志）、
+// 以及没人调用的旧限流代码已经删干净。
+func assertAdminRateLimit(t *testing.T, outDir string) {
+	t.Helper()
+
+	backend := filepath.Join(outDir, "backend")
+	mwDir := filepath.Join(backend, "app", "middleware")
+	rateLimit := readFile(t, filepath.Join(mwDir, "rate_limit.go"))
+	limiter := readFile(t, filepath.Join(mwDir, "ip_rate_limiter.go"))
+	routes := readFile(t, filepath.Join(backend, "app", "routes", "routes.go"))
+	bootstrap := readFile(t, filepath.Join(backend, "app", "bootstrap.go"))
+	httpYAML := readFile(t, filepath.Join(backend, "config", "autoload", "http", "http.yaml"))
+	envExample := readFile(t, filepath.Join(backend, ".env.example"))
+
+	// 1. 三条后台链都挂后台限流，且在 JWT 之前。
+	//    挂到 JWT 之后的话，无 Token 的洪水请求每次都要先走完一遍 Token 解析；
+	//    漏掉任意一条链就等于留了一条绕过限流的路（三条链覆盖的都是 /admin/**）。
+	for _, chain := range []string{"userBaseChain", "userSelfServiceChain", "userProtectedChain"} {
+		block := blockAfter(routes, chain+" := []router.MiddlewareFunc{")
+		if block == "" {
+			t.Errorf("routes.go 找不到 %s 定义", chain)
+			continue
+		}
+		rl := strings.Index(block, "tmid.AdminRateLimitMiddleware()")
+		if rl < 0 {
+			t.Errorf("%s 没挂 tmid.AdminRateLimitMiddleware()：这条链上的 /admin/** 接口没有限流", chain)
+			continue
+		}
+		jwt := strings.Index(block, "tmid.JWTMiddleware()")
+		if jwt < 0 {
+			t.Errorf("%s 没挂 JWTMiddleware", chain)
+			continue
+		}
+		if rl > jwt {
+			t.Errorf("%s 的后台限流应排在 JWT 之前，否则未登录的洪水请求会先走一遍 Token 解析", chain)
+		}
+		if bl := strings.Index(block, "tmid.BodyLimitMiddleware()"); bl < 0 || bl > rl {
+			t.Errorf("%s 的后台限流应紧跟在 BodyLimit 之后", chain)
+		}
+	}
+
+	// 2. /admin/** 挂载完整性：**遍历所有路由组**，凡是落在后台额度范围内的
+	//    （Prefix 以 /admin 开头，以及走后台链的 /user 组）都必须计入后台限流。
+	//
+	//    为什么不按名字一个个点着查：那样下次新增一个 /admin/xxx 路由组时，
+	//    断言会静默通过 —— 而那恰好就是漏挂发生的时刻。规则是「一个不漏」，
+	//    所以断言也必须是全集扫描，没有白名单。
+	//    计入方式有两种：直接挂 tmid.AdminRateLimitMiddleware()，
+	//    或复用上面三条已经挂了它的后台链。
+	backendChains := []string{"userBaseChain", "userSelfServiceChain", "userProtectedChain"}
+	groups := routerGroups(routes)
+	if len(groups) < 11 {
+		// 解析兜底：真实数量是 13（含两个 /auth 组）。切片解析一旦失效，
+		// 下面的循环会「一个都不检查却全部通过」，这是最危险的失败方式。
+		t.Fatalf("routes.go 解析出的路由组只有 %d 个，远少于预期：routerGroups 的切分失效了，下面的完整性扫描会变成空转", len(groups))
+	}
+	covered := 0
+	for _, group := range groups {
+		prefix := groupPrefix(group)
+		if prefix == "" {
+			t.Errorf("routes.go 有路由组解析不出 Prefix，完整性扫描无法覆盖它：\n%s", group)
+			continue
+		}
+		// /user/refresh-token 也走后台链，一并计入（见 routes.go 里的取舍注释）
+		if !strings.HasPrefix(prefix, "/admin") && !strings.HasPrefix(prefix, "/user") {
+			continue
+		}
+		metered := strings.Contains(group, "tmid.AdminRateLimitMiddleware()")
+		for _, chain := range backendChains {
+			if strings.Contains(group, "Middleware: "+chain) {
+				metered = true
+			}
+		}
+		if !metered {
+			t.Errorf("路由组 %q 没有计入后台限流额度：要么直接挂 tmid.AdminRateLimitMiddleware()，要么用已挂它的后台链（%s）。/admin/** 的规则是一个不漏，不维护白名单。\n%s",
+				prefix, strings.Join(backendChains, " / "), group)
+			continue
+		}
+		covered++
+	}
+	if covered < 9 {
+		t.Errorf("计入后台额度的路由组只有 %d 个，少于预期的 9 个：要么路由被删了，要么扫描没认出它们", covered)
+	}
+
+	// 3. 两条内联链（绑定/解绑手机号、发送验证码）在计入后台额度之外，
+	//    还各自叠一个更严的专用桶，而且专用桶排在后台限流**之后** ——
+	//    先过「这个 IP 对 /admin/** 的总额度」，再过「这一类请求的专用额度」。
+	bindGroup := groupContaining(routes, `{Path: "/bind-mobile"`)
+	if bindGroup == "" {
+		t.Error("routes.go 找不到 /bind-mobile 的路由组")
+	} else {
+		if !strings.Contains(bindGroup, `tmid.NamedRateLimitMiddleware("verify_code")`) {
+			t.Error("bind-mobile/unbind-mobile 的 verify_code 限流桶不能丢（抗 6 位码枚举）")
+		}
+	}
+	sendCodeGroup := groupContaining(routes, `{Path: "/send-code"`)
+	if sendCodeGroup == "" {
+		t.Error("routes.go 找不到 /send-code 的路由组")
+	} else {
+		if !strings.Contains(sendCodeGroup, `tmid.NamedRateLimitMiddleware("send_code")`) {
+			t.Error("send-code 的 send_code 限流桶不能丢（短信有真金白银的成本）")
+		}
+		admin := strings.Index(sendCodeGroup, "tmid.AdminRateLimitMiddleware()")
+		bucket := strings.Index(sendCodeGroup, `tmid.NamedRateLimitMiddleware("send_code")`)
+		if admin >= 0 && bucket >= 0 && admin > bucket {
+			t.Error("send-code 的后台限流应排在 send_code 桶之前：总额度先判，专用桶后判")
+		}
+	}
+
+	// 4. 不该被限流的入口保持原样：登录走自己的 login 桶、登出刻意不限流、
+	//    /health 与前端错误上报也不该被后台额度连坐。
+	logoutGroup := groupContaining(routes, `{Path: "/logout"`)
+	if logoutGroup == "" {
+		t.Error("routes.go 找不到 /logout 的路由组")
+	} else if strings.Contains(logoutGroup, "AdminRateLimitMiddleware") {
+		t.Error("/auth/logout 不该挂后台限流：登出被挡住会把已失效的会话留在白名单里")
+	}
+	loginGroup := groupContaining(routes, `{Path: "/login"`)
+	if loginGroup == "" {
+		t.Error("routes.go 找不到 /login 的路由组")
+	} else if strings.Contains(loginGroup, "AdminRateLimitMiddleware") {
+		t.Error("/auth/login 不该挂后台限流：它有自己更严的 login 桶")
+	}
+
+	// 5. 三条链共用一个限流器实例。
+	//    每条链各建一个的话，同一个 IP 对 /admin/** 就有三份独立配额，
+	//    换条链就能接着刷，配置里的「每秒 10 次」实际是每秒 30 次。
+	if !strings.Contains(rateLimit, "var adminLimiter *ipRateLimiter") {
+		t.Error("后台限流器应是包级单实例（var adminLimiter *ipRateLimiter）：每条链各建一个等于把额度翻三倍")
+	}
+	mw := funcBody(rateLimit, "func AdminRateLimitMiddleware() func(next http.Handler) http.Handler {")
+	if mw == "" {
+		t.Fatal("rate_limit.go 找不到 AdminRateLimitMiddleware")
+	}
+	if strings.Contains(mw, "newIPRateLimiter(") {
+		t.Error("AdminRateLimitMiddleware 里不该自己造限流器：那样每条链一份额度")
+	}
+	if !strings.Contains(mw, "adminLimiter") {
+		t.Error("AdminRateLimitMiddleware 应使用共享的 adminLimiter")
+	}
+
+	// 6. 后台限流不设全局桶：全站单桶会让一个人刷光所有人的额度。
+	initFn := funcBody(rateLimit, "func InitAdminRateLimiter(getString func(string) string) error {")
+	if initFn == "" {
+		t.Fatal("rate_limit.go 找不到 InitAdminRateLimiter")
+	}
+	if !strings.Contains(initFn, `newIPRateLimiter("admin", cfg.Burst, 0, cfg.FillInterval())`) {
+		t.Error("后台限流器应以 globalCapacity=0 构造（只按 IP、不设全站总额度），名字固定为 admin（日志要能认出是哪个桶拦的）")
+	}
+
+	// 7. 配置在**启动阶段**校验，不是等第一个请求。
+	//    限流参数配错属于安全配置错误，必须立刻可见。
+	if !strings.Contains(bootstrap, "initAdminRateLimit()") {
+		t.Error("bootstrap.go 的 init() 没调用 initAdminRateLimit：配置非法会拖到第一个请求才暴露")
+	}
+	initBoot := funcBody(bootstrap, "func initAdminRateLimit() {")
+	if initBoot == "" {
+		t.Fatal("bootstrap.go 找不到 initAdminRateLimit")
+	}
+	if !strings.Contains(initBoot, "middleware.InitAdminRateLimiter(taurus.Container.Config.GetString)") {
+		t.Error("initAdminRateLimit 应用 GetString 解析配置：GetInt 会把 abc 静默当成 0，即「悄悄关掉限流」")
+	}
+	if !strings.Contains(initBoot, "log.Fatalf") {
+		t.Error("后台限流配置非法时应直接终止启动，而不是打条日志继续跑")
+	}
+	// 解析必须走 GetString（见上），所以函数签名里不能出现 GetInt
+	if strings.Contains(initFn, "GetInt") {
+		t.Error("InitAdminRateLimiter 不该用 GetInt 解析：abc 会被静默当成 0")
+	}
+
+	// 8. 配置文件：旧的 composite/basic 两段（从来没有调用方，却写着 enabled: true）
+	//    必须删掉，新键与默认值要在位。
+	for _, dead := range []string{"composite:", "basic:", "ip_capacity: 5", "global_capacity: 50"} {
+		if strings.Contains(httpYAML, dead) {
+			t.Errorf("http.yaml 仍含已废弃的限流配置 %q：没有调用方的 enabled: true 是误导性配置", dead)
+		}
+	}
+	for _, want := range []string{
+		"admin:",
+		"burst: ${ADMIN_RATE_LIMIT_BURST:300}",
+		"per_second: ${ADMIN_RATE_LIMIT_PER_SECOND:10}",
+	} {
+		if !strings.Contains(httpYAML, want) {
+			t.Errorf("http.yaml 缺少后台限流配置 %q", want)
+		}
+	}
+	// 占位符不能被加引号：.env 的值是先文本替换、再 YAML 解析的
+	for _, quoted := range []string{`"${ADMIN_RATE_LIMIT_BURST`, `"${ADMIN_RATE_LIMIT_PER_SECOND`} {
+		if strings.Contains(httpYAML, quoted) {
+			t.Errorf("http.yaml 的占位符 %q 不该加引号：值是先替换再解析的，引号会进到值里", quoted)
+		}
+	}
+	for _, want := range []string{"ADMIN_RATE_LIMIT_BURST=300", "ADMIN_RATE_LIMIT_PER_SECOND=10"} {
+		if !strings.Contains(envExample, want) {
+			t.Errorf(".env.example 缺少 %q", want)
+		}
+	}
+
+	// 9. 旧的死代码删干净：RateLimitMiddleware/initLimiters/checkRateLimit 没有调用方，
+	//    留着会让人以为 composite/basic 那套配置还在生效。
+	for _, dead := range []string{
+		"func RateLimitMiddleware()",
+		"func initLimiters(",
+		"func checkRateLimit(",
+		"tlimit.NewRateLimiter",
+	} {
+		if strings.Contains(rateLimit, dead) {
+			t.Errorf("rate_limit.go 仍含没有调用方的旧限流代码 %q", dead)
+		}
+	}
+
+	// 10. 超限响应：真实 429 + Retry-After + **中文提示放在 data 里**。
+	//
+	//     提示必须走 data：httpx.SendResponse 的 message 由公共库按状态码写死
+	//     （429 → 英文 "Too Many Requests"），把中文塞进 message 参数的位置
+	//     会被公共库覆盖掉，用户看到的就是英文。前端 extractError 因此是
+	//     「data 字符串优先」的取值顺序，两头必须对齐。
+	if !strings.Contains(rateLimit, `const rateLimitedMessage = "请求过于频繁，请稍后重试"`) {
+		t.Error("超限提示应是常量 rateLimitedMessage = 「请求过于频繁，请稍后重试」，后台与敏感接口共用一句")
+	}
+	reject := funcBody(rateLimit, "func serveRateLimited(w http.ResponseWriter, r *http.Request, limiter *ipRateLimiter, next http.Handler) {")
+	if reject == "" {
+		t.Fatal("rate_limit.go 找不到 serveRateLimited")
+	}
+	if !strings.Contains(reject, "httpx.SendResponse(w, http.StatusTooManyRequests, rateLimitedMessage,") {
+		t.Error("超限响应应为 429 + rateLimitedMessage 放在 data 位置（第三个参数）：放到 message 会被公共库的英文覆盖")
+	}
+	if !strings.Contains(reject, `"Retry-After": strconv.Itoa(limiter.retryAfterSeconds())`) {
+		t.Error("429 响应要带 Retry-After（取桶的填充间隔向上取整秒），否则客户端只能立刻重试再吃一个 429")
+	}
+	// 超限要留痕，但必须是节流日志：每请求一条会把一次被刷放大成日志盘故障
+	if !strings.Contains(reject, "limiter.noteRejection(ip)") {
+		t.Error("serveRateLimited 的拒绝分支要留痕（noteRejection）：否则「限流挡住了人」和「接口坏了」在运维那边无法区分")
+	}
+	if !strings.Contains(limiter, "rateLimitRejectLogInterval") {
+		t.Error("被拒日志必须节流（rateLimitRejectLogInterval）：每请求一条会把被刷放大成第二起故障")
+	}
+	noteFn := funcBody(limiter, "func (l *ipRateLimiter) noteRejection(ip string) {")
+	if !strings.Contains(noteFn, "rateLimitRejectLogInterval") || !strings.Contains(noteFn, "log.Printf") {
+		t.Error("noteRejection 应在节流窗口内只打一条汇总日志")
+	}
+
+	// 11. 触顶时的强制清扫也要节流。
+	//     表满后每个新 IP 都想抢一个记录位，而清扫是**锁内 O(记录数)** 的全表扫描：
+	//     不节流的话，「把表撑满」就能换来「每个请求都在锁内扫 10 万条」，
+	//     限流器自己成了瓶颈 —— 正好是攻击者想要的结果。
+	if !strings.Contains(limiter, "rateLimitForcedSweepInterval") {
+		t.Error("ip_rate_limiter.go 缺少 rateLimitForcedSweepInterval：触顶强制清扫没有节流，每个新 IP 都会触发一次全表扫描")
+	}
+	trackFn := funcBody(limiter, "func (l *ipRateLimiter) trackLocked(ip string, now time.Time) *tokenBucket {")
+	if strings.Contains(trackFn, "l.sweepLocked(now)") {
+		t.Error("trackLocked 不该直接调 sweepLocked：触顶路径必须走带节流的 maybeForceSweepLocked")
+	}
+	if !strings.Contains(trackFn, "l.maybeForceSweepLocked(now)") {
+		t.Error("trackLocked 的触顶路径应调用 maybeForceSweepLocked（带独立节流）")
+	}
+	forceFn := funcBody(limiter, "func (l *ipRateLimiter) maybeForceSweepLocked(now time.Time) {")
+	if !strings.Contains(forceFn, "rateLimitForcedSweepInterval") {
+		t.Error("maybeForceSweepLocked 必须按 rateLimitForcedSweepInterval 节流")
+	}
+
+	// 12. 「限流器从未初始化」要和「配置关闭」区分开：前者是接线事故
+	//     （比如将来多一个入口二进制、没走 app 包的 init()），结果是 /admin/**
+	//     静默地完全不限流。放行但告警一次，别让它能活到被刷那天。
+	if !strings.Contains(rateLimit, "func warnIfAdminLimiterUninitialized() {") {
+		t.Error("rate_limit.go 缺少 warnIfAdminLimiterUninitialized：未初始化与配置关闭在行为上无法区分，必须有一条告警")
+	}
+	if !strings.Contains(rateLimit, "adminLimiterReady = true") {
+		t.Error("InitAdminRateLimiter 应标记 adminLimiterReady，用来区分「关闭」与「没接上」")
+	}
+	if !strings.Contains(mw, "warnIfAdminLimiterUninitialized()") {
+		t.Error("AdminRateLimitMiddleware 应在未初始化时告警一次（仍放行）")
+	}
+
+	// 13. per_second 的上限钉住：这是个安全参数，改动必须是有意识的
+	if !strings.Contains(rateLimit, "maxAdminRateLimitPerSecond = 10000") {
+		t.Error("per_second 上限应显式写成 10000：后台接口是人在点，更大的值只可能是手误（多打 0 或把每分钟当每秒）")
+	}
+
+	// 14. 生成项目自带后台限流的单元测试
+	if _, err := os.Stat(filepath.Join(mwDir, "rate_limit_test.go")); err != nil {
+		t.Errorf("生成项目缺少 app/middleware/rate_limit_test.go: %v", err)
+	}
+}
+
+// assertFrontendErrorHandling 前端在「接口失败」时的行为（T6-fix2）。
+//
+// 后台限流默认开启之后，正常的快速操作（切菜单时并发拉十几个列表/选项接口）
+// 也会撞上 429，所以这条路径从「偶发」变成了日常：
+//
+//  1. 首屏加载的调用不接错误 → 控制台 Uncaught (in promise)，而且会触发
+//     unhandledrejection；
+//  2. frontError.ts 把每个 unhandledrejection 当成前端 JS 异常上报 → 一轮
+//     往 front_error_log 里灌几十条 "Request failed with status code 429"，
+//     把真正的前端错误挤出视野（上报接口自己也有限流桶，等于自己刷自己）；
+//  3. 提示不合并 → 一次切换叠出二十多条一模一样的「请求过于频繁」。
+//
+// 三条都是「限流一开就立刻出现」的问题，所以钉进生成产物断言。
+func assertFrontendErrorHandling(t *testing.T, outDir string) {
+	t.Helper()
+
+	src := filepath.Join(outDir, "frontend", "src")
+
+	// 1. 列表页首屏加载必须接住错误（提示由 http.ts 拦截器负责，这里只防浮空 Promise）
+	listPage := readFile(t, filepath.Join(src, "composables", "useListPage.ts"))
+	mounted := tsBlock(listPage, "onMounted(")
+	if mounted == "" {
+		t.Fatal("useListPage.ts 找不到 onMounted")
+	}
+	if !strings.Contains(mounted, "loadTableData().catch(") {
+		t.Errorf("useListPage.ts 的 onMounted 必须接住 loadTableData 的失败，否则首屏撞上 429 就是 Uncaught (in promise) + 一条垃圾错误上报，实际:\n%s", mounted)
+	}
+	// loading 在失败时也要复位，否则列表永远转圈
+	load := tsBlock(listPage, "async function loadTableData() {")
+	if load == "" {
+		t.Fatal("useListPage.ts 找不到 loadTableData")
+	}
+	if !strings.Contains(load, "finally") {
+		t.Error("loadTableData 必须用 finally 复位 loading：接口失败后列表会一直转圈")
+	}
+
+	// 2. 接口失败不作为前端 JS 异常上报，但真正的运行时错误仍要上报
+	frontError := readFile(t, filepath.Join(src, "utils", "frontError.ts"))
+	if !strings.Contains(frontError, "axios.isAxiosError(reason)") {
+		t.Error("frontError.ts 应识别 axios 错误（网络层/真实非 2xx）并跳过上报")
+	}
+	if !strings.Contains(frontError, "reason instanceof ApiError") {
+		t.Error("frontError.ts 应识别 http.ts 抛出的 ApiError（业务 code 非 2xx）并跳过上报")
+	}
+	rejection := tsBlock(frontError, "window.addEventListener('unhandledrejection'")
+	if rejection == "" {
+		t.Fatal("frontError.ts 找不到 unhandledrejection 监听器")
+	}
+	if !strings.Contains(rejection, "(reason)) return") {
+		t.Errorf("unhandledrejection 监听器必须先判定「这是接口失败吗」再决定是否上报（形如 if xxx(reason)) return），实际:\n%s", rejection)
+	}
+	// 不得借机把上报能力整体削弱：两类监听器都要在，且都仍然调用 report
+	errListener := tsBlock(frontError, "window.addEventListener('error'")
+	if errListener == "" || !strings.Contains(errListener, "report({") {
+		t.Error("frontError.ts 仍必须上报真实的 JS 运行时错误（window error 监听器）")
+	}
+	if !strings.Contains(rejection, "report({") {
+		t.Error("frontError.ts 仍必须上报非接口的 Promise rejection")
+	}
+
+	// 3. 错误提示合并同内容，否则一次限流糊满整屏
+	httpTS := readFile(t, filepath.Join(src, "api", "http.ts"))
+	if strings.Contains(httpTS, "ElMessage.error(") {
+		t.Error("http.ts 不应再用 ElMessage.error(message)：它不合并同内容提示，一次限流会叠出几十条一样的 toast")
+	}
+	// 每一处 ElMessage 调用都要带 grouping（逐个调用看，不数全文出现次数：
+	// 注释里也会提到 grouping，数次数会把注释算进去）
+	calls := strings.Split(httpTS, "ElMessage({")[1:]
+	if len(calls) == 0 {
+		t.Error("http.ts 应通过 ElMessage({ ... }) 弹错误提示")
+	}
+	for _, seg := range calls {
+		if end := strings.Index(seg, "})"); end >= 0 {
+			seg = seg[:end]
+		}
+		if !strings.Contains(seg, "grouping: true") {
+			t.Errorf("http.ts 的 ElMessage 调用缺少 grouping: true，一次限流会叠出几十条一样的 toast: ElMessage({%s})", seg)
+		}
+	}
+	if !strings.Contains(httpTS, "export class ApiError extends Error {") {
+		t.Error("http.ts 应导出 ApiError，供 frontError.ts 区分「接口失败」与「前端异常」")
+	}
+	if !strings.Contains(tsBlock(httpTS, "export async function request<T>(config: AxiosRequestConfig): Promise<T> {"), "throw new ApiError(") {
+		t.Error("request() 业务 code 非 2xx 时应抛 ApiError，否则 frontError.ts 认不出来、照旧当前端异常上报")
 	}
 }
 
@@ -1539,6 +1916,28 @@ func blockAfter(src, marker string) string {
 	return rest[:end]
 }
 
+// tsBlock 返回前端源码里 marker 所在那个块的内容：从 marker 之后起，
+// 到第一个与 marker 行同缩进的收尾花括号（"}" 或 "})"）为止。
+//
+// 不复用 funcBody / blockAfter：那两个按 Go 的制表符缩进找收尾，
+// 而前端是 2 空格缩进，直接套会一路吃到文件末尾、让断言失去定位能力。
+func tsBlock(src, marker string) string {
+	i := strings.Index(src, marker)
+	if i < 0 {
+		return ""
+	}
+	indent := src[strings.LastIndex(src[:i], "\n")+1 : i]
+	if strings.TrimSpace(indent) != "" {
+		indent = "" // marker 不在行首时退化为顶层缩进
+	}
+	rest := src[i+len(marker):]
+	end := strings.Index(rest, "\n"+indent+"}")
+	if end < 0 {
+		return ""
+	}
+	return rest[:end]
+}
+
 // groupContaining 返回包含 needle 的那个 AddRouterGroup(...) 调用的源码片段。
 func groupContaining(src, needle string) string {
 	const marker = "taurus.Container.Http.AddRouterGroup(router.RouteGroup{"
@@ -1559,6 +1958,49 @@ func groupContaining(src, needle string) string {
 		}
 		start = i + end
 	}
+}
+
+// routerGroups 返回 RegisterRoutes 里**所有** AddRouterGroup(...) 调用的源码片段。
+//
+// 和 groupContaining 的区别是「遍历」而不是「查一个」：有些不变量是全集性质的
+// （例如「/admin/** 下一个路由组都不能漏挂后台限流」），按名字一个个点着查，
+// 下次新增路由组时断言会静默失效 —— 而那恰好就是漏挂发生的时刻。
+func routerGroups(src string) []string {
+	const marker = "taurus.Container.Http.AddRouterGroup(router.RouteGroup{"
+	var groups []string
+	for start := 0; ; {
+		i := strings.Index(src[start:], marker)
+		if i < 0 {
+			return groups
+		}
+		i += start
+		rest := src[i:]
+		end := strings.Index(rest, "\n\t})")
+		if end < 0 {
+			return groups
+		}
+		groups = append(groups, rest[:end])
+		start = i + end
+	}
+}
+
+// groupPrefix 取一个路由组的 Prefix 字面量（取不到返回空串）。
+func groupPrefix(group string) string {
+	i := strings.Index(group, "Prefix:")
+	if i < 0 {
+		return ""
+	}
+	rest := group[i+len("Prefix:"):]
+	open := strings.Index(rest, `"`)
+	if open < 0 {
+		return ""
+	}
+	rest = rest[open+1:]
+	end := strings.Index(rest, `"`)
+	if end < 0 {
+		return ""
+	}
+	return rest[:end]
 }
 
 // assertBaseline 底座必备产物：初始化 SQL 建齐 12 张表、权限数据与初始管理员到位，

@@ -129,12 +129,11 @@ function goBack() {
   router.push({ name: 'permission' })
 }
 
+// 接住加载失败：浮空的 Promise 失败会变成 Uncaught (in promise)，
+// 还会被 utils/frontError.ts 误报成前端异常。提示已由 http.ts 拦截器弹过。
 onMounted(() => {
-  if (isEdit.value) {
-    loadEditData()
-  } else {
-    loadPermissionTree()
-  }
+  const loading = isEdit.value ? loadEditData() : loadPermissionTree()
+  loading.catch(() => {})
 })
 </script>
 

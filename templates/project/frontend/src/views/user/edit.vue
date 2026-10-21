@@ -156,9 +156,15 @@ function goBack() {
 }
 
 onMounted(async () => {
-  await loadRoles()
-  if (isEdit.value) {
-    await loadEditData()
+  // 接住加载失败（提示已由 http.ts 拦截器弹过），避免未处理的 Promise rejection
+  // 被 utils/frontError.ts 误报成前端异常。
+  try {
+    await loadRoles()
+    if (isEdit.value) {
+      await loadEditData()
+    }
+  } catch {
+    // 已提示，无需额外处理
   }
 })
 </script>

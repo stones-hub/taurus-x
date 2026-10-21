@@ -6,15 +6,20 @@
 // 要守住的不变量：
 //  1. 基本放行/拒绝，单 IP 之间互不连坐；
 //  2. 令牌按时间回补，且回补的取整方式与被替换的公共库实现一致（不能变松）；
-//  3. 全局桶是独立的第二道闸；
+//  3. 全局桶是独立的第二道闸，且**可以不启用**（后台限流只按 IP）；
 //  4. 闲置且已回满的记录会被回收 —— 这是这次改动的目的；
 //  5. **没回满的记录绝不回收** —— 回收它等于给正在被限流的 IP 清零欠账；
-//  6. 记录数触顶时按既定策略降级，不崩、不无限增长；
-//  7. 并发访问不 race（配合 go test -race）。
+//  6. 记录数触顶时按既定策略降级，不崩、不无限增长，且清扫开销有上限；
+//  7. 超限留痕，但日志本身是节流的；
+//  8. 并发访问不 race（配合 go test -race）。
 package middleware
 
 import (
+	"bytes"
 	"fmt"
+	"log"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -42,16 +47,41 @@ func (c *fakeClock) Advance(d time.Duration) {
 	c.t = c.t.Add(d)
 }
 
-// newTestLimiter 造一个挂着假时钟的限流器。
+// captureLog 把标准 log 的输出接到一个 buffer 上，测试结束后还原。
+//
+// log 的输出目标是**全局状态**，所以用到它的测试不能 t.Parallel()：
+// 并行跑会互相抢 output，断言结果随机。
+func captureLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	flags := log.Flags()
+	log.SetOutput(buf)
+	log.SetFlags(0) // 去掉时间前缀，断言只看内容
+	t.Cleanup(func() {
+		log.SetOutput(os.Stderr)
+		log.SetFlags(flags)
+	})
+	return buf
+}
+
+// newTestLimiter 造一个挂着假时钟的限流器（名字固定为 test）。
 func newTestLimiter(ipCapacity, globalCapacity int, fillInterval time.Duration) (*ipRateLimiter, *fakeClock) {
+	return newNamedTestLimiter("test", ipCapacity, globalCapacity, fillInterval)
+}
+
+// newNamedTestLimiter 同上，但可以指定限流器名字（日志断言要用）。
+// globalCapacity <= 0 时不建全局桶（后台限流就是这种形态），所以那一段要判空。
+func newNamedTestLimiter(name string, ipCapacity, globalCapacity int, fillInterval time.Duration) (*ipRateLimiter, *fakeClock) {
 	clock := newFakeClock()
-	l := newIPRateLimiter(ipCapacity, globalCapacity, fillInterval)
+	l := newIPRateLimiter(name, ipCapacity, globalCapacity, fillInterval)
 	l.now = clock.Now
 	l.lastSweep = clock.Now()
 	// 全局桶和 per-IP 桶的时间基准也要挪到假时钟上，
 	// 否则真实时间与假时间的差值会被当成「已经过了很久」。
-	l.global.lastFill = clock.Now()
-	l.global.lastSeen = clock.Now()
+	if l.global != nil {
+		l.global.lastFill = clock.Now()
+		l.global.lastSeen = clock.Now()
+	}
 	return l, clock
 }
 
@@ -265,6 +295,7 @@ func TestIPRateLimiter_SweepIsThrottled(t *testing.T) {
 // TestIPRateLimiter_RespectsMaxEntries 记录数触顶时的行为：
 // 不再新增记录（内存有界），新来源降级为只受全局桶约束，不崩也不拒服务。
 func TestIPRateLimiter_RespectsMaxEntries(t *testing.T) {
+	captureLog(t) // 触顶会打降级告警日志，别刷到测试输出里
 	l, _ := newTestLimiter(1, 100000, time.Hour)
 	l.maxEntries = 10 // 调小上限，避免测试里真的灌 10 万条
 
@@ -299,6 +330,7 @@ func TestIPRateLimiter_RespectsMaxEntries(t *testing.T) {
 // TestIPRateLimiter_OverflowStillBoundedByGlobalBucket 触顶降级之后，
 // 总吞吐仍然被全局桶卡住 —— 这是降级策略能成立的前提。
 func TestIPRateLimiter_OverflowStillBoundedByGlobalBucket(t *testing.T) {
+	captureLog(t)
 	const globalCapacity = 3
 	l, _ := newTestLimiter(1, globalCapacity, time.Hour)
 	l.maxEntries = 1
@@ -320,9 +352,208 @@ func TestIPRateLimiter_OverflowStillBoundedByGlobalBucket(t *testing.T) {
 	}
 }
 
+// TestIPRateLimiter_NoGlobalBucketWhenCapacityNotPositive globalCapacity <= 0
+// 表示不建全局桶。后台接口限流靠的就是这个形态，所以它必须是显式契约，
+// 不能靠「传了个大数当作无限」糊过去。
+func TestIPRateLimiter_NoGlobalBucketWhenCapacityNotPositive(t *testing.T) {
+	for _, capacity := range []int{0, -1} {
+		l, _ := newTestLimiter(10, capacity, time.Second)
+		if l.global != nil {
+			t.Errorf("globalCapacity=%d 时不应建全局桶", capacity)
+		}
+	}
+}
+
+// TestIPRateLimiter_NoGlobalLayerLetsManyIPsThrough 没有全局桶时，
+// 大量不同 IP 都应放行：全站总额度被刻意去掉了，谁都不该被别人的流量连坐。
+//
+// 反过来说，如果哪天有人给后台限流器补上一个全局桶，这条测试会立刻失败 ——
+// 那是一次策略变更（一个人能刷光全站额度），必须是有意识的决定。
+func TestIPRateLimiter_NoGlobalLayerLetsManyIPsThrough(t *testing.T) {
+	// 单 IP 容量只有 1，但没有全局桶
+	l, _ := newTestLimiter(1, 0, time.Hour)
+
+	const sources = 500
+	for i := 0; i < sources; i++ {
+		ip := fmt.Sprintf("198.51.%d.%d", i/256, i%256)
+		if res := l.Allow(ip); !res.Allowed {
+			t.Fatalf("第 %d 个来源应放行（没有全站总额度），实际被拒，原因 %q", i+1, res.Reason)
+		}
+	}
+	// 每个 IP 自己的配额仍然生效
+	if l.Allow("198.51.0.0").Allowed {
+		t.Error("去掉全局桶不等于去掉单 IP 限流：同一个 IP 的第二次请求应被拒")
+	}
+}
+
+// TestIPRateLimiter_NoGlobalLayerOverflowFailsOpen 没有全局桶时记录数触顶的行为：
+// **放行**（fail open）并打节流日志，而不是拒绝新来源。
+//
+// 这是刻意选的那一侧，理由见 trackLocked 的注释：触顶即拒绝会把「10 万条记录
+// 上限」这道内存保护变成攻击者的武器 —— 用足够多的来源 IP 把表撑满，之后
+// 所有新来源（包括真实管理员）全部 429，整个后台对所有人锁死。
+// 后台限流本来就没有全站总额度，就是因为「一人自伤全站」比「被刷」更糟；
+// 触顶行为必须和这个取舍保持一致。
+func TestIPRateLimiter_NoGlobalLayerOverflowFailsOpen(t *testing.T) {
+	captureLog(t)
+	l, _ := newTestLimiter(1, 0, time.Hour)
+	l.maxEntries = 10 // 调小上限，避免测试里真的灌 10 万条
+
+	for i := 0; i < l.maxEntries; i++ {
+		if !l.Allow(fmt.Sprintf("203.0.113.%d", i)).Allowed {
+			t.Fatalf("第 %d 个 IP 的首次请求应放行", i+1)
+		}
+	}
+	if got := l.trackedIPs(); got != l.maxEntries {
+		t.Fatalf("记录数应为上限 %d，实际 %d", l.maxEntries, got)
+	}
+
+	// 触顶之后的新来源：放行，且不再新增记录（内存仍然有界）
+	for i := 0; i < 100; i++ {
+		if !l.Allow(fmt.Sprintf("198.51.100.%d", i)).Allowed {
+			t.Fatalf("触顶后第 %d 个新来源被拒了：内存保护不该变成拒绝服务", i+1)
+		}
+	}
+	if got := l.trackedIPs(); got > l.maxEntries {
+		t.Errorf("记录数突破了上限：期望 <= %d，实际 %d", l.maxEntries, got)
+	}
+
+	// 表内已有的 IP 仍然正常受单 IP 配额约束（容量 1，已用过一次）
+	if l.Allow("203.0.113.0").Allowed {
+		t.Error("表内已有的 IP 应继续受单 IP 配额约束")
+	}
+}
+
+// TestIPRateLimiter_ForcedSweepIsThrottledUnderOverflow 触顶时的强制清扫必须有上限。
+//
+// 表满之后每个新 IP 都会试着抢一个记录位，而清扫是**锁内 O(记录数)** 的全表扫描。
+// 不节流的话，「把表撑满」就能换来「每个请求都在锁内扫 10 万条」——
+// 限流器自己成了瓶颈，正好是攻击者想要的结果。
+func TestIPRateLimiter_ForcedSweepIsThrottledUnderOverflow(t *testing.T) {
+	captureLog(t)
+	l, clock := newTestLimiter(1, 0, time.Hour)
+	l.maxEntries = 10 // 调小上限，避免测试里真的灌 10 万条
+
+	// 先把表填满（这一段时间不推进，不会触发常规清扫）
+	for i := 0; i < l.maxEntries; i++ {
+		l.Allow(fmt.Sprintf("203.0.113.%d", i))
+	}
+	if got := l.sweepsDone(); got != 0 {
+		t.Fatalf("填表阶段不该发生清扫，实际 %d 次", got)
+	}
+
+	// 触顶状态下连续 2000 个新来源，时间不动：强制清扫最多 1 次
+	for i := 0; i < 2000; i++ {
+		l.Allow(fmt.Sprintf("198.51.%d.%d", i/256, i%256))
+	}
+	if got := l.sweepsDone(); got > 1 {
+		t.Errorf("同一个节流窗口内最多清扫 1 次，实际 %d 次（2000 个新来源 → 2000 次全表扫描？）", got)
+	}
+
+	// 时间推进时清扫可以再发生，但次数要跟着时间走、而不是跟着请求数走：
+	// 一共推进 20 秒，节流窗口是 1 秒，所以上限约 20 次，而请求数是 2000。
+	before := l.sweepsDone()
+	for i := 0; i < 2000; i++ {
+		clock.Advance(10 * time.Millisecond)
+		l.Allow(fmt.Sprintf("198.51.%d.%d", 100+i/256, i%256))
+	}
+	if got := l.sweepsDone() - before; got > 21 {
+		t.Errorf("清扫次数应受时间节流（20 秒 / 1 秒窗口 ≈ 20 次），实际 %d 次", got)
+	}
+
+	// 节流不能把「记录数有界」这条弄丢
+	if got := l.trackedIPs(); got > l.maxEntries {
+		t.Errorf("记录数突破了上限：期望 <= %d，实际 %d", l.maxEntries, got)
+	}
+}
+
+// TestIPRateLimiter_RejectionLogIsThrottled 超限要留痕，但每个限流器每个窗口只留一条。
+//
+// 两个方向都要守：一条都不打 = 限流把人挡住了和接口坏了在运维那边长得一样；
+// 每请求一条 = 一次被刷会把日志写成第二起故障（磁盘写满、有用日志被冲掉）。
+func TestIPRateLimiter_RejectionLogIsThrottled(t *testing.T) {
+	buf := captureLog(t)
+	l, clock := newNamedTestLimiter("login", 1, 0, time.Hour)
+
+	if !l.Allow("203.0.113.10").Allowed {
+		t.Fatal("首次请求应放行")
+	}
+	// 连续 100 次被拒
+	for i := 0; i < 100; i++ {
+		if l.Allow("203.0.113.10").Allowed {
+			t.Fatalf("第 %d 次请求应被拒（容量只有 1）", i+2)
+		}
+		l.noteRejection("203.0.113.10")
+	}
+
+	lines := logLines(buf)
+	if len(lines) != 1 {
+		t.Fatalf("同一窗口内 100 次拒绝应只打 1 条日志，实际 %d 条：\n%s", len(lines), buf.String())
+	}
+	// 内容要够用来定位：哪个桶、拒了多少次、最近一次来自谁
+	for _, want := range []string{"login", "203.0.113.10"} {
+		if !strings.Contains(lines[0], want) {
+			t.Errorf("日志应包含 %q，实际: %s", want, lines[0])
+		}
+	}
+	if !strings.Contains(lines[0], "1 次") {
+		t.Errorf("第一条日志是窗口内的第一次拒绝，次数应为 1，实际: %s", lines[0])
+	}
+
+	// 跨过节流窗口：下一条汇总日志带上这一窗口攒下的次数
+	clock.Advance(rateLimitRejectLogInterval)
+	l.noteRejection("203.0.113.11")
+	lines = logLines(buf)
+	if len(lines) != 2 {
+		t.Fatalf("跨过节流窗口后应再打 1 条，实际共 %d 条：\n%s", len(lines), buf.String())
+	}
+	if !strings.Contains(lines[1], "100 次") {
+		t.Errorf("第二条日志应汇总窗口内的 100 次拒绝（99 次被节流掉的 + 这次），实际: %s", lines[1])
+	}
+	if !strings.Contains(lines[1], "203.0.113.11") {
+		t.Errorf("日志应带最近一次被拒的来源 IP，实际: %s", lines[1])
+	}
+}
+
+// TestIPRateLimiter_RetryAfterSecondsRoundsUp Retry-After 只能用整秒，
+// 必须向上取整且至少 1 秒：向下取整会让守规矩的客户端在令牌还没回补时就重试，
+// 白吃一个 429；0 等于「立刻重试」，对限流毫无意义。
+func TestIPRateLimiter_RetryAfterSecondsRoundsUp(t *testing.T) {
+	cases := []struct {
+		fill time.Duration
+		want int
+	}{
+		{100 * time.Millisecond, 1}, // 后台限流默认（per_second=10）
+		{time.Second, 1},
+		{1500 * time.Millisecond, 2},
+		{2 * time.Second, 2},   // front_error
+		{6 * time.Second, 6},   // login
+		{30 * time.Second, 30}, // verify_code
+		{60 * time.Second, 60}, // send_code
+	}
+	for _, tc := range cases {
+		l, _ := newTestLimiter(1, 0, tc.fill)
+		if got := l.retryAfterSeconds(); got != tc.want {
+			t.Errorf("填充间隔 %v 的 Retry-After 应为 %d 秒，实际 %d", tc.fill, tc.want, got)
+		}
+	}
+}
+
+// logLines 把捕获到的日志切成非空行。
+func logLines(buf *bytes.Buffer) []string {
+	var lines []string
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
 // TestIPRateLimiter_ConcurrentAccess 并发安全。
 // 单独跑意义有限，主要价值是在 go test -race 下暴露数据竞争。
 func TestIPRateLimiter_ConcurrentAccess(t *testing.T) {
+	captureLog(t) // 拒绝路径会打节流日志，别让它刷到测试输出里
 	l, _ := newTestLimiter(100, 1000000, time.Millisecond)
 
 	const (
@@ -336,10 +567,13 @@ func TestIPRateLimiter_ConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < perG; i++ {
 				// 一半打同一个 IP（争同一个桶），一半打各自的 IP（争 map）
+				ip := fmt.Sprintf("198.51.100.%d", g)
 				if i%2 == 0 {
-					l.Allow("203.0.113.1")
-				} else {
-					l.Allow(fmt.Sprintf("198.51.100.%d", g))
+					ip = "203.0.113.1"
+				}
+				// 拒绝路径上的计数与节流日志也要进并发覆盖（它改的是限流器里的共享状态）
+				if !l.Allow(ip).Allowed {
+					l.noteRejection(ip)
 				}
 			}
 		}(g)

@@ -212,7 +212,7 @@ go install github.com/stones-hub/taurus-x@latest
 也可以安装指定版本，所有版本见 GitHub 的 [Releases](https://github.com/stones-hub/taurus-x/releases) 页面：
 
 ```bash
-go install github.com/stones-hub/taurus-x@v0.2.0
+go install github.com/stones-hub/taurus-x@v0.2.1
 ```
 
 安装后命令通常位于 `$(go env GOPATH)/bin`，需要该目录在 `PATH` 中。如果提示找不到命令，先检查安装目录，不必重复安装。
@@ -640,7 +640,7 @@ cd backend && go mod tidy && make wire
 - OTEL 默认关闭，需要你配置并启动 collector；TCP/gRPC 也不是选中后就自动带业务服务。
 - 真实 MySQL 并发交错、完整安全故障矩阵等仍有未验证边界；普通功能通过不代表这些边界已通过。
 - 从 v0.2.0 起密码用 bcrypt 存储，旧版生成的 SHA-256 散列账号在下次登录成功时自动升级。
-- 生成项目只有登录、发验证码、校验验证码、前端错误上报 4 个入口有限流，`/admin/**` 业务接口没有限流；面向公网时请在入口加 Nginx / WAF 限流。
+- 从 v0.2.1 起生成项目的后台接口（`/admin/**`）按 IP 限流，默认同一 IP 连续 300 次、之后每秒 10 次，可用 `ADMIN_RATE_LIMIT_BURST` / `ADMIN_RATE_LIMIT_PER_SECOND` 调整；没有全站总额度，面向公网时仍建议在入口加 Nginx / WAF 限流。
 - 日志表默认只保留 180 天，超期记录会被自动删除；需要长期留存的，部署前调整 `LOG_RETENTION_DAYS`。
 - 生成项目 README 还列有其他安全与功能待办，上生产前必须逐项评估。
 - Redis 会话白名单缺失或故障会拒绝认证；改密等操作会吊销旧会话。这些现象不能简单理解为“登录偶尔不稳定”。

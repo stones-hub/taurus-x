@@ -24,17 +24,22 @@ http:
 
   # 限流配置
   rate_limit:
-    composite:
-      enabled: true
-      ip_capacity: 5        # 每个 IP 令牌桶容量
-      global_capacity: 50   # 全局令牌桶容量
-      fill_interval: 1      # 填充令牌间隔（秒）
-    basic:
-      enabled: true
-      capacity: 10          # 令牌桶容量
-      fill_interval: 1      # 填充令牌间隔（秒）
+    # 后台接口（/admin/** 与 /user/refresh-token）的按 IP 限流。
+    # 语义：单 IP 突发上限 burst 次，之后每秒回补 per_second 个令牌。
+    # 同一个 IP 对所有后台接口共享这一份额度（三条后台链共用一个限流器实例）。
+    #
+    # 刻意**没有**全站总额度：后台是已登录用户的操作面，全站单桶意味着
+    # 一个人刷接口就能让所有人都用不了。要卡全站总量请在入口层（Nginx / WAF）做。
+    #
+    # 两项都写 0 = 关闭后台限流；只写一个 0、负数、非整数都会让服务拒绝启动
+    # （见 app/middleware/rate_limit.go 的 resolveAdminRateLimit）。
+    admin:
+      burst: ${ADMIN_RATE_LIMIT_BURST:300}          # 单 IP 突发上限
+      per_second: ${ADMIN_RATE_LIMIT_PER_SECOND:10} # 单 IP 每秒回补次数
     # 敏感接口的独立限流桶（每个路由组一套，互不挤占）。
     # 语义：单 IP 突发上限 ip_capacity 次，之后每 fill_interval 秒回一个令牌。
+    # 这几个是**匿名**入口，所以除了 per-IP 还各带一层 global_capacity 全站总额度：
+    # 多来源洪峰只能靠它兜住。
     sensitive:
       login:                  # 登录：抗口令爆破
         ip_capacity: 10

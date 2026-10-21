@@ -26,6 +26,7 @@ import (
 	"{{ .Module }}/app/crontab"
 	"{{ .Module }}/app/helper"
 	"{{ .Module }}/app/hooks"
+	"{{ .Module }}/app/middleware"
 	"{{ .Module }}/app/repo"
 	"{{ .Module }}/app/service"
 	"{{ .Module }}/internal/taurus"
@@ -194,6 +195,9 @@ func init() {
 	// 日志表定期清理（配置非法时在这里就让启动失败）
 	startLogCleanup()
 
+	// 后台接口按 IP 限流（配置非法时在这里就让启动失败）
+	initAdminRateLimit()
+
 	// 设置 Go 相关配置
 	setGoConfig()
 
@@ -245,6 +249,19 @@ func startLogCleanup() {
 	}
 	if stop := service.NewLogCleaner(repo.NewStore(), days).Start(); stop != nil {
 		cleanups = append([]func(){stop}, cleanups...)
+	}
+}
+
+// initAdminRateLimit 初始化后台接口（/admin/**）的按 IP 限流器。
+//
+// 放在这里而不是等第一个请求懒加载，有两个原因：
+//   - 限流参数配错（负数、拼成 abc、只把一个值写成 0）是安全配置错误，
+//     必须在启动时就炸出来，而不是等被爆破那天才发现限流其实没生效；
+//   - 三条后台链共用同一个限流器实例，必须在 RegisterRoutes 之前建好。
+//     init() 早于 main()，所以这个顺序是天然成立的。
+func initAdminRateLimit() {
+	if err := middleware.InitAdminRateLimiter(taurus.Container.Config.GetString); err != nil {
+		log.Fatalf("%s启动自检失败: %v%s\n", Red, err, Reset)
 	}
 }
 

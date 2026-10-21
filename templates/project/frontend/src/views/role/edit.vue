@@ -142,7 +142,11 @@ function goBack() {
   router.push({ name: 'role' })
 }
 
-onMounted(loadPermissionTree)
+// 接住加载失败（提示已由 http.ts 拦截器弹过），避免未处理的 Promise rejection
+// 被 utils/frontError.ts 误报成前端异常。
+onMounted(() => {
+  loadPermissionTree().catch(() => {})
+})
 </script>
 
 <template>

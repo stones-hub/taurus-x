@@ -1,10 +1,16 @@
 package middleware
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/stones-hub/taurus-pro-http/pkg/httpx"
 )
 
 // seedTrustedProxies 预热 ClientIP 的可信代理缓存。
@@ -18,10 +24,11 @@ func seedTrustedProxies() {
 // 限流挂了但请求照样打到业务上，等于没限流。
 func TestServeRateLimited_BlocksOverBudget(t *testing.T) {
 	seedTrustedProxies()
+	captureLog(t) // 超限会打节流日志，别刷到测试输出里
 
 	const capacity = 3
 	// fillInterval 给足够长，保证测试过程中不会回令牌
-	limiter := newIPRateLimiter(capacity, 1000, time.Hour)
+	limiter := newIPRateLimiter("login", capacity, 1000, time.Hour)
 
 	calls := 0
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -60,9 +67,10 @@ func TestServeRateLimited_BlocksOverBudget(t *testing.T) {
 // 否则随便改个 X-Real-IP 就能把登录限流绕过去，限流形同虚设。
 func TestServeRateLimited_ForgedHeaderCannotResetBudget(t *testing.T) {
 	seedTrustedProxies()
+	captureLog(t)
 
 	const capacity = 2
-	limiter := newIPRateLimiter(capacity, 1000, time.Hour)
+	limiter := newIPRateLimiter("login", capacity, 1000, time.Hour)
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 
 	// 同一个真实对端，先把配额用光
@@ -93,8 +101,9 @@ func TestServeRateLimited_ForgedHeaderCannotResetBudget(t *testing.T) {
 // TestServeRateLimited_SeparateIPsHaveOwnBudget 一个 IP 被限流不能连坐其它 IP。
 func TestServeRateLimited_SeparateIPsHaveOwnBudget(t *testing.T) {
 	seedTrustedProxies()
+	captureLog(t)
 
-	limiter := newIPRateLimiter(1, 1000, time.Hour)
+	limiter := newIPRateLimiter("login", 1, 1000, time.Hour)
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 
 	serve := func(ip string) int {
@@ -118,7 +127,17 @@ func TestServeRateLimited_SeparateIPsHaveOwnBudget(t *testing.T) {
 
 // TestSensitiveRateLimitDefaults 登录、验证码发送/校验、前端错误上报
 // 这四个敏感接口必须都有内置默认桶：漏一个就等于那条路由裸奔。
+//
+// 数值本身也钉住：这四个桶管的是抗口令爆破、抗 6 位码枚举、控短信成本、
+// 防日志表被灌 —— 把它们调松不会有任何报错，只会在被刷的那天才发现。
+// 要改这些数值就得同时改这里，于是必然是一次有意识的决定。
 func TestSensitiveRateLimitDefaults(t *testing.T) {
+	want := map[string]rateLimitRule{
+		"login":       {IPCapacity: 10, GlobalCapacity: 200, FillSeconds: 6},
+		"send_code":   {IPCapacity: 3, GlobalCapacity: 60, FillSeconds: 60},
+		"verify_code": {IPCapacity: 10, GlobalCapacity: 200, FillSeconds: 30},
+		"front_error": {IPCapacity: 30, GlobalCapacity: 300, FillSeconds: 2},
+	}
 	for _, name := range []string{"login", "send_code", "verify_code", "front_error"} {
 		rule, ok := sensitiveRateLimitDefaults[name]
 		if !ok {
@@ -128,6 +147,120 @@ func TestSensitiveRateLimitDefaults(t *testing.T) {
 		if rule.IPCapacity <= 0 || rule.GlobalCapacity <= 0 || rule.FillSeconds <= 0 {
 			t.Errorf("敏感接口 %q 的默认限流参数无效: %+v", name, rule)
 		}
+		if rule != want[name] {
+			t.Errorf("敏感接口 %q 的默认限流参数被改动：期望 %+v，实际 %+v（改松这些数值不会有任何报错，只会在被刷那天才发现）", name, want[name], rule)
+		}
+	}
+	// 多出来的名字也要被看见：没有路由挂的桶是死配置，有路由挂的桶就该在上面钉住数值
+	if len(sensitiveRateLimitDefaults) != len(want) {
+		t.Errorf("敏感接口默认值表应有 %d 项，实际 %d 项：新增/删除敏感桶要同步这条测试", len(want), len(sensitiveRateLimitDefaults))
+	}
+}
+
+// TestServeRateLimited_RejectionResponseShape 超限响应的三件事：
+// 真实 429 状态码、Retry-After 头、**中文提示在 data 里**。
+//
+// 最后一条最容易被改坏：httpx.SendResponse 的 message 由公共库按状态码写死
+// （429 → 英文 "Too Many Requests"），能由我们决定的只有 data。前端
+// extractError 因此是「data 字符串优先」的取值顺序；谁把提示从 data 挪到
+// 别处，用户看到的就会变成英文或兜底的「请求失败」。
+func TestServeRateLimited_RejectionResponseShape(t *testing.T) {
+	seedTrustedProxies()
+	captureLog(t) // 拒绝会打节流日志，别刷到测试输出里
+
+	// fillInterval 6 秒（= login 桶的默认值）→ Retry-After 应为 6
+	limiter := newIPRateLimiter("login", 1, 1000, 6*time.Second)
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+
+	serve := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+		req.RemoteAddr = "203.0.113.10:40000"
+		rec := httptest.NewRecorder()
+		serveRateLimited(rec, req, limiter, next)
+		return rec
+	}
+
+	if rec := serve(); rec.Code != http.StatusOK {
+		t.Fatalf("首次请求应放行，实际 %d", rec.Code)
+	}
+
+	rec := serve()
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("超额请求应返回真实 429（不是 200 + body.code），实际 %d", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "6" {
+		t.Errorf("Retry-After 应为桶的填充间隔向上取整秒（6），实际 %q", got)
+	}
+
+	var body struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    string `json:"data"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("响应体应是 JSON: %v", err)
+	}
+	if body.Code != http.StatusTooManyRequests {
+		t.Errorf("body.code 应为 429，实际 %d", body.Code)
+	}
+	if body.Data != rateLimitedMessage {
+		t.Errorf("中文提示必须在 data 里（前端按 data 优先取值），期望 %q，实际 %q", rateLimitedMessage, body.Data)
+	}
+	// 固定住公共库的行为：message 是英文，所以前端不能只读 message。
+	// 这里失败说明公共库改了 429 的 message —— 那就该回头检查前端的取值顺序。
+	if body.Message != "Too Many Requests" {
+		t.Errorf("httpx 对 429 的 message 应是公共库固定的英文（提示才必须放 data），实际 %q", body.Message)
+	}
+}
+
+// TestServeRateLimited_RejectionIsLoggedWithLimiterName 超限要留痕：
+// 日志得说清是哪个桶拦的、拒了多少次、最近一次来自哪个 IP。
+// 没有这条日志的话，「限流把人挡住了」和「接口坏了」在运维那边长得一模一样。
+// 节流本身（每个桶每分钟 1 条）在 ip_rate_limiter_test.go 里单独测。
+func TestServeRateLimited_RejectionIsLoggedWithLimiterName(t *testing.T) {
+	seedTrustedProxies()
+	buf := captureLog(t)
+
+	limiter := newIPRateLimiter("send_code", 1, 1000, time.Hour)
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/admin/user/send-code", nil)
+		req.RemoteAddr = "203.0.113.77:40000"
+		serveRateLimited(httptest.NewRecorder(), req, limiter, next)
+	}
+
+	out := buf.String()
+	for _, want := range []string{"send_code", "203.0.113.77"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("被限流的请求应留下含 %q 的日志，实际输出: %q", want, out)
+		}
+	}
+	if lines := logLines(buf); len(lines) != 1 {
+		t.Errorf("同一窗口内多次拒绝只该打 1 条汇总日志，实际 %d 条: %q", len(lines), out)
+	}
+}
+
+// TestServeRateLimited_AllowedRequestsAreSilent 放行的请求不打日志、不带 Retry-After。
+// 正常流量每条都打日志的话，日志量会直接压垮磁盘。
+func TestServeRateLimited_AllowedRequestsAreSilent(t *testing.T) {
+	seedTrustedProxies()
+	buf := captureLog(t)
+
+	limiter := newIPRateLimiter("login", 100, 1000, time.Hour)
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+
+	for i := 0; i < 20; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/auth/login", nil)
+		req.RemoteAddr = fmt.Sprintf("203.0.113.%d:40000", i)
+		rec := httptest.NewRecorder()
+		serveRateLimited(rec, req, limiter, next)
+		if rec.Header().Get("Retry-After") != "" {
+			t.Fatalf("放行的响应不该带 Retry-After")
+		}
+	}
+	if out := buf.String(); out != "" {
+		t.Errorf("放行的请求不该打日志，实际输出: %q", out)
 	}
 }
 
@@ -175,5 +308,469 @@ func TestResolveSensitiveRule(t *testing.T) {
 	// 这是有意的：未登记的名字不该凭空造出一个限流桶。
 	if got := resolveSensitiveRule("not_registered", noConfig); got != (rateLimitRule{}) {
 		t.Errorf("未登记的名字且无配置时应为零值，实际 %+v", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 后台接口（/admin/**）按 IP 限流
+// ---------------------------------------------------------------------------
+
+// stubConfig 把一组 key→value 包成 GetString 的形态；未列出的键返回空串（= 未配置）。
+func stubConfig(kv map[string]string) func(string) string {
+	return func(key string) string { return kv[key] }
+}
+
+// TestResolveAdminRateLimit_Defaults 两项都没配时取内置默认值 300 / 10。
+// 默认值被改小会悄悄影响所有未显式配置的部署，所以把数值本身钉住。
+func TestResolveAdminRateLimit_Defaults(t *testing.T) {
+	cfg, err := resolveAdminRateLimit(stubConfig(nil))
+	if err != nil {
+		t.Fatalf("未配置时不应报错: %v", err)
+	}
+	if cfg.Burst != 300 || cfg.PerSecond != 10 {
+		t.Errorf("默认值应为 burst=300 / per_second=10，实际 %+v", cfg)
+	}
+	if !cfg.Enabled() {
+		t.Error("默认配置应是启用状态")
+	}
+	if got := cfg.FillInterval(); got != 100*time.Millisecond {
+		t.Errorf("per_second=10 时填充间隔应为 100ms，实际 %v", got)
+	}
+}
+
+// TestResolveAdminRateLimit_CustomValues 合法自定义值按配置生效。
+func TestResolveAdminRateLimit_CustomValues(t *testing.T) {
+	cfg, err := resolveAdminRateLimit(stubConfig(map[string]string{
+		adminRateLimitBurstKey:     "50",
+		adminRateLimitPerSecondKey: "4",
+	}))
+	if err != nil {
+		t.Fatalf("合法配置不应报错: %v", err)
+	}
+	if cfg.Burst != 50 || cfg.PerSecond != 4 {
+		t.Errorf("应按配置生效，实际 %+v", cfg)
+	}
+	if got := cfg.FillInterval(); got != 250*time.Millisecond {
+		t.Errorf("per_second=4 时填充间隔应为 250ms，实际 %v", got)
+	}
+}
+
+// TestResolveAdminRateLimit_BothZeroDisables 两项都写 0 = 显式关闭后台限流。
+func TestResolveAdminRateLimit_BothZeroDisables(t *testing.T) {
+	cfg, err := resolveAdminRateLimit(stubConfig(map[string]string{
+		adminRateLimitBurstKey:     "0",
+		adminRateLimitPerSecondKey: "0",
+	}))
+	if err != nil {
+		t.Fatalf("两项都为 0 是合法的「关闭」，不应报错: %v", err)
+	}
+	if cfg.Enabled() {
+		t.Error("两项都为 0 时应为关闭状态")
+	}
+}
+
+// TestResolveAdminRateLimit_RejectsInvalid 非法配置必须报错，让启动失败。
+//
+// 最关键的是 "abc" 和「只有一个 0」这两类：它们如果被静默当成 0，
+// 结果就是**限流悄悄没生效**，而运维看着配置文件以为它开着。
+// 这也是这里用 GetString 而不是 GetInt 的原因（GetInt 会把 abc 变成 0）。
+func TestResolveAdminRateLimit_RejectsInvalid(t *testing.T) {
+	cases := []struct {
+		name      string
+		burst     string
+		perSecond string
+	}{
+		{"burst 为负", "-1", "10"},
+		{"per_second 为负", "300", "-5"},
+		{"burst 非整数", "abc", "10"},
+		{"per_second 非整数", "300", "10.5"},
+		{"burst 带单位后缀", "300req", "10"},
+		{"只有 burst 为 0", "0", "10"},
+		{"只有 per_second 为 0", "300", "0"},
+		{"per_second 刚过上限", "300", "10001"},
+		{"per_second 大到填充间隔归零（上限之上，顺带防住除零 panic）", "300", "2000000000"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := resolveAdminRateLimit(stubConfig(map[string]string{
+				adminRateLimitBurstKey:     tc.burst,
+				adminRateLimitPerSecondKey: tc.perSecond,
+			}))
+			if err == nil {
+				t.Fatalf("burst=%q per_second=%q 应报错让启动失败，实际通过了", tc.burst, tc.perSecond)
+			}
+		})
+	}
+}
+
+// TestResolveAdminRateLimit_AcceptsPerSecondCeiling 上限本身是合法值（边界含在内），
+// 并且在上限处填充间隔仍然算得出来（不为 0，refill 不会除零）。
+//
+// 和上面「刚过上限」那条合起来把 maxAdminRateLimitPerSecond 钉死在 10000：
+// 改动这个常量会立刻有一条测试失败，而不是悄悄放宽/收紧一个安全参数。
+func TestResolveAdminRateLimit_AcceptsPerSecondCeiling(t *testing.T) {
+	cfg, err := resolveAdminRateLimit(stubConfig(map[string]string{
+		adminRateLimitBurstKey:     "300",
+		adminRateLimitPerSecondKey: "10000",
+	}))
+	if err != nil {
+		t.Fatalf("per_second 等于上限 %d 应该合法: %v", maxAdminRateLimitPerSecond, err)
+	}
+	if cfg.PerSecond != maxAdminRateLimitPerSecond {
+		t.Errorf("per_second 应为 %d，实际 %d", maxAdminRateLimitPerSecond, cfg.PerSecond)
+	}
+	if got := cfg.FillInterval(); got != 100*time.Microsecond {
+		t.Errorf("per_second=%d 时填充间隔应为 100µs，实际 %v", maxAdminRateLimitPerSecond, got)
+	}
+}
+
+// TestResolveAdminRateLimit_TrimsWhitespace 占位符替换后留下的空白不应变成解析错误。
+func TestResolveAdminRateLimit_TrimsWhitespace(t *testing.T) {
+	cfg, err := resolveAdminRateLimit(stubConfig(map[string]string{
+		adminRateLimitBurstKey:     "  20 ",
+		adminRateLimitPerSecondKey: "\t5\n",
+	}))
+	if err != nil {
+		t.Fatalf("带空白的合法值不应报错: %v", err)
+	}
+	if cfg.Burst != 20 || cfg.PerSecond != 5 {
+		t.Errorf("应为 burst=20 / per_second=5，实际 %+v", cfg)
+	}
+}
+
+// TestInitAdminRateLimiter_BuildsIPOnlyLimiter 启动初始化后，限流器参数要对上配置，
+// 并且**没有全局桶** —— 后台限流不设全站总额度是这次方案的核心取舍。
+func TestInitAdminRateLimiter_BuildsIPOnlyLimiter(t *testing.T) {
+	t.Cleanup(resetAdminLimiter)
+
+	if err := InitAdminRateLimiter(stubConfig(map[string]string{
+		adminRateLimitBurstKey:     "7",
+		adminRateLimitPerSecondKey: "20",
+	})); err != nil {
+		t.Fatalf("InitAdminRateLimiter 失败: %v", err)
+	}
+	if adminLimiter == nil {
+		t.Fatal("配置合法时应建出限流器")
+	}
+	if adminLimiter.global != nil {
+		t.Error("后台限流器不该有全局桶：全站单桶会让一个人刷光所有人的额度")
+	}
+	if adminLimiter.ipCapacity != 7 {
+		t.Errorf("单 IP 容量应为 burst=7，实际 %d", adminLimiter.ipCapacity)
+	}
+	if adminLimiter.fillInterval != 50*time.Millisecond {
+		t.Errorf("per_second=20 时填充间隔应为 50ms，实际 %v", adminLimiter.fillInterval)
+	}
+}
+
+// TestInitAdminRateLimiter_DisabledAndInvalid 关闭时限流器为 nil（放行）；
+// 配置非法时返回 error 供启动阶段 Fatal。
+func TestInitAdminRateLimiter_DisabledAndInvalid(t *testing.T) {
+	t.Cleanup(resetAdminLimiter)
+
+	if err := InitAdminRateLimiter(stubConfig(map[string]string{
+		adminRateLimitBurstKey:     "0",
+		adminRateLimitPerSecondKey: "0",
+	})); err != nil {
+		t.Fatalf("显式关闭不应报错: %v", err)
+	}
+	if adminLimiter != nil {
+		t.Error("关闭后台限流时限流器应为 nil")
+	}
+
+	if err := InitAdminRateLimiter(stubConfig(map[string]string{
+		adminRateLimitBurstKey: "-3",
+	})); err == nil {
+		t.Error("非法配置应返回 error，让 bootstrap 终止启动")
+	}
+}
+
+// 下面三个辅助函数读写的是**包级**状态（adminLimiter / adminLimiterReady /
+// adminLimiterWarnOnce），所以用到它们的测试一律不能 t.Parallel()：
+// 并行跑会互相覆盖限流器，断言结果随机。
+// 同理，带 captureLog 的测试也不能并行（log 的输出目标也是全局的）。
+
+// resetAdminLimiter 把包级状态恢复成「从未初始化」，避免测试之间互相污染。
+// 三个变量要一起复位：只清 adminLimiter 的话，下一个测试拿到的是
+// 「限流器为 nil 但 ready=true」，恰好等于「配置关闭」，
+// 于是「未初始化要告警」那条测试永远看不到告警。
+func resetAdminLimiter() {
+	adminLimiter = nil
+	adminLimiterReady = false
+	adminLimiterWarnOnce = sync.Once{}
+}
+
+// newAdminTestLimiter 直接装一个挂假时钟的后台限流器（无全局桶），返回时钟。
+// 同时把 ready 置真：这是在模拟「启动时正常初始化过」，不该触发未初始化告警。
+func newAdminTestLimiter(burst, perSecond int) *fakeClock {
+	cfg := adminRateLimitConfig{Burst: burst, PerSecond: perSecond}
+	l, clock := newTestLimiter(cfg.Burst, 0, cfg.FillInterval())
+	adminLimiter = l
+	adminLimiterReady = true
+	return clock
+}
+
+// adminRequest 发一个请求给 AdminRateLimitMiddleware 包起来的 next，返回状态码。
+func adminRequest(ip string, next http.Handler) int {
+	req := httptest.NewRequest(http.MethodGet, "/admin/user/list", nil)
+	req.RemoteAddr = ip + ":40000"
+	rec := httptest.NewRecorder()
+	AdminRateLimitMiddleware()(next).ServeHTTP(rec, req)
+	return rec.Code
+}
+
+// TestAdminRateLimitMiddleware_BurstThenRefill 突发 burst 次后第 burst+1 次被拒；
+// per_second=10 时每 100ms 回一个令牌。用假时钟断言，不 sleep。
+func TestAdminRateLimitMiddleware_BurstThenRefill(t *testing.T) {
+	seedTrustedProxies()
+	t.Cleanup(resetAdminLimiter)
+	captureLog(t) // 被限流会打节流日志，别刷到测试输出里
+
+	const burst = 5
+	clock := newAdminTestLimiter(burst, 10)
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+
+	for i := 0; i < burst; i++ {
+		if code := adminRequest("203.0.113.10", next); code != http.StatusOK {
+			t.Fatalf("突发额度内第 %d 次请求应放行，实际 %d", i+1, code)
+		}
+	}
+	if code := adminRequest("203.0.113.10", next); code != http.StatusTooManyRequests {
+		t.Fatalf("第 %d 次请求应被限流并返回 429，实际 %d", burst+1, code)
+	}
+
+	// 不足一个填充间隔：不回令牌
+	clock.Advance(99 * time.Millisecond)
+	if code := adminRequest("203.0.113.10", next); code != http.StatusTooManyRequests {
+		t.Fatalf("不到 100ms 就回了令牌，限流被放松了，实际 %d", code)
+	}
+
+	// 跨过 100ms：回一个令牌，正好够一次请求
+	clock.Advance(100 * time.Millisecond)
+	if code := adminRequest("203.0.113.10", next); code != http.StatusOK {
+		t.Fatalf("per_second=10 时每 100ms 应回一个令牌，实际 %d", code)
+	}
+	if code := adminRequest("203.0.113.10", next); code != http.StatusTooManyRequests {
+		t.Fatalf("100ms 只该回一个令牌，实际 %d", code)
+	}
+}
+
+// TestAdminRateLimitMiddleware_SeparateIPsAndNoGlobalQuota 不同 IP 互不影响，
+// 且没有全站总额度：大量不同来源都能通过（一个人刷接口不该让别人也进不来）。
+func TestAdminRateLimitMiddleware_SeparateIPsAndNoGlobalQuota(t *testing.T) {
+	seedTrustedProxies()
+	t.Cleanup(resetAdminLimiter)
+	captureLog(t)
+
+	newAdminTestLimiter(1, 10)
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+
+	// 第一个 IP 把自己的 1 次额度用光
+	if code := adminRequest("203.0.113.10", next); code != http.StatusOK {
+		t.Fatalf("首次请求应放行，实际 %d", code)
+	}
+	if code := adminRequest("203.0.113.10", next); code != http.StatusTooManyRequests {
+		t.Fatalf("同一 IP 超额应 429，实际 %d", code)
+	}
+
+	// 另外 200 个来源每人都还有自己的额度，不被连坐
+	for i := 0; i < 200; i++ {
+		ip := fmt.Sprintf("198.51.%d.%d", i/256, i%256)
+		if code := adminRequest(ip, next); code != http.StatusOK {
+			t.Fatalf("第 %d 个来源被连坐了（后台限流不设全站总额度），实际 %d", i+1, code)
+		}
+	}
+}
+
+// TestAdminRateLimitMiddleware_SharedAcrossChains 三条后台链必须共用同一份额度。
+//
+// 这里用两个独立构造的中间件实例模拟两条链：它们各自调用
+// AdminRateLimitMiddleware()，但读的是同一个包级限流器。
+// 如果哪天改成「每条链各建一个限流器」，同一个 IP 对 /admin/** 就有三份配额，
+// 换条链就能接着刷，配置里写的「每秒 10 次」实际是每秒 30 次 —— 这条测试会失败。
+func TestAdminRateLimitMiddleware_SharedAcrossChains(t *testing.T) {
+	seedTrustedProxies()
+	t.Cleanup(resetAdminLimiter)
+	captureLog(t)
+
+	newAdminTestLimiter(2, 10)
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+
+	// 模拟 userBaseChain 和 userProtectedChain 各自那一层
+	chainA := AdminRateLimitMiddleware()(next)
+	chainB := AdminRateLimitMiddleware()(next)
+
+	serve := func(h http.Handler) int {
+		req := httptest.NewRequest(http.MethodGet, "/admin/user/list", nil)
+		req.RemoteAddr = "203.0.113.10:40000"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	// 在 A 链上把 2 次额度耗尽
+	for i := 0; i < 2; i++ {
+		if code := serve(chainA); code != http.StatusOK {
+			t.Fatalf("A 链第 %d 次请求应放行，实际 %d", i+1, code)
+		}
+	}
+	// 同一个 IP 换到 B 链，额度已经没了
+	if code := serve(chainB); code != http.StatusTooManyRequests {
+		t.Errorf("三条后台链应共用一份额度：同 IP 在 B 链上也该被 429，实际 %d", code)
+	}
+}
+
+// TestAdminRateLimitMiddleware_BlocksBeforeAuth 被限流的请求不进入后面的认证环节。
+//
+// 对应路由上「BodyLimit → 后台限流 → JWT」的顺序：未带 Token 的洪水请求超限后
+// 应该拿到 429，而不是走完一遍 Token 解析再拿 401。挂到 JWT 之后的话，
+// 刷接口的流量每次都能白白消耗一次鉴权开销。
+// 这里用一个「总是 401」的 handler 顶替 JWTMiddleware（真的 JWT 中间件要读配置容器），
+// 路由上的实际顺序由 generator_test 的文本断言守住。
+func TestAdminRateLimitMiddleware_BlocksBeforeAuth(t *testing.T) {
+	seedTrustedProxies()
+	t.Cleanup(resetAdminLimiter)
+	captureLog(t)
+
+	newAdminTestLimiter(1, 10)
+
+	authCalls := 0
+	fakeJWT := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		authCalls++
+		httpx.SendResponse(w, http.StatusUnauthorized, "缺少JWT令牌", nil)
+	})
+
+	// 第一次：额度还在，走到「JWT」那一层（401 经 httpx 映射成 HTTP 200 + body.code）
+	if code := adminRequest("203.0.113.10", fakeJWT); code != http.StatusOK {
+		t.Fatalf("额度内的请求应进入鉴权环节，实际 %d", code)
+	}
+	if authCalls != 1 {
+		t.Fatalf("额度内的请求应调用一次鉴权，实际 %d 次", authCalls)
+	}
+
+	// 第二次：超限，必须在限流这一层就返回 429，不碰鉴权
+	if code := adminRequest("203.0.113.10", fakeJWT); code != http.StatusTooManyRequests {
+		t.Errorf("超限请求应返回 429，实际 %d", code)
+	}
+	if authCalls != 1 {
+		t.Errorf("超限请求不该进入鉴权环节，鉴权共被调用 %d 次", authCalls)
+	}
+}
+
+// TestAdminRateLimitMiddleware_DisabledPassesThrough 关闭后台限流（两项都为 0）时
+// 中间件必须放行，不能因为限流器是 nil 就把请求拦掉或 panic。
+func TestAdminRateLimitMiddleware_DisabledPassesThrough(t *testing.T) {
+	seedTrustedProxies()
+	t.Cleanup(resetAdminLimiter)
+
+	if err := InitAdminRateLimiter(stubConfig(map[string]string{
+		adminRateLimitBurstKey:     "0",
+		adminRateLimitPerSecondKey: "0",
+	})); err != nil {
+		t.Fatalf("显式关闭不应报错: %v", err)
+	}
+
+	calls := 0
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+	})
+	for i := 0; i < 50; i++ {
+		if code := adminRequest("203.0.113.10", next); code != http.StatusOK {
+			t.Fatalf("关闭限流后第 %d 次请求应放行，实际 %d", i+1, code)
+		}
+	}
+	if calls != 50 {
+		t.Errorf("关闭限流后所有请求都应进入 handler，实际 %d 次", calls)
+	}
+}
+
+// TestAdminRateLimitMiddleware_ForgedHeaderCannotResetBudget 伪造转发头换不到新额度。
+// 否则随便改个 X-Real-IP 就能把后台限流绕过去。
+func TestAdminRateLimitMiddleware_ForgedHeaderCannotResetBudget(t *testing.T) {
+	seedTrustedProxies()
+	t.Cleanup(resetAdminLimiter)
+	captureLog(t)
+
+	newAdminTestLimiter(1, 10)
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+
+	if code := adminRequest("203.0.113.10", next); code != http.StatusOK {
+		t.Fatalf("首次请求应放行，实际 %d", code)
+	}
+	for _, forged := range []string{"1.2.3.4", "5.6.7.8"} {
+		req := httptest.NewRequest(http.MethodGet, "/admin/user/list", nil)
+		req.RemoteAddr = "203.0.113.10:40000"
+		req.Header.Set("X-Real-IP", forged)
+		req.Header.Set("X-Forwarded-For", forged)
+		rec := httptest.NewRecorder()
+		AdminRateLimitMiddleware()(next).ServeHTTP(rec, req)
+		if rec.Code != http.StatusTooManyRequests {
+			t.Errorf("伪造来源 %s 仍应被限流，实际 %d", forged, rec.Code)
+		}
+	}
+}
+
+// TestAdminRateLimitMiddleware_UninitializedWarnsOnceAndPassesThrough
+// 「限流器从未初始化」要和「配置里关掉了限流」区分开。
+//
+// 两者的行为都是放行，没法从外部区分；但前者是接线事故（比如将来多一个入口
+// 二进制、没走 app 包的 init()），后果是 /admin/** 完全不限流而没人知道。
+// 所以未初始化时在第一个请求上告警一次 —— 一次，不是每请求一次，
+// 否则这条日志会把它想保护的日志盘写满。
+func TestAdminRateLimitMiddleware_UninitializedWarnsOnceAndPassesThrough(t *testing.T) {
+	seedTrustedProxies()
+	t.Cleanup(resetAdminLimiter)
+	buf := captureLog(t)
+
+	// 刻意不调用 InitAdminRateLimiter，也不装限流器
+	resetAdminLimiter()
+
+	calls := 0
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+	})
+	for i := 0; i < 20; i++ {
+		if code := adminRequest("203.0.113.10", next); code != http.StatusOK {
+			t.Fatalf("未初始化时第 %d 次请求应放行（中间件不该因为没被接上就把后台打挂），实际 %d", i+1, code)
+		}
+	}
+	if calls != 20 {
+		t.Errorf("未初始化时所有请求都应进入 handler，实际 %d 次", calls)
+	}
+
+	lines := logLines(buf)
+	if len(lines) != 1 {
+		t.Fatalf("未初始化应只告警 1 次，实际 %d 条：\n%s", len(lines), buf.String())
+	}
+	if !strings.Contains(lines[0], "InitAdminRateLimiter") {
+		t.Errorf("告警应点明缺的是哪一步（InitAdminRateLimiter），实际: %s", lines[0])
+	}
+}
+
+// TestAdminRateLimitMiddleware_DisabledDoesNotWarn 配置里显式关闭是运维的合法选择，
+// 不该跟着打告警 —— 否则这条日志每次启动都在喊，真正的接线事故就被淹掉了。
+func TestAdminRateLimitMiddleware_DisabledDoesNotWarn(t *testing.T) {
+	seedTrustedProxies()
+	t.Cleanup(resetAdminLimiter)
+	buf := captureLog(t)
+
+	if err := InitAdminRateLimiter(stubConfig(map[string]string{
+		adminRateLimitBurstKey:     "0",
+		adminRateLimitPerSecondKey: "0",
+	})); err != nil {
+		t.Fatalf("显式关闭不应报错: %v", err)
+	}
+
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	for i := 0; i < 5; i++ {
+		if code := adminRequest("203.0.113.10", next); code != http.StatusOK {
+			t.Fatalf("关闭限流后第 %d 次请求应放行，实际 %d", i+1, code)
+		}
+	}
+	if lines := logLines(buf); len(lines) != 0 {
+		t.Errorf("显式关闭不该告警，实际打了 %d 条：\n%s", len(lines), buf.String())
 	}
 }

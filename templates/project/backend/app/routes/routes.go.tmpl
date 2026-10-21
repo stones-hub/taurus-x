@@ -113,9 +113,19 @@ func RegisterRoutes() {
 	})
 
 	// 基础用户链：JWT + 会话校验 + 访问日志 + CSRF（不校验接口权限，供「读自己」的基础功能）
+	//
+	// 下面三条后台链都挂 AdminRateLimitMiddleware，且用的是**同一个**限流器实例
+	// （tmid 包里的包级变量，启动时建好）。这是有意的：同一个 IP 对所有 /admin/**
+	// 共享一份额度，否则换一条链就能接着刷，配置里的「每秒 10 次」会变成每秒 30 次。
+	// 位置固定在 BodyLimit 之后、JWT 之前 —— 未登录的洪水请求也要挡住。
+	//
+	// /admin/** 下还有两条内联链（手机号绑定/解绑、发送验证码），它们也挂了同一个
+	// 后台限流，再各自叠一个更严的专用桶。规则是「/admin/** 一个不漏」，
+	// 由 generator_test 的结构化断言遍历所有路由组守住，不靠人记。
 	userBaseChain := []router.MiddlewareFunc{
 		recovery(),
 		tmid.BodyLimitMiddleware(),
+		tmid.AdminRateLimitMiddleware(),
 		tmid.JWTMiddleware(),
 		tmid.SessionValidatorMiddleware(),
 		tmid.AccessLogMiddleware(),
@@ -128,6 +138,7 @@ func RegisterRoutes() {
 	userSelfServiceChain := []router.MiddlewareFunc{
 		recovery(),
 		tmid.BodyLimitMiddleware(),
+		tmid.AdminRateLimitMiddleware(),
 		tmid.JWTMiddleware(),
 		tmid.SessionValidatorMiddleware(),
 		tmid.AccessLogMiddleware(),
@@ -139,6 +150,7 @@ func RegisterRoutes() {
 	userProtectedChain := []router.MiddlewareFunc{
 		recovery(),
 		tmid.BodyLimitMiddleware(),
+		tmid.AdminRateLimitMiddleware(),
 		tmid.JWTMiddleware(),
 		tmid.SessionValidatorMiddleware(),
 		tmid.AccessLogMiddleware(),
@@ -147,7 +159,11 @@ func RegisterRoutes() {
 		tmid.CSRFMiddleware(),
 	}
 
-	// 令牌刷新
+	// 令牌刷新。
+	//
+	// 用 userBaseChain，所以它也计入后台额度。取舍：正常会话每隔几十分钟才刷一次，
+	// 占掉的额度可以忽略；而把它排除在外就留下一个「带 Token 就能全速打」的接口，
+	// 它背后是一次签名 + 一次会话写入，恰恰是不该让人白嫖的那类开销。
 	taurus.Container.Http.AddRouterGroup(router.RouteGroup{
 		Prefix:     "/user",
 		Middleware: userBaseChain,
@@ -176,12 +192,15 @@ func RegisterRoutes() {
 		},
 	})
 
-	// 手机号绑定/解绑：要校验短信验证码，额外挂验证码校验限流（抗 6 位码枚举）
+	// 手机号绑定/解绑：要校验短信验证码，额外挂验证码校验限流（抗 6 位码枚举）。
+	// 这条链是 userProtectedChain 加一个 verify_code 桶。后台限流照常挂在最前面：
+	// verify_code 桶只管验证码这一类请求，不替代「这个 IP 对 /admin/** 的总额度」。
 	taurus.Container.Http.AddRouterGroup(router.RouteGroup{
 		Prefix: "/admin/user",
 		Middleware: []router.MiddlewareFunc{
 			recovery(),
 			tmid.BodyLimitMiddleware(),
+			tmid.AdminRateLimitMiddleware(),
 			tmid.NamedRateLimitMiddleware("verify_code"),
 			tmid.JWTMiddleware(),
 			tmid.SessionValidatorMiddleware(),
@@ -212,11 +231,16 @@ func RegisterRoutes() {
 
 	// 发送验证码（无需 JWT，供登录/绑定/解绑共用）。
 	// 短信有真金白银的成本，单独一套更紧的限流桶；并记访问日志（验证码已脱敏）。
+	//
+	// 后台限流排在 send_code 桶**之前**：两者卡的是不同的东西 —— 后台限流是这个 IP
+	// 对 /admin/** 的总额度，send_code 是短信这一项的专用额度。先过总额度再过专用桶，
+	// 顺带让 /admin/** 下没有任何一个口子游离在后台额度之外（规则统一，不用维护白名单）。
 	taurus.Container.Http.AddRouterGroup(router.RouteGroup{
 		Prefix: "/admin/user",
 		Middleware: []router.MiddlewareFunc{
 			recovery(),
 			tmid.BodyLimitMiddleware(),
+			tmid.AdminRateLimitMiddleware(),
 			tmid.NamedRateLimitMiddleware("send_code"),
 			tmid.AccessLogMiddleware(),
 		},
@@ -246,7 +270,8 @@ func RegisterRoutes() {
 	})
 
 	// 前端错误上报（公共路由，无需登录）。
-	// 唯一的匿名写入口：必须限制请求体大小并限流，否则谁都能往日志表里灌数据。
+	// 匿名写入口（另一个是 /admin/user/send-code）：必须限制请求体大小并限流，
+	// 否则谁都能往日志表里灌数据。
 	taurus.Container.Http.AddRouter(router.Router{
 		Path:    "/report-front-error",
 		Handler: http.HandlerFunc(app.Core.LogController.ReportFrontError),

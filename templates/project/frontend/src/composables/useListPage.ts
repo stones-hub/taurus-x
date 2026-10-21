@@ -119,8 +119,12 @@ export function useListPage<T, F extends object, P = F>(options: UseListPageOpti
     }
   }
 
+  // 首屏加载。必须接住错误：这里是个浮空的 Promise，失败就是控制台的
+  // Uncaught (in promise)，还会被 utils/frontError.ts 当成前端 JS 异常上报。
+  // 提示已由 api/http.ts 的拦截器弹过，这里不重复弹；loading 由 loadTableData
+  // 自己的 finally 复位。
   onMounted(() => {
-    loadTableData()
+    loadTableData().catch(() => {})
   })
 
   return {

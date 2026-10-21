@@ -3,7 +3,7 @@
 // 上报到后端 /report-front-error（公共路由，无需登录）。
 // 用独立 axios 实例（不走业务 instance，避免错误弹窗循环 + 不受 JWT 拦截干扰）。
 import axios from 'axios'
-import { baseURL } from '../api/http'
+import { ApiError, baseURL } from '../api/http'
 
 // 独立 axios 实例：仅用于错误上报，超时短、不重试、静默失败
 const reportInstance = axios.create({
@@ -35,6 +35,24 @@ function truncate(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) : s
 }
 
+/**
+ * 这个 rejection 是不是「接口失败」。
+ *
+ * 接口失败不上报：服务端自己已经知道（它就是响应的那一方，日志里也有），
+ * 用户也已经看到提示，再往 front_error_log 里写一条纯属噪音 —— 后台限流上线后
+ * 快速切菜单撞上 429，一轮能灌几十条 "Request failed with status code 429"，
+ * 把真正的前端 JS 异常挤出视野。
+ *
+ * 两类：
+ *  - axios 错误：网络层/框架层真实非 2xx（429、超时、断网）；
+ *  - ApiError：api/http.ts 的 request() 因 body.code 非 2xx 抛出的业务错误。
+ *
+ * 其它一切（真实 JS 运行时错误、非接口的 Promise rejection）照旧上报。
+ */
+function isApiFailure(reason: unknown): boolean {
+  return axios.isAxiosError(reason) || reason instanceof ApiError
+}
+
 /** 安装全局错误捕获 */
 export function setupFrontErrorReporting() {
   // 1. 同步运行时错误
@@ -57,6 +75,8 @@ export function setupFrontErrorReporting() {
   // 2. 未处理的 Promise rejection
   window.addEventListener('unhandledrejection', (event) => {
     const reason = event.reason
+    // 接口失败不算前端异常，直接跳过（见 isApiFailure）
+    if (isApiFailure(reason)) return
     let message = 'Unhandled promise rejection'
     let stack = ''
     if (reason instanceof Error) {

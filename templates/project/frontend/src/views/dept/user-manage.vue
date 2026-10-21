@@ -57,7 +57,11 @@ function goBack() {
   router.push({ name: 'dept' })
 }
 
-onMounted(loadData)
+// 接住加载失败（提示已由 http.ts 拦截器弹过），避免未处理的 Promise rejection
+// 被 utils/frontError.ts 误报成前端异常；loading 由 loadData 自己的 finally 复位。
+onMounted(() => {
+  loadData().catch(() => {})
+})
 </script>
 
 <template>

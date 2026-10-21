@@ -1,42 +1,26 @@
 package middleware
 
 import (
+	"fmt"
+	"log"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/stones-hub/taurus-pro-common/pkg/util/tlimit"
 	"github.com/stones-hub/taurus-pro-http/pkg/httpx"
 
 	"{{ .Module }}/internal/taurus"
 )
 
-// RateLimitMiddleware 组合限流中间件（IP 维度组合限流 + 基础限流），
-// 配置取 http.rate_limit.composite / http.rate_limit.basic。
+// rateLimitedMessage 超限时回给客户端的提示。
 //
-// IP 维度那一层用项目内的 ipRateLimiter（见 ip_rate_limiter.go）：限流语义与
-// 公共库的 tlimit.CompositeRateLimiter 一致，但 per-IP 记录会自动回收，
-// 不会随来访 IP 数无上限增长。基础限流是单个全局桶，没有 per-IP map，
-// 继续直接用公共库的实现。
-func RateLimitMiddleware() func(next http.Handler) http.Handler {
-	var (
-		compositeLimiter *ipRateLimiter
-		basicLimiter     *tlimit.RateLimiter
-		once             sync.Once
-	)
-
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			once.Do(func() { initLimiters(&compositeLimiter, &basicLimiter) })
-
-			if !checkRateLimit(r, compositeLimiter, basicLimiter) {
-				httpx.SendResponse(w, http.StatusTooManyRequests, "请求过于频繁，请稍后重试", nil)
-				return
-			}
-			next.ServeHTTP(w, r)
-		})
-	}
-}
+// 它被放在响应体的 **data** 里而不是 message 里：httpx.SendResponse 的 message
+// 由公共库按状态码固定（429 → 英文 "Too Many Requests"），只有 data 是调用方能
+// 决定的。前端 extractError 的取值优先级因此是「data 字符串 → data.message →
+// message」，恰好能拿到这句中文（见 frontend/src/api/http.ts）。
+const rateLimitedMessage = "请求过于频繁，请稍后重试"
 
 // rateLimitRule 单个敏感接口的限流参数。
 type rateLimitRule struct {
@@ -76,9 +60,21 @@ func NamedRateLimitMiddleware(name string) func(next http.Handler) http.Handler 
 
 // serveRateLimited 限流判定的纯参数版本（限流器由调用方给定），便于测试。
 // limiter 为 nil 表示该接口没配出有效的限流参数，直接放行。
+//
+// 被拒时做三件事：留痕（节流日志，见 noteRejection）、给出 Retry-After、
+// 回 429 + 中文提示。Retry-After 取这个桶的填充间隔向上取整秒，
+// 让守规矩的客户端知道该等多久，而不是立刻重试再吃一个 429。
 func serveRateLimited(w http.ResponseWriter, r *http.Request, limiter *ipRateLimiter, next http.Handler) {
-	if limiter != nil && !limiter.Allow(ClientIP(r)).Allowed {
-		httpx.SendResponse(w, http.StatusTooManyRequests, "请求过于频繁，请稍后重试", nil)
+	if limiter == nil {
+		next.ServeHTTP(w, r)
+		return
+	}
+	ip := ClientIP(r)
+	if !limiter.Allow(ip).Allowed {
+		limiter.noteRejection(ip)
+		httpx.SendResponse(w, http.StatusTooManyRequests, rateLimitedMessage, map[string]string{
+			"Retry-After": strconv.Itoa(limiter.retryAfterSeconds()),
+		})
 		return
 	}
 	next.ServeHTTP(w, r)
@@ -90,7 +86,7 @@ func newSensitiveLimiter(name string) *ipRateLimiter {
 	if rule.IPCapacity <= 0 || rule.GlobalCapacity <= 0 || rule.FillSeconds <= 0 {
 		return nil
 	}
-	return newIPRateLimiter(rule.IPCapacity, rule.GlobalCapacity, time.Duration(rule.FillSeconds)*time.Second)
+	return newIPRateLimiter(name, rule.IPCapacity, rule.GlobalCapacity, time.Duration(rule.FillSeconds)*time.Second)
 }
 
 // resolveSensitiveRule 合并配置与内置默认值；getInt 返回 0 视为「未配置」。
@@ -109,44 +105,184 @@ func resolveSensitiveRule(name string, getInt func(string) int) rateLimitRule {
 	return rule
 }
 
-// initLimiters 延迟初始化限流器
-func initLimiters(composite **ipRateLimiter, basic **tlimit.RateLimiter) {
-	config := taurus.Container.Config
+// 后台接口（/admin/**）的按 IP 限流。
+//
+// 与上面四个敏感接口的区别是**只按 IP、不设全站总额度**：后台是已登录用户的
+// 日常操作面，一个全站单桶意味着「一个人刷接口 → 所有人都用不了」，
+// 这种自伤比被刷更糟。全站总量要卡的话该卡在入口层（Nginx / WAF / 网关）。
+//
+// 默认每 IP 每秒 10 次、突发 300 次：10 次/秒远高于人工点击的速率（正常翻页
+// 一次也就几个请求），300 的突发足够覆盖「打开一个带十几个下拉选项的表单页」
+// 这类并发拉取，又能把脚本化的批量拉取压在可接受的量级上。
+const (
+	// defaultAdminRateLimitBurst 单 IP 突发上限（= 令牌桶容量）。
+	defaultAdminRateLimitBurst = 300
+	// defaultAdminRateLimitPerSecond 单 IP 每秒回补的令牌数。
+	defaultAdminRateLimitPerSecond = 10
 
-	if config.GetBool("http.rate_limit.composite.enabled") {
-		ipCapacity := config.GetInt("http.rate_limit.composite.ip_capacity")
-		globalCapacity := config.GetInt("http.rate_limit.composite.global_capacity")
-		fillInterval := time.Duration(config.GetInt("http.rate_limit.composite.fill_interval")) * time.Second
-		if ipCapacity > 0 && globalCapacity > 0 && fillInterval > 0 {
-			*composite = newIPRateLimiter(ipCapacity, globalCapacity, fillInterval)
-		}
+	adminRateLimitBurstKey     = "http.rate_limit.admin.burst"
+	adminRateLimitPerSecondKey = "http.rate_limit.admin.per_second"
+
+	// maxAdminRateLimitPerSecond 每秒回补数的上限。
+	//
+	// 技术上的硬下限是 1e9：再大填充间隔就不足 1 纳秒，整除归零后 refill 会除零 panic。
+	// 这里刻意收得更紧（1 万次/秒）：后台接口是人在点，一个真实管理员的峰值也就
+	// 每秒几次，1 万次/秒已经高出三个数量级。能写到这个数的只有两种情况 ——
+	// 多打了几个 0，或者把「每分钟」当成了「每秒」—— 两种都该在启动时就报错，
+	// 而不是留下一个看着像限流、实际等于不限流的配置。
+	// 真要撑这种量级说明选错了层：那是入口层（Nginx / WAF）的活。
+	maxAdminRateLimitPerSecond = 10000
+)
+
+// adminRateLimitConfig 后台限流参数。
+type adminRateLimitConfig struct {
+	// Burst 单 IP 突发上限。
+	Burst int
+	// PerSecond 单 IP 每秒回补次数。
+	PerSecond int
+}
+
+// Enabled 两个值都为正才启用；都为 0 表示显式关闭（非法组合在解析阶段就报错了）。
+func (c adminRateLimitConfig) Enabled() bool {
+	return c.Burst > 0 && c.PerSecond > 0
+}
+
+// FillInterval 单 IP 每隔多久回一个令牌。
+//
+// 前置条件：PerSecond > 0 —— 调用方必须先用 Enabled() 判一次。
+// PerSecond == 0 时这里会整数除零 panic，刻意不加防御：能走到这里的 0 说明
+// 调用方漏判了 Enabled，拿一个兜底值糊过去只会变成「实际限流参数不是配置
+// 里写的那个」这种更难查的故障。解析阶段（resolveAdminRateLimit）已经保证
+// PerSecond 要么为 0（两项同时为 0 = 显式关闭）要么为正。
+func (c adminRateLimitConfig) FillInterval() time.Duration {
+	return time.Second / time.Duration(c.PerSecond)
+}
+
+// adminLimiter 后台接口共用的限流器实例；nil 表示不限流。
+//
+// 这里刻意用包级变量而不是「每次调用 AdminRateLimitMiddleware 各建一个」：
+// 四条后台链（userBaseChain / userSelfServiceChain / userProtectedChain
+// 以及手机号绑定那条内联链）必须共用同一份额度，否则同一个 IP 对 /admin/**
+// 就有多份独立配额，换一条链就能接着刷，配置里写的「每秒 10 次」实际会翻几倍。
+//
+// 并发安全靠「写一次、之后只读」保证：InitAdminRateLimiter 在 app 包的
+// init() 里调用，早于 main()、早于 RegisterRoutes、也早于任何请求；
+// 运行期没有第二个写入点，所以不需要锁。
+var adminLimiter *ipRateLimiter
+
+// adminLimiterReady 标记 InitAdminRateLimiter 是否真的被调用过。
+//
+// adminLimiter == nil 有两种成因，后果一样（放行）但性质完全不同：
+//   - 配置里两项都写 0 = 运维明确选择了「不在应用层限流」；
+//   - 根本没人调用 InitAdminRateLimiter = 接线事故，比如将来新增一个入口
+//     二进制、没走 app 包的 init()，于是 /admin/** 静默地完全不限流。
+//
+// 把两者分开，后者在第一个请求上告警一次（见 warnIfAdminLimiterUninitialized）。
+// 和 adminLimiter 一样是「init() 写一次、之后只读」，不需要锁。
+var (
+	adminLimiterReady    bool
+	adminLimiterWarnOnce sync.Once
+)
+
+// InitAdminRateLimiter 在启动阶段解析配置并建好后台限流器。
+//
+// 配置非法时返回 error，调用方（app.initAdminRateLimit）据此让启动失败。
+// 为什么不等第一个请求再懒加载：限流参数配错（负数、拼成 abc、只把一个值写成 0）
+// 是个安全配置错误，必须在启动时就炸出来，而不是等被爆破那天才发现限流没生效。
+func InitAdminRateLimiter(getString func(string) string) error {
+	cfg, err := resolveAdminRateLimit(getString)
+	if err != nil {
+		// 解析失败不算「初始化过」：调用方会让启动失败，不该走到有请求那一步。
+		return err
 	}
+	adminLimiterReady = true
+	if !cfg.Enabled() {
+		adminLimiter = nil
+		return nil
+	}
+	// 第一个参数是限流器名字（只用于日志），第二个 0 = 不设全局桶，只按 IP 限流。
+	adminLimiter = newIPRateLimiter("admin", cfg.Burst, 0, cfg.FillInterval())
+	return nil
+}
 
-	if config.GetBool("http.rate_limit.basic.enabled") {
-		capacity := config.GetInt("http.rate_limit.basic.capacity")
-		fillInterval := time.Duration(config.GetInt("http.rate_limit.basic.fill_interval")) * time.Second
-		if capacity > 0 && fillInterval > 0 {
-			*basic = tlimit.NewRateLimiter(capacity, fillInterval)
-		}
+// AdminRateLimitMiddleware 后台接口的按 IP 限流中间件。
+//
+// 挂在 BodyLimit 之后、JWT 之前：未登录的洪水请求也要在这里被挡住，
+// 挂到 JWT 后面的话，无 Token 的刷接口流量每次都能走完一遍 Token 解析。
+// 限流键用 ClientIP(r)（只在可信代理后面才采信转发头）。
+func AdminRateLimitMiddleware() func(next http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			warnIfAdminLimiterUninitialized()
+			serveRateLimited(w, r, adminLimiter, next)
+		})
 	}
 }
 
-// checkRateLimit 执行限流检查。
-// 限流键用 ClientIP（只在可信代理后面才采信转发头），客户端伪造 X-Real-IP 换不到新配额。
-func checkRateLimit(r *http.Request, composite *ipRateLimiter, basic *tlimit.RateLimiter) bool {
-	clientID := ClientIP(r)
-
-	if composite != nil {
-		if !composite.Allow(clientID).Allowed {
-			return false
-		}
+// warnIfAdminLimiterUninitialized 限流器从未初始化时，在第一个请求上告警一次。
+//
+// 仍然放行：中间件不该因为自己没被接上就把后台整个打挂。但这条日志必须有 ——
+// 「配置关掉了限流」和「限流根本没接上」在行为上无法区分，没有告警的话
+// 后者可以在生产里存在到被刷的那一天。
+func warnIfAdminLimiterUninitialized() {
+	if adminLimiterReady {
+		return
 	}
+	adminLimiterWarnOnce.Do(func() {
+		log.Printf("后台限流器未初始化（没有调用 InitAdminRateLimiter），/admin/** 当前不受应用层限流：请检查启动流程是否执行了 app 包的 init()\n")
+	})
+}
 
-	if basic != nil {
-		if !basic.Allow() {
-			return false
-		}
+// resolveAdminRateLimit 解析后台限流配置。
+//
+// 返回值语义：
+//   - 两项都未配置（取到空串）→ 内置默认值 300 / 10；
+//   - 两项都是 0 → 关闭后台限流（是一个合法选择，比如前面已有网关限流）；
+//   - 两项都是正数 → 按配置生效；
+//   - 负数、非整数、只有一个为 0、per_second 超过 maxAdminRateLimitPerSecond → 返回 error，启动失败。
+//
+// 为什么「只有一个为 0」要报错而不是当成关闭：`burst: 0 / per_second: 10` 和
+// `burst: 300 / per_second: 0` 都读不出意图 —— 可能是想关限流只改了一处，
+// 也可能是想调参数手误清了一个值。按「关闭」处理就是在用户以为限流还开着的时候
+// 悄悄把它摘掉了；报错只需要改一个字符，而且是立刻可见的。
+//
+// 刻意用 GetString 而不是 GetInt：GetInt 碰到 `abc` 会返回 0，而 0 在这里是
+// 「关闭限流」的合法值 —— 一个拼错的配置会被静默解读成「不限流」。
+// 同样的取舍见 service.ResolveLogRetentionDays。
+func resolveAdminRateLimit(getString func(string) string) (adminRateLimitConfig, error) {
+	burst, err := parseAdminRateLimitValue(getString, adminRateLimitBurstKey, defaultAdminRateLimitBurst)
+	if err != nil {
+		return adminRateLimitConfig{}, err
 	}
+	perSecond, err := parseAdminRateLimitValue(getString, adminRateLimitPerSecondKey, defaultAdminRateLimitPerSecond)
+	if err != nil {
+		return adminRateLimitConfig{}, err
+	}
+	if (burst == 0) != (perSecond == 0) {
+		return adminRateLimitConfig{}, fmt.Errorf(
+			"配置 %s=%d 与 %s=%d 组合非法：要关闭后台限流请把两项都写 0，只写一个 0 读不出是想关限流还是手误",
+			adminRateLimitBurstKey, burst, adminRateLimitPerSecondKey, perSecond)
+	}
+	if perSecond > maxAdminRateLimitPerSecond {
+		return adminRateLimitConfig{}, fmt.Errorf(
+			"配置 %s=%d 过大（上限 %d）：后台接口是人在点，这个量级只可能是手误（多打了 0 或把每分钟当成了每秒）",
+			adminRateLimitPerSecondKey, perSecond, maxAdminRateLimitPerSecond)
+	}
+	return adminRateLimitConfig{Burst: burst, PerSecond: perSecond}, nil
+}
 
-	return true
+// parseAdminRateLimitValue 解析单个后台限流配置项；空值取 def，负数或非整数报错。
+func parseAdminRateLimitValue(getString func(string) string, key string, def int) (int, error) {
+	raw := strings.TrimSpace(getString(key))
+	if raw == "" {
+		return def, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("配置 %s 不是整数: %q", key, raw)
+	}
+	if v < 0 {
+		return 0, fmt.Errorf("配置 %s 不能为负数（%d）；两项都写 0 表示关闭后台限流", key, v)
+	}
+	return v, nil
 }

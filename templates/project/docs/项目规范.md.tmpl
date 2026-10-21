@@ -50,7 +50,7 @@
   - `BindJSON(w, r, &req) bool`：解码 JSON body，失败自动回 `400 请求参数格式错误` 并返回 false（调用方 `if !BindJSON(w, r, &req) { return }`）。
   - `OK(w, data)`：成功响应（`body.code = 200`）。
   - `Fail(w, code, message)`：错误响应（`body.code = code`，`data = {"message": message}`；code 沿用 HTTP 状态码语义 400 参数错误 / 401 未授权 / 404 不存在 / 500 业务错误）。
-- **响应契约完全不变**：`{code, message, data}`，错误时 `data={"message":"..."}`；前端 `http.ts` 按 `body.code` 是否在 2xx 判成功、`extractError` 优先读 `data.message`。
+- **响应契约完全不变**：`{code, message, data}`，错误时 `data={"message":"..."}`；前端 `http.ts` 按 `body.code` 是否在 2xx 判成功；`extractError` 取提示的优先级是 `data` 为非空字符串 → `data.message` → `message`。
 - **合法保留例外**（不套用 BindJSON/OK/Fail）：
   - `Content-Type` 分叉（JSON vs multipart/form）的分支里，JSON 分支可保留 `json.NewDecoder`（如 auth 登录/注册）。
   - `_ = json.NewDecoder(...)`（忽略解码错误、空 body 不报错）保留。
@@ -95,19 +95,21 @@
 
   | 链 | 中间件顺序 | 用途 |
   |----|-----------|------|
-  | `userBaseChain` | `Recovery → BodyLimit → JWT → SessionValidator → AccessLog → CSRF` | 「读自己」与下拉选项；**不含** Permission、**不含** OperationLog |
-  | `userSelfServiceChain` | `Recovery → BodyLimit → JWT → SessionValidator → AccessLog → OperationLog → CSRF` | 「自己改自己」的写操作；**不含** Permission，但要操作留痕 |
-  | `userProtectedChain` | `Recovery → BodyLimit → JWT → SessionValidator → AccessLog → Permission → OperationLog → CSRF` | 业务 list / CRUD，**受接口权限校验** |
+  | `userBaseChain` | `Recovery → BodyLimit → AdminRateLimit → JWT → SessionValidator → AccessLog → CSRF` | 「读自己」与下拉选项；**不含** Permission、**不含** OperationLog |
+  | `userSelfServiceChain` | `Recovery → BodyLimit → AdminRateLimit → JWT → SessionValidator → AccessLog → OperationLog → CSRF` | 「自己改自己」的写操作；**不含** Permission，但要操作留痕 |
+  | `userProtectedChain` | `Recovery → BodyLimit → AdminRateLimit → JWT → SessionValidator → AccessLog → Permission → OperationLog → CSRF` | 业务 list / CRUD，**受接口权限校验** |
 
-- 三条链都以 `BodyLimit` 限制请求体、都挂 `AccessLog`、都以 `CSRF` 收尾；
+- 三条链都以 `BodyLimit` 限制请求体、都挂 `AdminRateLimit`（**三条链共用同一个按 IP 限流器**，同一 IP 对全部后台接口共享一份额度，排在 JWT 之前）、都挂 `AccessLog`、都以 `CSRF` 收尾；新加后台路由组时用这三条链之一，别漏掉限流；
   差别只在 **Permission**（是否校验接口权限）和 **OperationLog**（是否记操作日志）。
 - `SessionValidator` 紧跟 `JWT`：JWT 只验签名，会话是否已被吊销（改密 / 禁用 / 登出）
   由 `SessionValidator` 比对 `admin_users.auth_version` 判定，二者缺一不可。
 - 不走这三条链的例外（各自单独定义，别往链里塞）：
   - `/auth/login`：`Recovery → BodyLimit → RateLimit("login") → AccessLog`（无 JWT，带登录限流）；
   - `/auth/logout`：`Recovery → BodyLimit → AccessLog`（无 JWT、**故意不限流**，Token 过期也要能清会话）；
-  - `/admin/user/bind-mobile`、`unbind-mobile`：在基础链的 `BodyLimit` 之后额外插
-    `RateLimit("verify_code")`。
+  - `/admin/user/bind-mobile`、`unbind-mobile`：在 `BodyLimit → AdminRateLimit` 之后额外插
+    `RateLimit("verify_code")`；
+  - `/admin/user/send-code`：`Recovery → BodyLimit → AdminRateLimit → RateLimit("send_code") → AccessLog`
+    （无 JWT、无 CSRF，登录与绑定手机号共用；既计入后台共享额度，又受短信专用额度约束）。
 - 改密只有两个入口，不要再加第三个：`change-password`（自助，**必须带旧密码**，走
   `userSelfServiceChain` 不挂 Permission）与 `/admin/user/update` 的 `password` 字段
   （管理员重置他人，走 `userProtectedChain` 受接口权限校验，并额外受下面的目标账号保护）。
@@ -243,6 +245,7 @@
 
 ### 11. 响应判定（前端）
 - 前端判成功看 `body.code` 是否在 2xx 区间，**不看 HTTP 状态码**（`httpx.SendResponse` 对 400/401/403/404/500 都返回 HTTP 200 + body.code）。
+- 例外：429（限流）、413（请求体过大）等返回**真实 HTTP 状态码**，走 axios 的错误分支；此时 `message` 是公共库固定的英文（如 `Too Many Requests`），中文提示放在 `data` 里，所以响应拦截器同样要用 `extractError` 取提示。
 - `extractError` 需兼容 `string` 与 `object.message` 两种错误形态。
 
 ### 12. CSRF

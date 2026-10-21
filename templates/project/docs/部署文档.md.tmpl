@@ -65,7 +65,7 @@ Go 编译出的程序只能在**对应的系统和 CPU 架构**上运行。这�
 | Go | **只在编译时需要** | - | {{ .GoVersion }} 或更高（`go.mod` 声明）；运行时不需要 |
 | Node | **只在构建前端时需要** | - | 20.19+ / 22.12+（Vite 8 要求）；运行时不需要 |
 | MySQL | 业务数据库 | 3306 | 8.x |
-| Redis | 验证码 / 登录会话 / 限流计数 | 6379 | 5.x+；会话校验依赖 Redis，不可用时请求会被拒绝 |
+| Redis | 验证码 / 登录会话 | 6379 | 5.x+；会话校验依赖 Redis，不可用时请求会被拒绝 |
 | supervisor | Go 进程守护（仅 Ubuntu 裸机） | - | |
 | launchd | Go 进程守护（仅 macOS，系统自带） | - | |
 | Docker | 容器编排（仅 Docker 方式） | - | |
@@ -342,6 +342,7 @@ vim .env.local
 | `SERVER_ADDRESS` | 直接对外用 `0.0.0.0`；前面加 nginx 时用 `127.0.0.1` |
 | `SERVER_PORT` | 默认 `9080` |
 | `TRUSTED_PROXIES` | **只在前面加了 nginx 时添加**此行，填 `127.0.0.1`，见第七节 |
+| `ADMIN_RATE_LIMIT_BURST` / `ADMIN_RATE_LIMIT_PER_SECOND` | 后台接口按 IP 限流，默认 `300` / `10`（同一 IP 可连续请求 300 次，之后每秒恢复 10 次）。多人共用一个出口 IP、经常提示「请求过于频繁」时调大；两项都填 `0` 表示关闭；负数、非整数、只有一项为 `0` 或每秒次数超过 `10000` 时程序拒绝启动 |
 | `LOG_RETENTION_DAYS` | 日志保留天数，默认 `180`；超过的访问、操作、前端错误、登录日志每天自动分批删除。`0` 表示不清理；填负数或非数字时程序拒绝启动 |
 
 > 值会被**原样**文本替换进配置文件再解析：**不要加引号**，不要在值里写 `}` 或换行。
@@ -923,6 +924,7 @@ curl -I http://{{ .ProjectName }}.example.com/
 | nginx 502 | Go 没起来；`proxy_pass` 的 9080 与 Go `SERVER_PORT` 不一致 |
 | nginx 413 | `client_max_body_size` 太小 |
 | 加了 nginx 后频繁被限流、登录日志 IP 全一样 | 没有按 7.3 设置 `TRUSTED_PROXIES` |
+| 正常使用时提示「请求过于频繁」（HTTP 429） | 先在程序启动输出里找「限流器 admin 已拒绝」（不在 `app.log` 里：Ubuntu 看 `backend/logs/supervisor.log`，macOS 看 `backend/logs/launchd.log`，Docker 用 `docker compose logs app`）：看最近来源 IP 是不是 nginx 地址（是则排除上一条）；确是多人共用一个出口 IP 时，调大 `.env.local` 的 `ADMIN_RATE_LIMIT_BURST` / `ADMIN_RATE_LIMIT_PER_SECOND` 后重启 |
 | 前端白屏 / 接口 404 | 检查 `frontend/dist` 是否存在且位置正确（与 `backend/` 同级）；Docker 下在镜像内 `/app/frontend/dist` |
 | 刷新子路由 404 | 确认 Go 做 SPA 回退（history 模式），nginx 全量 `location /` 反代而非自 serve 静态 |
 | MySQL 连不上 | DSN 账号密码、账号 host（`localhost` vs `127.0.0.1`）、库是否存在 |

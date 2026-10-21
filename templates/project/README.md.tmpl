@@ -207,13 +207,9 @@ mysql -uroot -p {{ .DBName }} -e "UPDATE admin_user_logins SET login_credential=
    JWT 里的自己（和 `change-password` 一样），但权限数据里还登记着 209、210 两条接口权限，
    所以**普通角色不配这两条权限就绑不了自己的手机号**。`change-password` 已移出权限链；
    这两条要一起移的话，同时删掉 `init.sql` 里 209/210 两行并改 `routes.go` 的中间件链。
-3. **只有 4 个入口有限流，`/admin/**` 业务接口不限流**。限流只挂在登录、发验证码、校验验证码、
-   前端错误上报上。通用限流中间件 `RateLimitMiddleware`（`app/middleware/rate_limit.go`）代码在库，
-   但**没有挂到任何路由链**，所以 `config/autoload/http/http.yaml` 里 `rate_limit.composite` /
-   `rate_limit.basic` 的 `enabled: true` 目前不起作用。面向公网时，请在入口加一层 Nginx / WAF 限流，
-   或自行把它挂进 `routes.go` 的中间件链。
-4. **限流是单机内存实现**。多实例部署时每个实例各算各的，总额度会按实例数放大。
-5. **访问日志、操作日志是每个请求单独起协程异步写库的**（`app/middleware/access_log.go`、
+3. **限流是单机内存实现，后台接口没有全站总额度**。多实例部署时每个实例各算各的，总额度会按实例数放大；
+   后台接口只按 IP 限（登录、验证码、错误上报除按 IP 外另有各自的全站额度），要卡全站总量请在入口层（Nginx / WAF）做。
+4. **访问日志、操作日志是每个请求单独起协程异步写库的**（`app/middleware/access_log.go`、
    `operation_log.go`），程序退出时不等待它们写完，退出瞬间的少量日志可能丢失。
 
 ### 行为约定（不是缺陷，容易被当成 bug）
@@ -237,7 +233,13 @@ mysql -uroot -p {{ .DBName }} -e "UPDATE admin_user_logins SET login_credential=
   确需降级只能直接改数据库。
 - **限流的按 IP 记录会自动回收**（`app/middleware/ip_rate_limiter.go`）：替换了公共库里
   只增不减的实现。闲置超过 5 分钟且额度已回满的 IP 记录会被清掉（没回满的不清，避免被限流的
-  IP 靠等待清理重置额度）；每个限流器最多记录 10 万个 IP（本底座实际生效 4 个：登录、发验证码、校验验证码、前端错误上报各 1 个），满了之后新 IP 只受全局额度约束，不会撑爆内存。
+  IP 靠等待清理重置额度）；每个限流器最多记录 10 万个 IP（本底座共 5 个：登录、发验证码、校验验证码、前端错误上报、后台接口各 1 个），满了之后新 IP 不再单独记录（前 4 个只受全局额度约束，后台接口直接放行），不会撑爆内存。
+- **后台接口按 IP 限流**（`app/middleware/rate_limit.go` 的 `AdminRateLimitMiddleware`）：所有 `/admin/**` 接口（含发验证码、绑定手机号，它们另有自己更严的额度）和
+  `/user/refresh-token` 共用一份额度，默认同一 IP 可连续请求 300 次，之后每秒恢复 10 次；超过时返回 HTTP 429，
+  带 `Retry-After` 头，前端弹出「请求过于频繁，请稍后重试」（相同提示自动合并成一条；接口失败不再被当成前端 JS 异常写进前端错误日志），稍等即恢复。被拒绝时程序日志里每分钟最多一条汇总
+  （「限流器 admin 已拒绝 N 次请求（最近一次来自 某 IP）」），可据此判断是否需要调大额度。限流排在登录校验之前，未登录的刷接口请求也会被挡住。刻意**不设全站总额度**，避免一个人刷接口导致所有人不能用。
+  用 `ADMIN_RATE_LIMIT_BURST`、`ADMIN_RATE_LIMIT_PER_SECOND` 调整，两项都填 `0` 表示关闭；负数、非整数、只有一项为 `0` 或每秒次数超过 `10000` 时程序拒绝启动。
+  多人共用一个出口 IP（同一办公室）时共享这份额度；前面加了 nginx 却没设 `TRUSTED_PROXIES` 时，所有人会被当成同一个 IP。
 - **日志表自动清理**（`app/service/log_cleanup.go`）：访问、操作、前端错误、登录四类日志
   默认保留 180 天，启动 5～15 分钟后（随机错开，避免多实例同时清理）清理一次，之后每 24 小时一次，分批删除避免锁表。
   分批删除用 `DELETE … LIMIT`，依赖 MySQL 默认的 `binlog_format=ROW`。
@@ -365,7 +367,7 @@ mysql -uroot -p {{ .DBName }} -e "UPDATE admin_user_logins SET login_credential=
 - 登出吊销的是**请求真正通过认证的那个 Token**：controller 与中间件统一用
   `middleware.GetJWTToken`（Cookie → `jwt_token` 头 → `Bearer`），不再各写一套优先级。
 - `RefreshToken` 不再从 URL query 取 Token。
-- 登录、验证码发送/校验、前端错误上报都挂了**限流**，并限制请求体大小；
+- 登录、验证码发送/校验、前端错误上报、全部后台接口都挂了**限流**，并限制请求体大小；
   客户端自带的 `X-Real-IP` 不再被信任（`app/middleware/client_ip.go`）。
 - 登录成功 / 失败都写 `admin_user_login_logs`；pprof 默认关闭。
 - **登录失败真的以 `login_status=0` 落库**。之前 model 的 `LoginStatus` 带了
