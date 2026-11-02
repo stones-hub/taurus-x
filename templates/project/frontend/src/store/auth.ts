@@ -1,7 +1,8 @@
 // 认证状态（Pinia）。
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { apiLogin, apiMe } from '../api/auth'
+import { apiLogin, apiMe, apiLogout, apiRefresh } from '../api/auth'
+import { createSessionActions, registerLocalReset } from './session'
 import { usePermissionStore } from './permission'
 import type { LoginRequest, UserInfo } from '../types'
 
@@ -26,12 +27,24 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  function logout() {
+  function clearLocal() {
     token.value = ''
     user.value = null
     localStorage.removeItem('token')
     usePermissionStore().reset()
   }
 
-  return { token, user, login, loadMe, logout }
+  registerLocalReset(clearLocal)
+  const { logout, refresh } = createSessionActions({
+    revoke: apiLogout,
+    rotate: apiRefresh,
+    clear: clearLocal,
+    save: (res) => {
+      token.value = res.token
+      localStorage.setItem('token', res.token)
+    },
+    active: () => Boolean(token.value),
+  })
+
+  return { token, user, login, loadMe, logout, refresh, clearLocal }
 })

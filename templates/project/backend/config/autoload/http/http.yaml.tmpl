@@ -19,6 +19,8 @@ http:
   # （解析时会丢弃不是合法 IP / CIDR 的条目，所以 none 等同于空名单）
   trusted_proxies: ${TRUSTED_PROXIES:none}
 
+  auth_trusted_origins: ${AUTH_TRUSTED_ORIGINS:none}
+
   # 请求体大小上限（字节）。底座没有文件上传接口，默认 1MiB；0 表示不限制。
   max_body_bytes: ${MAX_BODY_BYTES:1048576}
 

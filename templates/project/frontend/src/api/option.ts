@@ -6,11 +6,16 @@
 // /admin/option 路由组里登记对应 Handler。
 import { request } from './http'
 import type { UserOptionListResponse } from '../types'
+import { collectPages } from '../utils/pagination'
 
 // 用户选项（给「负责人」「经办人」这类人员下拉用）。
 // 返回最小字段（user_id / username / realname）：这个接口只做登录校验，
 // 不做接口权限校验，后端刻意不返回手机号、邮箱等敏感字段。
-export function apiOptionUsers(params: { page_no: number; page_size: number } = { page_no: 1, page_size: 9999 }) {
+export async function apiOptionUsers(params?: { page_no: number; page_size: number }): Promise<UserOptionListResponse> {
+  if (!params) {
+    const list = await collectPages((page_no, page_size) => apiOptionUsers({ page_no, page_size }), (user) => user.user_id)
+    return { list, page_no: 1, page_size: list.length, result_total: list.length } as UserOptionListResponse
+  }
   return request<UserOptionListResponse>({
     url: '/admin/option/users',
     method: 'post',

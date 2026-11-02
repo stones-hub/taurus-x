@@ -10,3 +10,11 @@ export function apiLogin(data: LoginRequest) {
 export function apiMe() {
   return request<UserInfo>({ url: '/admin/user/current-info', method: 'get' })
 }
+
+export function apiLogout() {
+  return request<unknown>({ url: '/auth/logout', method: 'post' })
+}
+
+export function apiRefresh() {
+  return request<LoginResponse>({ url: '/user/refresh-token', method: 'post' })
+}

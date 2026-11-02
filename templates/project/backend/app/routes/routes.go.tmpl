@@ -89,6 +89,7 @@ func RegisterRoutes() {
 		Prefix: "/auth",
 		Middleware: []router.MiddlewareFunc{
 			recovery(),
+			tmid.AuthRequestMiddleware(false),
 			tmid.BodyLimitMiddleware(),
 			tmid.NamedRateLimitMiddleware("login"),
 			tmid.AccessLogMiddleware(),
@@ -104,6 +105,7 @@ func RegisterRoutes() {
 		Prefix: "/auth",
 		Middleware: []router.MiddlewareFunc{
 			recovery(),
+			tmid.LogoutRequestMiddleware(),
 			tmid.BodyLimitMiddleware(),
 			tmid.AccessLogMiddleware(),
 		},
@@ -164,9 +166,10 @@ func RegisterRoutes() {
 	// 用 userBaseChain，所以它也计入后台额度。取舍：正常会话每隔几十分钟才刷一次，
 	// 占掉的额度可以忽略；而把它排除在外就留下一个「带 Token 就能全速打」的接口，
 	// 它背后是一次签名 + 一次会话写入，恰恰是不该让人白嫖的那类开销。
+	refreshChain := append([]router.MiddlewareFunc{tmid.AuthRequestMiddleware(true)}, userBaseChain...)
 	taurus.Container.Http.AddRouterGroup(router.RouteGroup{
 		Prefix:     "/user",
-		Middleware: userBaseChain,
+		Middleware: refreshChain,
 		Routes: []router.Router{
 			{Path: "/refresh-token", Handler: http.HandlerFunc(app.Core.AuthController.RefreshToken)},
 		},

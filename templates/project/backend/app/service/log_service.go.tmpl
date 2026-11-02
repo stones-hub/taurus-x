@@ -43,6 +43,7 @@ func NewLogService(store *repo.Store) *LogService {
 
 // GetAccessLogList 分页查询访问日志
 func (s *LogService) GetAccessLogList(ctx context.Context, req dto.AccessLogListRequest) (*dto.AccessLogListResponse, error) {
+	req.Normalize()
 	logs, total, err := s.accessLogRepo.ListWithFilter(ctx, req.PageNo, req.PageSize, repo.AccessLogListFilter{
 		UserID:     req.UserID,
 		Method:     req.Method,
@@ -86,6 +87,7 @@ func (s *LogService) GetAccessLogList(ctx context.Context, req dto.AccessLogList
 
 // GetOperationLogList 分页查询操作日志
 func (s *LogService) GetOperationLogList(ctx context.Context, req dto.OperationLogListRequest) (*dto.OperationLogListResponse, error) {
+	req.Normalize()
 	logs, total, err := s.operationLogRepo.ListWithFilter(ctx, req.PageNo, req.PageSize, repo.OperationLogListFilter{
 		UserID:   req.UserID,
 		Method:   req.Method,
@@ -155,6 +157,7 @@ func (s *LogService) ReportFrontError(ctx context.Context, req *dto.FrontErrorRe
 
 // GetFrontErrorLogList 分页查询前端错误日志
 func (s *LogService) GetFrontErrorLogList(ctx context.Context, req dto.FrontErrorLogListRequest) (*dto.FrontErrorLogListResponse, error) {
+	req.Normalize()
 	logs, total, err := s.frontErrorLogRepo.ListWithFilter(ctx, req.PageNo, req.PageSize, repo.FrontErrorLogListFilter{
 		UserID: req.UserID,
 		Kind:   req.Kind,

@@ -2,11 +2,14 @@ package service
 
 import (
 	"context"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/wire"
 
 	"{{ .Module }}/app/dto"
+	"{{ .Module }}/app/helper"
 	"{{ .Module }}/app/model"
 	"{{ .Module }}/app/repo"
 )
@@ -68,20 +71,44 @@ func newLoginLogRecord(userID uint64, loginType, ip, userAgent string, status in
 	}
 }
 
-// clampLen 按字符（rune）截断，避免把多字节字符切断成乱码。
+// clampLen 按字节预算截断，非法UTF8字节替换为U+FFFD，不拆分合法字符。
 func clampLen(s string, max int) string {
-	if max <= 0 || len(s) <= max {
-		return s
+	if max <= 0 {
+		return strings.ToValidUTF8(s, "�")
 	}
-	runes := []rune(s)
-	for len(runes) > 0 && len(string(runes)) > max {
-		runes = runes[:len(runes)-1]
+	var sanitized strings.Builder
+	offset, size := 0, 0
+	for offset < len(s) && size < max {
+		character, width := utf8.DecodeRuneInString(s[offset:])
+		invalid := character == utf8.RuneError && width == 1
+		encodedWidth := width
+		if invalid {
+			encodedWidth = utf8.RuneLen(utf8.RuneError)
+		}
+		if encodedWidth > max-size {
+			break
+		}
+		if invalid {
+			if sanitized.Cap() == 0 {
+				sanitized.Grow(min(max, len(s)))
+				sanitized.WriteString(s[:offset])
+			}
+			sanitized.WriteRune(utf8.RuneError)
+		} else if sanitized.Cap() != 0 {
+			sanitized.WriteString(s[offset : offset+width])
+		}
+		offset += width
+		size += encodedWidth
 	}
-	return string(runes)
+	if sanitized.Cap() != 0 {
+		return sanitized.String()
+	}
+	return s[:offset]
 }
 
 // GetLoginLogList 分页查询登录日志（状态过滤），并回填用户名
 func (s *AdminLoginLogService) GetLoginLogList(ctx context.Context, page, pageSize int, loginStatus int8) (*dto.LoginLogListResponse, error) {
+	page, pageSize = helper.NormalizePagination(page, pageSize, 15)
 	logs, total, err := s.loginLogRepo.ListWithFilter(ctx, page, pageSize, repo.AdminUserLoginLogListFilter{
 		LoginStatus: loginStatus,
 	})

@@ -1,0 +1,121 @@
+package store
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestAtomicRotationSingleUse(t *testing.T) {
+	kv := newFakeKV()
+	store := NewAuthRedisStoreWith(kv, newFakeAuthVersions(7))
+	if err := store.RegisterSession(7, "old", time.Hour, 1); err != nil {
+		t.Fatal(err)
+	}
+	var successes atomic.Int32
+	var wait sync.WaitGroup
+	for index := 0; index < 32; index++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			err := store.RotateSession(7, "old", fmt.Sprintf("new-%d", index), time.Hour, 1)
+			if err == nil {
+				successes.Add(1)
+			} else if !errors.Is(err, ErrSessionRevoked) {
+				t.Errorf("unexpected rotation error: %v", err)
+			}
+		}(index)
+	}
+	wait.Wait()
+	if successes.Load() != 1 || len(kv.data) != 1 {
+		t.Fatalf("successes=%d sessions=%d", successes.Load(), len(kv.data))
+	}
+}
+
+func TestAtomicRotationLogoutAndFaultBoundaries(t *testing.T) {
+	for _, logoutFirst := range []bool{true, false} {
+		kv := newFakeKV()
+		store := NewAuthRedisStoreWith(kv, newFakeAuthVersions(7))
+		if err := store.RegisterSession(7, "old", time.Hour, 1); err != nil {
+			t.Fatal(err)
+		}
+		if logoutFirst {
+			if err := store.RevokeSession("old"); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.RotateSession(7, "old", "new", time.Hour, 1); !errors.Is(err, ErrSessionRevoked) {
+				t.Fatalf("rotation after logout: %v", err)
+			}
+		} else {
+			kv.failing = true
+			if err := store.RotateSession(7, "old", "new", time.Hour, 1); !errors.Is(err, ErrSessionStoreUnavailable) {
+				t.Fatalf("fault must fail closed: %v", err)
+			}
+			kv.failing = false
+			if _, err := store.ValidateSession(7, "old"); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.RotateSession(7, "old", "new", time.Hour, 1); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.RevokeSession("old"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.ValidateSession(7, "new"); err != nil {
+				t.Fatalf("old-token logout cannot revoke unknown successor: %v", err)
+			}
+			kv.failing = true
+			if _, err := store.ValidateSession(7, "old"); !errors.Is(err, ErrSessionStoreUnavailable) {
+				t.Fatal(err)
+			}
+			kv.failing = false
+			if _, err := store.ValidateSession(7, "old"); !errors.Is(err, ErrSessionRevoked) {
+				t.Fatalf("consumed token resurrected: %v", err)
+			}
+		}
+	}
+}
+
+func TestRedisRotationAdapter(t *testing.T) {
+	var called bool
+	kv := redisSessionKV{eval: func(_ context.Context, script string, keys []string, args ...interface{}) (interface{}, error) {
+		called = true
+		if script != rotateSessionScript || len(keys) != 2 || keys[0] != "old" || keys[1] != "new" || args[0] != "7:3" || args[1] != int64(1000) {
+			t.Fatalf("invalid script invocation: %v %v", keys, args)
+		}
+		return int64(1), nil
+	}}
+	if ok, err := kv.Rotate(context.Background(), "old", "new", "7:3", time.Second); !ok || err != nil || !called {
+		t.Fatalf("ok=%v called=%v err=%v", ok, called, err)
+	}
+}
+
+type committedRotationErrorKV struct{ *fakeKV }
+
+func (kv committedRotationErrorKV) Rotate(ctx context.Context, oldKey, newKey, value string, ttl time.Duration) (bool, error) {
+	if _, err := kv.fakeKV.Rotate(ctx, oldKey, newKey, value, ttl); err != nil {
+		return false, err
+	}
+	return false, errFakeDown
+}
+
+func TestRotationLostResponseDoesNotResurrectConsumedSession(t *testing.T) {
+	kv := committedRotationErrorKV{newFakeKV()}
+	store := NewAuthRedisStoreWith(kv, newFakeAuthVersions(7))
+	if err := store.RegisterSession(7, "old", time.Hour, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RotateSession(7, "old", "new", time.Hour, 1); !errors.Is(err, ErrSessionStoreUnavailable) {
+		t.Fatalf("unknown outcome did not fail closed: %v", err)
+	}
+	if _, err := store.ValidateSession(7, "old"); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("consumed session was restored: %v", err)
+	}
+	if _, err := store.ValidateSession(7, "new"); err != nil {
+		t.Fatalf("committed successor missing: %v", err)
+	}
+}

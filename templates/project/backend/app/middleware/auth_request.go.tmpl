@@ -1,0 +1,90 @@
+package middleware
+
+import (
+	"net/http"
+	"net/url"
+	"strings"
+
+	"{{ .Module }}/internal/taurus"
+)
+
+func AuthRequestMiddleware(csrf bool) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if AllowAuthRequest(w, r, csrf) {
+				next.ServeHTTP(w, r)
+			}
+		})
+	}
+}
+
+func LogoutRequestMiddleware() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if AllowLogoutRequest(w, r) {
+				next.ServeHTTP(w, r)
+			}
+		})
+	}
+}
+
+func AllowLogoutRequest(w http.ResponseWriter, r *http.Request) bool {
+	if !AllowAuthRequest(w, r, false) {
+		return false
+	}
+	if token := GetJWTToken(r); token != "" {
+		if _, _, err := ValidateJWTToken(token); err == nil {
+			return AllowAuthRequest(w, r, true)
+		}
+	}
+	return true
+}
+
+func AllowAuthRequest(w http.ResponseWriter, r *http.Request, csrf bool) bool {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return false
+	}
+	trusted := taurus.Container.Config.GetString("http.auth_trusted_origins")
+	if !authSourceAllowed(r, trusted) {
+		http.Error(w, "Forbidden origin", http.StatusForbidden)
+		return false
+	}
+	if csrf {
+		cookie := GetCSRFTokenByCookie(r)
+		if cookie == "" || cookie != GetCSRFTokenByHeader(r) {
+			http.Error(w, "Invalid CSRF token", http.StatusForbidden)
+			return false
+		}
+	}
+	return true
+}
+
+func authSourceAllowed(r *http.Request, trusted string) bool {
+	raw := r.Header.Get("Origin")
+	if raw == "" {
+		raw = r.Header.Get("Referer")
+	}
+	source, err := url.Parse(raw)
+	if err != nil || source.User != nil || source.Host == "" || (source.Scheme != "http" && source.Scheme != "https") {
+		return false
+	}
+	origin := source.Scheme + "://" + source.Host
+	if r.Header.Get("Origin") != "" && raw != origin {
+		return false
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if origin == scheme+"://"+r.Host {
+		return true
+	}
+	for _, allowed := range strings.Split(trusted, ",") {
+		if origin == strings.TrimSpace(allowed) {
+			return true
+		}
+	}
+	return false
+}

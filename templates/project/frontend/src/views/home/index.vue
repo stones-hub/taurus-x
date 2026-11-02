@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import { Expand, Fold, SwitchButton } from '@element-plus/icons-vue'
 import SidebarMenu from '../../components/SidebarMenu.vue'
 import { useAuthStore } from '../../store/auth'
@@ -134,9 +135,13 @@ function onTopSelect(item: MenuNode) {
   sidebarCollapsed.value = false
 }
 
-function onLogout() {
-  auth.logout()
-  router.replace('/login')
+async function onLogout() {
+  try {
+    await auth.logout()
+    await router.replace('/login')
+  } catch {
+    ElMessage.error('退出失败，服务端会话未确认吊销，请重试')
+  }
 }
 
 // 进入个人中心（已有的 profile 路由，不是新页面）

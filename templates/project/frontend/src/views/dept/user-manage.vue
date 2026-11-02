@@ -6,6 +6,7 @@ import { ElMessage } from 'element-plus'
 import { apiBatchUpdateDeptUser, apiGetDeptUserOptions } from '../../api/dept'
 import { apiGetUserList } from '../../api/user-manage'
 import { QUERY_ALL } from '../../types'
+import { collectPages } from '../../utils/pagination'
 
 const route = useRoute()
 const router = useRouter()
@@ -14,6 +15,7 @@ const deptId = computed(() => Number(route.query.dept_id) || 0)
 
 const loading = ref(false)
 const submitLoading = ref(false)
+const dataReady = ref(false)
 
 // 所有用户（穿梭框左侧）
 const allUsers = ref<{ label: string; key: number }[]>([])
@@ -22,27 +24,33 @@ const selectedKeys = ref<number[]>([])
 
 async function loadData() {
   loading.value = true
+  dataReady.value = false
   try {
     // 左：所有用户
-    const users = await apiGetUserList({
-      page_no: 1,
-      page_size: 1000,
+    const users = await collectPages((page_no, page_size) => apiGetUserList({
+      page_no,
+      page_size,
       username_mobile_email: '',
       status: QUERY_ALL,
-    })
-    allUsers.value = (users.list ?? []).map((u) => ({
+    }), (user) => user.user_id)
+    allUsers.value = users.map((u) => ({
       label: `${u.realname || u.username} (${u.username})`,
       key: u.user_id,
     }))
     // 右：部门已有员工
-    const deptUsers = await apiGetDeptUserOptions(deptId.value, 1, 1000)
-    selectedKeys.value = (deptUsers.list ?? []).map((d) => d.user_id)
+    const deptUsers = await collectPages((page, size) => apiGetDeptUserOptions(deptId.value, page, size), (user) => user.user_id)
+    selectedKeys.value = deptUsers.map((member) => member.user_id)
+    dataReady.value = true
   } finally {
     loading.value = false
   }
 }
 
 async function onSave() {
+  if (!dataReady.value) {
+    ElMessage.error('员工列表尚未完整加载，请重新加载后保存')
+    return
+  }
   submitLoading.value = true
   try {
     await apiBatchUpdateDeptUser({ dept_id: deptId.value, user_ids: selectedKeys.value })

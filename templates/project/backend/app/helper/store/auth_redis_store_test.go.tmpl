@@ -3,12 +3,14 @@ package store
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
 
 // fakeKV 内存版 KVStore，可切换为「故障」状态，用来覆盖 Redis 不可用的分支。
 type fakeKV struct {
+	mu      sync.Mutex
 	data    map[string]string
 	failing bool
 }
@@ -20,6 +22,8 @@ func newFakeKV() *fakeKV {
 var errFakeDown = errors.New("fake redis down")
 
 func (f *fakeKV) Get(_ context.Context, key string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.failing {
 		return "", errFakeDown
 	}
@@ -28,6 +32,8 @@ func (f *fakeKV) Get(_ context.Context, key string) (string, error) {
 }
 
 func (f *fakeKV) Set(_ context.Context, key string, value interface{}, _ time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.failing {
 		return errFakeDown
 	}
@@ -40,6 +46,8 @@ func (f *fakeKV) Set(_ context.Context, key string, value interface{}, _ time.Du
 }
 
 func (f *fakeKV) Del(_ context.Context, keys ...string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.failing {
 		return errFakeDown
 	}
@@ -47,6 +55,20 @@ func (f *fakeKV) Del(_ context.Context, keys ...string) error {
 		delete(f.data, k)
 	}
 	return nil
+}
+
+func (f *fakeKV) Rotate(_ context.Context, oldKey, newKey, value string, _ time.Duration) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failing {
+		return false, errFakeDown
+	}
+	if f.data[oldKey] != value || f.data[newKey] != "" {
+		return false, nil
+	}
+	f.data[newKey] = value
+	delete(f.data, oldKey)
+	return true, nil
 }
 
 // fakeAuthVersions 内存版认证版本权威来源，模拟 admin_users.auth_version。

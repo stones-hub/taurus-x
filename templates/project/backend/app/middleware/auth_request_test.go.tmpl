@@ -1,0 +1,46 @@
+package middleware
+
+import (
+	"crypto/tls"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestAuthSourcePolicy(t *testing.T) {
+	cases := []struct {
+		name, origin, referer, trusted, host string
+		tls                                  bool
+		allowed                              bool
+	}{
+		{name: "same origin", origin: "http://example.test", allowed: true},
+		{name: "same origin TLS", origin: "https://example.test", tls: true, allowed: true},
+		{name: "Vite preserves host", origin: "http://localhost:5173", host: "localhost:5173", allowed: true},
+		{name: "TLS termination explicit", origin: "https://example.test", trusted: "https://example.test", allowed: true},
+		{name: "referer fallback", referer: "http://example.test/login", allowed: true},
+		{name: "foreign", origin: "https://evil.test"},
+		{name: "null", origin: "null"},
+		{name: "missing"},
+		{name: "userinfo", origin: "http://user@example.test"},
+		{name: "path not origin", origin: "http://example.test/path"},
+		{name: "prefix confusion", origin: "http://example.test.evil.test"},
+		{name: "scheme mismatch", origin: "https://example.test"},
+	}
+	for _, testcase := range cases {
+		t.Run(testcase.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "http://example.test/auth/login", nil)
+			if testcase.host != "" {
+				req.Host = testcase.host
+			}
+			if testcase.tls {
+				req.TLS = &tls.ConnectionState{}
+			}
+			req.Header.Set("Origin", testcase.origin)
+			req.Header.Set("Referer", testcase.referer)
+			req.Header.Set("X-Forwarded-Host", "evil.test")
+			req.Header.Set("X-Forwarded-Proto", "https")
+			if authSourceAllowed(req, testcase.trusted) != testcase.allowed {
+				t.Fatal("unexpected source policy result")
+			}
+		})
+	}
+}

@@ -35,7 +35,7 @@
 // 覆盖范围（所有会改账号或账号角色的入口都走同一套协议）：
 //   - AdminUserService.UpdateUser（资料 / 重置密码 / 角色）
 //   - AdminUserService.UpdateUserStatus、DeleteUser（禁用 / 软删）
-//   - AdminRoleService.UpdateUserRoles（角色分配与撤销，也是「新增用户后赋角色」走的入口）
+//   - AdminRoleService.UpdateUserRoles（角色分配与撤销）；新增账号在同一事务内校验初始角色并写入
 //   - AuthService.ChangePassword 走 lockSelfUserRow：自助改密不做身份判定，
 //     锁本人用户行只为统一「先用户行、再凭证行」的加锁顺序（见该函数注释）。
 //

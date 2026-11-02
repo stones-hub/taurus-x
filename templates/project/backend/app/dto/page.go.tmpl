@@ -1,5 +1,7 @@
 package dto
 
+import "{{ .Module }}/app/helper"
+
 // PageQuery 分页查询参数（deep module）。
 //
 // 它是一个可匿名嵌入到各 ListRequest 的公共分页基底：承载「分页参数
@@ -23,10 +25,5 @@ func (p *PageQuery) Normalize() {
 // NormalizePageSize 归一化分页参数并指定页大小默认值。
 // 供「有意用非 15 默认页大小」的模块使用（如权限列表默认 50）。
 func (p *PageQuery) NormalizePageSize(defaultPageSize int) {
-	if p.PageNo <= 0 {
-		p.PageNo = 1
-	}
-	if p.PageSize <= 0 {
-		p.PageSize = defaultPageSize
-	}
+	p.PageNo, p.PageSize = helper.NormalizePagination(p.PageNo, p.PageSize, defaultPageSize)
 }

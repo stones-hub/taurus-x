@@ -1,0 +1,93 @@
+package controller
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"net/http/httptest"
+	"testing"
+
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
+
+	"{{ .Module }}/app/dto"
+)
+
+func creationRequest(t *testing.T) dto.AddUserRequest {
+	t.Helper()
+	value := make([]byte, 8)
+	if _, err := rand.Read(value); err != nil {
+		t.Fatal(err)
+	}
+	return dto.AddUserRequest{Username: "new-policy-user", Password: "A1" + hex.EncodeToString(value), Mobile: "13800000000", RoleIDs: []uint64{roleOrdinaryID}}
+}
+
+func expectCreationPrechecks(mock sqlmock.Sqlmock) {
+	mock.ExpectQuery(sel("admin_users")).WillReturnRows(userRows())
+	mock.ExpectQuery(sel("admin_users")).WillReturnRows(userRows())
+	mock.ExpectBegin()
+}
+
+func TestAddUserTransactionalFailuresAndSuccess(t *testing.T) {
+	for _, stage := range []string{"invalid-role", "protected-role", "user-insert", "credential-insert", "role-insert", "success"} {
+		t.Run(stage, func(t *testing.T) {
+			controller, mock := newUserController(t)
+			req := creationRequest(t)
+			operatorID := operatorSuperID
+			if stage == "protected-role" {
+				operatorID = operatorOrdinaryID
+				req.RoleIDs = []uint64{roleSuperID}
+			}
+			expectCreationPrechecks(mock)
+			expectLockUserRow(mock, operatorID, "operator")
+			if operatorID == operatorSuperID {
+				expectRolesOf(mock, operatorID, superRole)
+			} else {
+				expectRolesOf(mock, operatorID, ordinaryRole)
+			}
+			if stage == "invalid-role" {
+				mock.ExpectQuery(shareSel("admin_roles")).WillReturnRows(roleRows())
+			} else if stage == "protected-role" {
+				mock.ExpectQuery(shareSel("admin_roles")).WillReturnRows(roleRows().AddRow(roleSuperID, superRole.roleCode, 1, 1))
+			} else {
+				mock.ExpectQuery(shareSel("admin_roles")).WillReturnRows(roleRows().AddRow(roleOrdinaryID, ordinaryRole.roleCode, 0, 1))
+				if stage == "user-insert" {
+					mock.ExpectExec(ins("admin_users")).WillReturnError(errors.New("simulated user write failure"))
+				} else {
+					mock.ExpectExec(ins("admin_users")).WillReturnResult(sqlmock.NewResult(99, 1))
+					mock.ExpectQuery(sel("admin_user_logins")).WillReturnRows(sqlmock.NewRows([]string{"login_id"}))
+					if stage == "credential-insert" {
+						mock.ExpectExec(ins("admin_user_logins")).WillReturnError(errors.New("simulated credential write failure"))
+					} else {
+						mock.ExpectExec(ins("admin_user_logins")).WillReturnResult(sqlmock.NewResult(99, 1))
+						mock.ExpectExec(del("admin_user_roles")).WithArgs(uint64(99)).WillReturnResult(sqlmock.NewResult(0, 0))
+						if stage == "role-insert" {
+							mock.ExpectExec(ins("admin_user_roles")).WillReturnError(errors.New("simulated role write failure"))
+						} else {
+							mock.ExpectExec(ins("admin_user_roles")).WillReturnResult(sqlmock.NewResult(99, 1))
+						}
+					}
+				}
+			}
+			if stage == "success" {
+				mock.ExpectCommit()
+			} else {
+				mock.ExpectRollback()
+			}
+			recorder := httptest.NewRecorder()
+			controller.AddUser(recorder, jwtRequest(t, operatorID, req))
+			code := respCode(t, recorder)
+			if stage == "success" && code != 200 {
+				t.Fatalf("creation failed: code=%d", code)
+			}
+			if stage == "protected-role" && code != 403 {
+				t.Fatalf("protected role accepted: code=%d", code)
+			}
+			if stage != "success" && code == 200 {
+				t.Fatal("failed transaction reported success")
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}

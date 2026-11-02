@@ -58,6 +58,8 @@
   - 非 200 成功码（如 `201 Created`）保留 `httpx.SendResponse`（`OK` 固定 200）。
 
 ### 6. service 查询三板斧（PageQuery / ListFilter / GenerateCode）
+
+- 分页公共实现为`helper.NormalizePagination`：默认15（权限50）、上限200，安全计算偏移；DTO、service和repo直接调用均需覆盖。全量选择通过前端`collectPages`逐页读取，完整加载前禁止提交，详见`商用加固一期说明.md`。
 - **分页归一化用 `dto.PageQuery.Normalize()`**（`app/dto/page.go`）：分页请求 DTO 匿名嵌入 `PageQuery`（`PageNo/PageSize` 字段提升 + JSON 平铺不变），列表方法开头调 `req.Normalize()`；**禁止手写 `if page <= 0 { page = 1 }` 样板**。特殊页大小用 `NormalizePageSize(n)`（如权限列表 50）。
 - **列表查询走 repo 的 `XxxListFilter` + `ListWithFilter`**（filter struct 与分页方法定义在 `app/repo/<实体>_repo.go`）：service 只把 dto 筛选字段映射到 filter struct，再调 `xxxRepo.ListWithFilter(ctx, page, pageSize, filter)`。**禁止在 service 里用 WhereBuilder 拼条件字符串、禁止 `wb.Raw(...)` 手写 SQL 片段**（条件构建全部下沉 repo）；子查询 / NOT EXISTS / IN / OR / 多字段 LIKE 等复杂条件语义化命名后下沉为 repo 领域方法。分页实现统一走 `baseRepository.page`（内部 `paginate`），**禁止手写 `Count + Offset + Limit` 样板**。
 - **编号生成用 `helper.GenerateCode(ctx, prefix, existsFunc)`**（`app/helper/code.go`）：收敛「前缀 + 秒级时间戳 + 查重 + 毫秒兜底」；有特殊编号逻辑（额外重试、调用方传入 code 校验）的模块保留自身实现，勿强行统一（避免行为风险）。编号真正唯一性靠**数据库唯一索引**，本函数只是「尽量唯一」。
@@ -104,8 +106,9 @@
 - `SessionValidator` 紧跟 `JWT`：JWT 只验签名，会话是否已被吊销（改密 / 禁用 / 登出）
   由 `SessionValidator` 比对 `admin_users.auth_version` 判定，二者缺一不可。
 - 不走这三条链的例外（各自单独定义，别往链里塞）：
-  - `/auth/login`：`Recovery → BodyLimit → RateLimit("login") → AccessLog`（无 JWT，带登录限流）；
-  - `/auth/logout`：`Recovery → BodyLimit → AccessLog`（无 JWT、**故意不限流**，Token 过期也要能清会话）；
+  - `/auth/login`：`Recovery → AuthRequest(false) → BodyLimit → RateLimit("login") → AccessLog`（仅POST，可信来源，无JWT）；
+  - `/auth/logout`：`Recovery → LogoutRequest → BodyLimit → AccessLog`（始终仅POST及可信来源；本地校验有效JWT还必须CSRF并吊销，JWT缺失/过期/无效签名可安全清Cookie，不依赖Redis判断过期；故意不限流）；
+  - `/user/refresh-token`：`AuthRequest(true) → userBaseChain`，在JWT与会话读写前拒绝错误方法/来源/CSRF；
   - `/admin/user/bind-mobile`、`unbind-mobile`：在 `BodyLimit → AdminRateLimit` 之后额外插
     `RateLimit("verify_code")`；
   - `/admin/user/send-code`：`Recovery → BodyLimit → AdminRateLimit → RateLimit("send_code") → AccessLog`

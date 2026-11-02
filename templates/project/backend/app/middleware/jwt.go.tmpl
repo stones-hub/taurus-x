@@ -163,8 +163,7 @@ func RefreshJWTToken(w http.ResponseWriter, token string) (string, error) {
 // 刷新却按新版本登记，于是刚被吊销的会话借刷新续了命。沿用旧版本后，
 // 这种并发下新 Token 的版本已经落后，下一次校验必然被拒。
 //
-// 顺序也是刻意的：先登记新的、再吊销旧的。登记失败时旧会话保持可用（刷新失败
-// 不该把人踢下线），而不会出现「旧的已吊销、新的没发出来」。
+// Redis 在一个原子操作中核对并消费旧会话、登记新会话；旧会话最多成功轮换一次。
 func rotateSession(s SessionStore, userID uint64, oldJTI string,
 	sign func() (token, jti string, ttl time.Duration, err error)) (string, error) {
 	authVersion, err := s.ValidateSession(userID, oldJTI)
@@ -175,23 +174,26 @@ func rotateSession(s SessionStore, userID uint64, oldJTI string,
 	if err != nil {
 		return "", err
 	}
-	if err := s.RegisterSession(userID, newJTI, ttl, authVersion); err != nil {
+	if err := s.RotateSession(userID, oldJTI, newJTI, ttl, authVersion); err != nil {
 		return "", fmt.Errorf("刷新 Token 失败: %w", err)
-	}
-	// 新 Token 已登记成功，旧的立即失效，避免一次刷新留下两个可用 Token
-	if err := s.RevokeSession(oldJTI); err != nil {
-		return "", err
 	}
 	return newToken, nil
 }
 
 // SetJWTToken 设置 JWT 令牌到响应头与 Cookie
-func SetJWTToken(w http.ResponseWriter, token string) {
-	expireHours := taurus.Container.Config.GetInt("http.jwt.expire_hours")
-	if expireHours <= 0 {
-		expireHours = 24
+func JWTExpiresAt(token string) (time.Time, error) {
+	_, claims, err := ValidateJWTToken(token)
+	if err != nil {
+		return time.Time{}, err
 	}
-	expiresAt := time.Now().Add(time.Duration(expireHours) * time.Hour)
+	return time.Unix(claims.ExpiresAt, 0), nil
+}
+
+func SetJWTToken(w http.ResponseWriter, token string) {
+	expiresAt, err := JWTExpiresAt(token)
+	if err != nil {
+		return
+	}
 	w.Header().Set(JWTTokenKey, token)
 	http.SetCookie(w, &http.Cookie{
 		Name:     JWTTokenKey,
@@ -247,6 +249,7 @@ func ClearJWTToken(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     JWTTokenKey,
 		Value:    "",
+		MaxAge:   -1,
 		Expires:  time.Now().Add(-1 * time.Hour),
 		Path:     "/",
 		HttpOnly: true,

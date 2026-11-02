@@ -220,6 +220,8 @@ mysql -uroot -p {{ .DBName }} -e "UPDATE admin_user_logins SET login_credential=
 
 ### 已落实的加固（代码层面，含单元测试）
 
+一期接口、Cookie、单次轮换及并发边界、账号/部门事务、分页兼容和待验收事项见`docs/商用加固一期说明.md`。HTTPS代理须配置`AUTH_TRUSTED_ORIGINS`及`JWT_COOKIE_SECURE=true`；前端测试要求Node22.18+。代码和单元测试不替代独立真库及HTTPS浏览器验收。
+
 下面这些改动已经进代码并有对应单元测试覆盖；**是否满足你的业务验收仍需你自己在
 本机跑一遍真实流程确认**，这里不代表已通过业务验收。
 
@@ -275,7 +277,7 @@ mysql -uroot -p {{ .DBName }} -e "UPDATE admin_user_logins SET login_credential=
     同样锁得住；固定升序让交叉管理不会锁序反转；锁等待超时 / 死锁一律整笔回滚，
     不做隐式重试。自助改密走同一个「先锁用户行」的开头，只为统一加锁顺序；
   - 覆盖的入口：`/admin/user/update`、`update-status`、`delete`、
-    `/admin/role/assign`（新增用户后赋角色也走它），以及自助 `change-password`
+    `/admin/role/assign`、新增账号事务内的初始角色校验及写入，以及自助 `change-password`
     的锁顺序对齐；
   - 角色关联的整体替换按 `user_id` 条件删一次再插入，不再「先查关联行、按主键逐行删」——
     后者只删得掉自己快照里的行，快照之后新增的关联行会留下来；

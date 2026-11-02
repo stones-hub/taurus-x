@@ -1,5 +1,7 @@
 # {{ .ProjectName }} 部署文档
 
+认证加固配置：HTTPS反向代理终止TLS时须显式设置`AUTH_TRUSTED_ORIGINS=https://实际后台域名`及`JWT_COOKIE_SECURE=true`，Compose已透传；不采信任意客户端转发头。认证接口仅POST并校验来源，刷新始终校验CSRF；退出在本地JWT有效时严格校验CSRF并吊销，缺失/过期/无效签名JWT可安全清Cookie，不将Redis故障当成过期。详见`商用加固一期说明.md`。下文历史部署验证不能代替模板修改后本候选的真库、HTTPS及浏览器验收。
+
 > 前端是纯静态文件，由 Go 后端托管（含 SPA history 回退），**运行时不需要 Node**，一个端口同时提供页面和接口。
 >
 > 本文提供三种部署方式，按目标机器选一种：

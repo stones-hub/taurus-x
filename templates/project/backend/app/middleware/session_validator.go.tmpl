@@ -20,6 +20,7 @@ type SessionStore interface {
 	RegisterSession(userID uint64, jti string, ttl time.Duration, authVersion int64) error
 	ValidateSession(userID uint64, jti string) (int64, error)
 	RevokeSession(jti string) error
+	RotateSession(userID uint64, oldJTI, newJTI string, ttl time.Duration, authVersion int64) error
 }
 
 // 默认用 Redis 实现；实例内部惰性解析组件容器，所以这里可以在 init 阶段构造。

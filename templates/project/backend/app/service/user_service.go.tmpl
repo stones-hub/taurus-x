@@ -39,6 +39,7 @@ func NewAdminUserService(store *repo.Store) *AdminUserService {
 
 // GetUserList 分页查询用户列表（支持 用户名/手机号/邮箱 模糊 + 状态过滤）
 func (s *AdminUserService) GetUserList(ctx context.Context, page, pageSize int, keyword string, status int) (*dto.UserListResponse, error) {
+	page, pageSize = helper.NormalizePagination(page, pageSize, 15)
 	users, total, err := s.userRepo.ListByKeyword(ctx, page, pageSize, keyword, status)
 	if err != nil {
 		return nil, err
@@ -62,6 +63,7 @@ func (s *AdminUserService) GetUserList(ctx context.Context, page, pageSize int, 
 // 选项接口不做接口权限校验，任何登录用户都能调，所以绝不能把
 // 手机号、邮箱、最后登录 IP 这些字段带出去。
 func (s *AdminUserService) GetUserOptions(ctx context.Context, page, pageSize int, keyword string, status int) (*dto.UserOptionListResponse, error) {
+	page, pageSize = helper.NormalizePagination(page, pageSize, 15)
 	users, total, err := s.userRepo.ListByKeyword(ctx, page, pageSize, keyword, status)
 	if err != nil {
 		return nil, err
@@ -96,16 +98,13 @@ func (s *AdminUserService) GetUserInfo(ctx context.Context, userID uint64) (*dto
 }
 
 // AddUser 新增用户（账号密码），返回新用户 ID
-func (s *AdminUserService) AddUser(ctx context.Context, req *dto.AddUserRequest) (uint64, error) {
+func (s *AdminUserService) AddUser(ctx context.Context, operatorID uint64, req *dto.AddUserRequest) (uint64, error) {
 	if req.Username == "" || req.Password == "" || req.Mobile == "" {
 		return 0, errors.New("用户名、密码、手机号不能为空")
 	}
 	if err := helper.ValidatePasswordStrength(req.Password); err != nil {
 		return 0, err
 	}
-	// 散列先算好再建号：bcrypt 是纯计算，放在任何写入之前，
-	// 「密码超长」这类错误就不会留下一个「用户行已建、登录方式没建」的半成品账号
-	//（这两步不在同一个事务里）。
 	hashed, err := helper.HashPassword(req.Password)
 	if err != nil {
 		return 0, err
@@ -163,12 +162,30 @@ func (s *AdminUserService) AddUser(ctx context.Context, req *dto.AddUserRequest)
 		// 「查不到用户」而拒绝，新建的账号会一登录就被拒。
 		AuthVersion: 1,
 	}
-	if err := s.userRepo.Create(ctx, user); err != nil {
-		return 0, err
-	}
-
-	// 创建用户名密码登录方式（散列在函数开头就算好了）
-	if err := s.loginRepo.SyncPasswordHash(ctx, user.UserID, req.Username, hashed); err != nil {
+	err = s.store.RunInTx(ctx, func(tx *repo.Tx) error {
+		guard, err := guardUserWrite(ctx, tx, operatorID, operatorID)
+		if err != nil {
+			return err
+		}
+		next, err := txRoleFactsByIDs(ctx, tx, req.RoleIDs)
+		if err != nil {
+			return err
+		}
+		if err := CheckRoleAssignmentAllowed(guard.OperatorIsSuperAdmin, nil, next); err != nil {
+			return err
+		}
+		if err := CheckRoleStatusAssignable(nil, next); err != nil {
+			return err
+		}
+		if err := tx.User().Create(ctx, user); err != nil {
+			return err
+		}
+		if err := tx.UserLogin().SyncPasswordHash(ctx, user.UserID, req.Username, hashed); err != nil {
+			return err
+		}
+		return replaceUserRolesTx(ctx, tx, user.UserID, req.RoleIDs)
+	})
+	if err != nil {
 		return 0, err
 	}
 	return user.UserID, nil

@@ -4,6 +4,7 @@
 import axios, { type AxiosInstance, type AxiosRequestConfig } from 'axios'
 import { ElMessage } from 'element-plus'
 import type { ApiResponse } from '../types'
+import { clearLocalAuth } from '../store/session'
 
 // API baseURL（导出供 frontError 等独立 axios 实例复用，避免重复 env 解析）
 export const baseURL = import.meta.env.VITE_API_BASE_URL ?? '/api'
@@ -98,7 +99,8 @@ instance.interceptors.response.use(
     // 与业务错误走同一套取值优先级：真实非 2xx（429 等）的中文提示在 data 里，
     // 只读 data.message 的话用户看到的永远是兜底的「请求失败」。
     const msg = extractError(error.response?.data as ApiResponse | undefined)
-    if (status === 401) {
+    if (status === 401 && error.config?.url !== '/auth/logout') {
+      clearLocalAuth()
       localStorage.removeItem('token')
       ElMessage({ message: '登录已过期，请重新登录', type: 'error', grouping: true })
       if (window.location.pathname !== '/login') {
@@ -117,7 +119,8 @@ export async function request<T>(config: AxiosRequestConfig): Promise<T> {
   const body = res.data
   if (body.code < 200 || body.code >= 300) {
     const msg = extractError(body)
-    if (body.code === 401) {
+    if (body.code === 401 && config.url !== '/auth/logout') {
+      clearLocalAuth()
       localStorage.removeItem('token')
     }
     showError(msg)

@@ -1,0 +1,68 @@
+package service
+
+import (
+	"strings"
+	"testing"
+	"unicode/utf8"
+)
+
+func TestClampLenUTF8Boundaries(t *testing.T) {
+	for _, value := range []string{"", "ascii", "中文🙂尾巴", strings.Repeat("🙂中a", 100000)} {
+		for _, limit := range []int{1, 2, 3, 4, 5, 6, 7, 45, 500} {
+			result := clampLen(value, limit)
+			if len(result) > limit || !utf8.ValidString(result) || !strings.HasPrefix(value, result) {
+				t.Fatalf("invalid prefix: limit=%d bytes=%d", limit, len(result))
+			}
+			if len(result) < len(value) {
+				next, _ := utf8.DecodeRuneInString(value[len(result):])
+				if len(result)+utf8.RuneLen(next) <= limit {
+					t.Fatalf("prefix is not maximal: limit=%d bytes=%d", limit, len(result))
+				}
+			}
+		}
+	}
+}
+
+func BenchmarkClampLenLongInput(bench *testing.B) {
+	value := strings.Repeat("🙂中a", 100000)
+	bench.ReportAllocs()
+	bench.ResetTimer()
+	for index := 0; index < bench.N; index++ {
+		_ = clampLen(value, 500)
+	}
+}
+
+func TestClampLenInvalidUTF8(t *testing.T) {
+	cases := []struct {
+		name, input, expected string
+		limit                 int
+	}{
+		{name: "invalid first byte", input: "\xff" + strings.Repeat("a", 500), expected: "�" + strings.Repeat("a", 497), limit: 500},
+		{name: "short invalid byte", input: "\xff", expected: "�", limit: 500},
+		{name: "isolated continuation", input: "a\x80b", expected: "a�b", limit: 500},
+		{name: "incomplete suffix", input: "a\xe4\xb8", expected: "a��", limit: 500},
+		{name: "replacement at budget", input: "aa\xffb", expected: "aa�", limit: 5},
+		{name: "replacement exceeds budget", input: "aaa\xffb", expected: "aaa", limit: 5},
+		{name: "valid replacement", input: "aa�b", expected: "aa�", limit: 5},
+		{name: "no replacement space", input: "\xffa", expected: "", limit: 2},
+		{name: "long invalid input", input: strings.Repeat("\xff", 1000000), expected: strings.Repeat("�", 166), limit: 500},
+		{name: "unlimited budget", input: "\xffabc", expected: "�abc", limit: 0},
+	}
+	for _, testcase := range cases {
+		t.Run(testcase.name, func(t *testing.T) {
+			result := clampLen(testcase.input, testcase.limit)
+			if result != testcase.expected || (testcase.limit > 0 && len(result) > testcase.limit) || !utf8.ValidString(result) {
+				t.Fatalf("unexpected sanitized bytes: %q", result)
+			}
+		})
+	}
+}
+
+func BenchmarkClampLenInvalidLongInput(bench *testing.B) {
+	value := "\xff" + strings.Repeat("🙂中a", 100000)
+	bench.ReportAllocs()
+	bench.ResetTimer()
+	for index := 0; index < bench.N; index++ {
+		_ = clampLen(value, 500)
+	}
+}

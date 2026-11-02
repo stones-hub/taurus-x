@@ -1,0 +1,110 @@
+package controller
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
+
+	"{{ .Module }}/app/dto"
+	"{{ .Module }}/app/repo"
+	"{{ .Module }}/app/service"
+)
+
+func TestDeptReplacementTransactionBoundaries(t *testing.T) {
+	for _, stage := range []string{"invalid-user", "user-query-failure", "insert-failure", "deduplicate", "empty-clear"} {
+		t.Run(stage, func(t *testing.T) {
+			database, mock := newMockDB(t)
+			dept := service.NewAdminDeptService(repo.NewStoreWithDB(database))
+			mock.ExpectBegin()
+			mock.ExpectQuery(lockSel("admin_depts")).WithArgs(uint64(5), 1).WillReturnRows(sqlmock.NewRows([]string{"dept_id", "status"}).AddRow(5, 1))
+			mock.ExpectQuery(sel("admin_depts")).WillReturnRows(sqlmock.NewRows([]string{"dept_id", "status"}).AddRow(5, 1))
+			mock.ExpectQuery(sel("admin_user_depts")).WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "dept_id", "is_manager", "status"}).AddRow(11, 7, 5, 1, 1))
+			ids := []uint64{8, 8}
+			if stage == "empty-clear" {
+				ids = nil
+			}
+			if stage == "invalid-user" {
+				mock.ExpectQuery(lockSel("admin_users")).WithArgs(uint64(8), 1).WillReturnRows(userRows())
+			} else if stage == "user-query-failure" {
+				mock.ExpectQuery(lockSel("admin_users")).WillReturnError(errors.New("simulated user query failure"))
+			} else {
+				if len(ids) > 0 {
+					mock.ExpectQuery(lockSel("admin_users")).WithArgs(uint64(8), 1).WillReturnRows(userRows().AddRow(8, "new-member", 1, 1))
+				}
+				mock.ExpectQuery(sel("admin_user_depts")).WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "dept_id"}).AddRow(11, 7, 5))
+				mock.ExpectExec(del("admin_user_depts")).WithArgs(uint64(11)).WillReturnResult(sqlmock.NewResult(0, 1))
+				if stage == "insert-failure" {
+					mock.ExpectExec(ins("admin_user_depts")).WillReturnError(errors.New("simulated member insert failure"))
+				} else if stage == "deduplicate" {
+					mock.ExpectExec(ins("admin_user_depts") + ".* VALUES \\([^)]*\\)$").WillReturnResult(sqlmock.NewResult(12, 1))
+				}
+			}
+			failure := stage == "invalid-user" || stage == "user-query-failure" || stage == "insert-failure"
+			if failure {
+				mock.ExpectRollback()
+			} else {
+				mock.ExpectCommit()
+			}
+			err := dept.BatchUpdateDeptUser(context.Background(), &dto.BatchUpdateDeptUserRequest{DeptID: 5, UserIDs: ids})
+			if (err != nil) != failure {
+				t.Fatalf("unexpected transaction outcome: %v", err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestDeptMemberWritersFailClosedAtStableAnchor(t *testing.T) {
+	for _, entry := range []string{"add", "update", "remove", "replace", "delete-dept"} {
+		t.Run(entry, func(t *testing.T) {
+			database, mock := newMockDB(t)
+			dept := service.NewAdminDeptService(repo.NewStoreWithDB(database))
+			if entry == "update" || entry == "remove" {
+				mock.ExpectQuery(sel("admin_user_depts")).WillReturnRows(sqlmock.NewRows([]string{"id", "dept_id"}).AddRow(11, 5))
+			}
+			mock.ExpectBegin()
+			mock.ExpectQuery(lockSel("admin_depts")).WithArgs(uint64(5), 1).WillReturnError(errors.New("simulated anchor lock failure"))
+			mock.ExpectRollback()
+			var err error
+			switch entry {
+			case "add":
+				err = dept.AddDeptUser(context.Background(), &dto.AddDeptUserRequest{DeptID: 5, UserIDs: []uint64{8}})
+			case "update":
+				err = dept.UpdateDeptUser(context.Background(), &dto.UpdateDeptUserRequest{ID: 11})
+			case "remove":
+				err = dept.RemoveDeptUser(context.Background(), &dto.RemoveDeptUserRequest{ID: 11})
+			case "replace":
+				err = dept.BatchUpdateDeptUser(context.Background(), &dto.BatchUpdateDeptUserRequest{DeptID: 5})
+			case "delete-dept":
+				err = dept.DeleteDept(context.Background(), 5)
+			}
+			if err == nil {
+				t.Fatal("failed department lock allowed a write")
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestDeptReplacementRetainsExistingMemberAttributes(t *testing.T) {
+	database, mock := newMockDB(t)
+	dept := service.NewAdminDeptService(repo.NewStoreWithDB(database))
+	mock.ExpectBegin()
+	mock.ExpectQuery(lockSel("admin_depts")).WithArgs(uint64(5), 1).WillReturnRows(sqlmock.NewRows([]string{"dept_id"}).AddRow(5))
+	mock.ExpectQuery(sel("admin_depts")).WillReturnRows(sqlmock.NewRows([]string{"dept_id"}).AddRow(5))
+	mock.ExpectQuery(sel("admin_user_depts")).WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "dept_id", "is_manager", "is_primary", "status"}).AddRow(11, 7, 5, 1, 1, 1))
+	mock.ExpectQuery(lockSel("admin_users")).WithArgs(uint64(7), 1).WillReturnRows(userRows().AddRow(7, "held-member", 1, 1))
+	mock.ExpectCommit()
+	if err := dept.BatchUpdateDeptUser(context.Background(), &dto.BatchUpdateDeptUserRequest{DeptID: 5, UserIDs: []uint64{7, 7}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}

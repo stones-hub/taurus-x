@@ -8,6 +8,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"{{ .Module }}/app/helper"
 	"{{ .Module }}/internal/taurus"
 )
 
@@ -181,6 +182,7 @@ func (r *baseRepository[T]) Save(ctx context.Context, entity *T) error {
 // paginate 执行分页查询：统计 total 并按 orderBy（含方向，如 "id DESC"）排序后分页填充 out。
 // q 需已 Model + 已加 Where 条件。
 func paginate[T any](q *gorm.DB, page, pageSize int, orderBy string, out *[]T) (int64, error) {
+	page, pageSize = helper.NormalizePagination(page, pageSize, 15)
 	var total int64
 	if err := q.Count(&total).Error; err != nil {
 		return 0, fmt.Errorf("count query failed: %w", err)

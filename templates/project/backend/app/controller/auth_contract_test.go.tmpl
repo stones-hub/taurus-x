@@ -1,0 +1,374 @@
+package controller
+
+import (
+	"bytes"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	"github.com/dgrijalva/jwt-go"
+	"github.com/stones-hub/taurus-pro-common/pkg/util/tcrypt"
+	"github.com/stones-hub/taurus-pro-config/pkg/config"
+	"github.com/stones-hub/taurus-pro-http/pkg/router"
+
+	"{{ .Module }}/app/dto"
+	"{{ .Module }}/app/helper"
+	"{{ .Module }}/app/middleware"
+	"{{ .Module }}/app/repo"
+	"{{ .Module }}/app/service"
+	"{{ .Module }}/internal/taurus"
+)
+
+type authPolicySessions struct {
+	revokeError error
+	rotations   int
+	revocations int
+	validations int
+}
+
+func (s *authPolicySessions) RegisterSession(uint64, string, time.Duration, int64) error { return nil }
+func (s *authPolicySessions) ValidateSession(uint64, string) (int64, error) {
+	s.validations++
+	return 1, nil
+}
+func (s *authPolicySessions) RotateSession(uint64, string, string, time.Duration, int64) error {
+	s.rotations++
+	return nil
+}
+func (s *authPolicySessions) RevokeSession(string) error {
+	s.revocations++
+	return s.revokeError
+}
+
+func authPolicyConfig(t *testing.T, secure bool) *authPolicySessions {
+	t.Helper()
+	previousContainer := taurus.Container
+	previousSessions := middleware.AuthSessionStore()
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.New(config.WithPrintEnable(false))
+	cfg.MergeMap(map[string]interface{}{"http": map[string]interface{}{
+		"jwt":                  map[string]interface{}{"secret": hex.EncodeToString(secret), "issuer": "policy-test", "expire_hours": 2, "secure": secure},
+		"auth_trusted_origins": "none",
+	}})
+	taurus.Container = &taurus.Components{Config: cfg}
+	sessions := &authPolicySessions{}
+	middleware.SetAuthSessionStore(sessions)
+	t.Cleanup(func() {
+		taurus.Container = previousContainer
+		middleware.SetAuthSessionStore(previousSessions)
+	})
+	return sessions
+}
+
+func authPolicyRequest(path string, body []byte, token string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "http://example.test"+path, bytes.NewReader(body))
+	req.Header.Set("Origin", "http://example.test")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(middleware.CSRFTokenKey, "csrf-policy-marker")
+	req.AddCookie(&http.Cookie{Name: middleware.CSRFTokenKey, Value: "csrf-policy-marker"})
+	if token != "" {
+		req.AddCookie(&http.Cookie{Name: middleware.JWTTokenKey, Value: token})
+	}
+	return req
+}
+
+func assertJWTCookie(t *testing.T, recorder *httptest.ResponseRecorder, secure, cleared bool) *http.Cookie {
+	t.Helper()
+	var found []*http.Cookie
+	for _, cookie := range recorder.Result().Cookies() {
+		if cookie.Name == middleware.JWTTokenKey {
+			found = append(found, cookie)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("expected one JWT cookie, got %d", len(found))
+	}
+	cookie := found[0]
+	var csrfCookies []*http.Cookie
+	for _, csrfCookie := range recorder.Result().Cookies() {
+		if csrfCookie.Name == middleware.CSRFTokenKey {
+			csrfCookies = append(csrfCookies, csrfCookie)
+		}
+	}
+	if len(csrfCookies) != 1 || csrfCookies[0].HttpOnly || csrfCookies[0].Secure != secure || csrfCookies[0].Path != "/" || csrfCookies[0].SameSite != http.SameSiteLaxMode {
+		t.Fatal("incorrect CSRF cookie attributes or count")
+	}
+	if cookie.Secure != secure || !cookie.HttpOnly || cookie.Path != "/" || cookie.SameSite != http.SameSiteLaxMode {
+		t.Fatal("incorrect JWT cookie attributes")
+	}
+	if cleared {
+		if csrfCookies[0].Value != "" || csrfCookies[0].MaxAge != -1 {
+			t.Fatal("CSRF cookie not cleared")
+		}
+		if cookie.Value != "" || cookie.MaxAge != -1 || !cookie.Expires.Before(time.Now()) {
+			t.Fatal("cookie not cleared")
+		}
+	} else {
+		if csrfCookies[0].Value == "" || !csrfCookies[0].Expires.Equal(cookie.Expires) {
+			t.Fatal("CSRF and JWT lifetime differ")
+		}
+		expiresAt, err := middleware.JWTExpiresAt(cookie.Value)
+		if err != nil {
+			t.Fatal("invalid signed response token")
+		}
+		var body struct {
+			Data dto.LoginResponse `json:"data"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if body.Data.Token != cookie.Value || !body.Data.ExpiresAt.Equal(expiresAt) || !cookie.Expires.Equal(expiresAt) {
+			t.Fatal("response, signature, cookie expirations differ")
+		}
+		remaining := time.Until(cookie.Expires)
+		if remaining < 119*time.Minute || remaining > 2*time.Hour {
+			t.Fatal("configured lifetime ignored")
+		}
+	}
+	return cookie
+}
+
+func authPolicyCode(t *testing.T, recorder *httptest.ResponseRecorder) int {
+	t.Helper()
+	var response struct {
+		Code int             `json:"code"`
+		Data json.RawMessage `json:"data"`
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected HTTP status: %d", recorder.Code)
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if !json.Valid(response.Data) {
+		t.Fatal("missing response data")
+	}
+	return response.Code
+}
+
+func TestAuthCookieLoginRefreshLogoutPolicy(t *testing.T) {
+	for _, secure := range []bool{false, true} {
+		t.Run(map[bool]string{false: "http", true: "secure"}[secure], func(t *testing.T) {
+			sessions := authPolicyConfig(t, secure)
+			database, mock := newMockDB(t)
+			store := repo.NewStoreWithDB(database)
+			controller := &AuthController{AuthService: service.NewAuthService(store), LoginLogService: service.NewAdminLoginLogService(store)}
+			passwordBytes := make([]byte, 18)
+			if _, err := rand.Read(passwordBytes); err != nil {
+				t.Fatal(err)
+			}
+			password := hex.EncodeToString(passwordBytes)
+			hash, err := helper.HashPassword(password)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mock.ExpectBegin()
+			mock.ExpectQuery("SELECT .* FROM `admin_users`").WillReturnRows(sqlmock.NewRows([]string{"user_id", "username", "status", "auth_version"}).AddRow(7, "policy-user", 1, 1))
+			mock.ExpectQuery("SELECT .* FROM `admin_user_logins`").WillReturnRows(sqlmock.NewRows([]string{"login_id", "user_id", "login_credential", "salt", "status"}).AddRow(7, 7, hash, "", 1))
+			mock.ExpectCommit()
+			mock.ExpectExec("INSERT INTO `admin_user_login_logs`").WillReturnResult(sqlmock.NewResult(1, 1))
+			body, err := json.Marshal(dto.LoginRequest{Username: "policy-user", Password: password})
+			if err != nil {
+				t.Fatal(err)
+			}
+			login := httptest.NewRecorder()
+			controller.Login(login, authPolicyRequest("/auth/login", body, ""))
+			if authPolicyCode(t, login) != 200 {
+				t.Fatal("login failed")
+			}
+			cookie := assertJWTCookie(t, login, secure, false)
+			refresh := httptest.NewRecorder()
+			controller.RefreshToken(refresh, authPolicyRequest("/user/refresh-token", nil, cookie.Value))
+			if authPolicyCode(t, refresh) != 200 || sessions.rotations != 1 {
+				t.Fatal("refresh failed")
+			}
+			cookie = assertJWTCookie(t, refresh, secure, false)
+			sessions.revokeError = errors.New("simulated revocation failure")
+			failed := httptest.NewRecorder()
+			controller.Logout(failed, authPolicyRequest("/auth/logout", nil, cookie.Value))
+			if authPolicyCode(t, failed) != 500 || len(failed.Result().Cookies()) != 0 {
+				t.Fatal("failed logout cleared cookies or reported success")
+			}
+			sessions.revokeError = nil
+			logout := httptest.NewRecorder()
+			controller.Logout(logout, authPolicyRequest("/auth/logout", nil, cookie.Value))
+			if authPolicyCode(t, logout) != 200 {
+				t.Fatal("logout failed")
+			}
+			assertJWTCookie(t, logout, secure, true)
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestAuthMethodAndCSRFBeforeSideEffects(t *testing.T) {
+	controller := &AuthController{}
+	for _, handler := range []http.HandlerFunc{controller.Login, controller.Logout, controller.RefreshToken} {
+		for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete, http.MethodOptions} {
+			recorder := httptest.NewRecorder()
+			handler(recorder, httptest.NewRequest(method, "/", nil))
+			if recorder.Code != 405 || recorder.Header().Get("Allow") != "POST" || len(recorder.Result().Cookies()) != 0 {
+				t.Fatal("unsupported method changed state")
+			}
+		}
+	}
+	authPolicyConfig(t, false)
+	for _, handler := range []http.HandlerFunc{controller.Login, controller.Logout, controller.RefreshToken} {
+		for _, origin := range []string{"", "null", "https://untrusted.test"} {
+			recorder := httptest.NewRecorder()
+			req := authPolicyRequest("/", nil, "")
+			req.Header.Set("Origin", origin)
+			handler(recorder, req)
+			if recorder.Code != 403 || len(recorder.Result().Cookies()) != 0 {
+				t.Fatal("untrusted auth source changed state")
+			}
+		}
+	}
+	token, err := middleware.GenerateJWTToken("7", "policy-user", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, handler := range []http.HandlerFunc{controller.Logout, controller.RefreshToken} {
+		recorder := httptest.NewRecorder()
+		req := authPolicyRequest("/", nil, token)
+		req.Header.Del(middleware.CSRFTokenKey)
+		handler(recorder, req)
+		if recorder.Code != 403 || len(recorder.Result().Cookies()) != 0 {
+			t.Fatal("missing CSRF accepted")
+		}
+		mismatch := httptest.NewRecorder()
+		req.Header.Set(middleware.CSRFTokenKey, "mismatched-csrf-marker")
+		handler(mismatch, req)
+		if mismatch.Code != 403 || len(mismatch.Result().Cookies()) != 0 {
+			t.Fatal("mismatched CSRF accepted")
+		}
+	}
+}
+
+func TestLogoutExpiredCookiePolicyThroughRoute(t *testing.T) {
+	for _, secure := range []bool{false, true} {
+		t.Run(map[bool]string{false: "http", true: "secure"}[secure], func(t *testing.T) {
+			sessions := authPolicyConfig(t, secure)
+			controller := &AuthController{}
+			manager := router.NewRouterManager()
+			manager.AddRouterGroup(router.RouteGroup{
+				Prefix:     "/auth",
+				Middleware: []router.MiddlewareFunc{middleware.LogoutRequestMiddleware()},
+				Routes: []router.Router{
+					{Path: "/logout", Handler: http.HandlerFunc(controller.Logout)},
+				},
+			})
+			mux := manager.LoadRoutes()
+			secret := taurus.Container.Config.GetString("http.jwt.secret")
+			expired, err := jwt.NewWithClaims(jwt.SigningMethodHS256, &tcrypt.Claims{
+				Uid: "7", Username: "policy-user",
+				StandardClaims: jwt.StandardClaims{Id: "expired-policy-session", ExpiresAt: time.Now().Add(-time.Hour).Unix()},
+			}).SignedString([]byte(secret))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := middleware.ValidateJWTToken(expired); err == nil {
+				t.Fatal("expired fixture unexpectedly authenticatable")
+			}
+			invalidSignature, err := tcrypt.GenerateTokenWithExpiration("7", "policy-user", "policy-test", secret+"-different-key", time.Hour)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, token := range []string{"", expired, invalidSignature, "malformed-jwt"} {
+				for _, handler := range []http.Handler{http.HandlerFunc(controller.Logout), mux} {
+					req := httptest.NewRequest(http.MethodPost, "http://example.test/auth/logout", nil)
+					req.Header.Set("Origin", "http://example.test")
+					if token != "" {
+						req.Header.Set("Authorization", "Bearer "+token)
+					}
+					recorder := httptest.NewRecorder()
+					handler.ServeHTTP(recorder, req)
+					if authPolicyCode(t, recorder) != 200 {
+						t.Fatal("non-authenticatable logout rejected")
+					}
+					assertJWTCookie(t, recorder, secure, true)
+				}
+			}
+			if sessions.revocations != 0 || sessions.validations != 0 || sessions.rotations != 0 {
+				t.Fatal("invalid JWT cleanup consulted or changed session store")
+			}
+			for _, token := range []string{"", expired} {
+				req := httptest.NewRequest(http.MethodPost, "http://example.test/user/refresh-token", nil)
+				req.Header.Set("Origin", "http://example.test")
+				req.Header.Set("Authorization", "Bearer "+token)
+				recorder := httptest.NewRecorder()
+				middleware.AuthRequestMiddleware(true)(http.HandlerFunc(controller.RefreshToken)).ServeHTTP(recorder, req)
+				if recorder.Code != 403 || len(recorder.Result().Cookies()) != 0 || sessions.rotations != 0 {
+					t.Fatal("refresh bypassed strict CSRF for expired or absent JWT")
+				}
+			}
+			valid, err := middleware.GenerateJWTToken("7", "policy-user", 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, handler := range []http.Handler{http.HandlerFunc(controller.Logout), mux} {
+				bearer := httptest.NewRequest(http.MethodPost, "http://example.test/auth/logout", nil)
+				bearer.Header.Set("Origin", "http://example.test")
+				bearer.Header.Set("Authorization", "Bearer "+valid)
+				missingCookies := httptest.NewRecorder()
+				handler.ServeHTTP(missingCookies, bearer)
+				if missingCookies.Code != 403 || len(missingCookies.Result().Cookies()) != 0 || sessions.revocations != 0 {
+					t.Fatal("valid Bearer logout bypassed missing CSRF cookies")
+				}
+				for _, csrf := range []string{"", "mismatched-csrf-marker"} {
+					req := authPolicyRequest("/auth/logout", nil, valid)
+					req.Header.Set(middleware.CSRFTokenKey, csrf)
+					recorder := httptest.NewRecorder()
+					handler.ServeHTTP(recorder, req)
+					if recorder.Code != 403 || len(recorder.Result().Cookies()) != 0 || sessions.revocations != 0 {
+						t.Fatal("valid JWT logout bypassed CSRF")
+					}
+				}
+			}
+			sessions.revokeError = errors.New("simulated Redis outage")
+			failed := httptest.NewRecorder()
+			mux.ServeHTTP(failed, authPolicyRequest("/auth/logout", nil, valid))
+			if authPolicyCode(t, failed) != 500 || len(failed.Result().Cookies()) != 0 || sessions.revocations != 1 {
+				t.Fatal("Redis outage treated as an expired session")
+			}
+			sessions.revokeError = nil
+			success := httptest.NewRecorder()
+			mux.ServeHTTP(success, authPolicyRequest("/auth/logout", nil, valid))
+			if authPolicyCode(t, success) != 200 || sessions.revocations != 2 {
+				t.Fatal("valid logout failed to revoke")
+			}
+			assertJWTCookie(t, success, secure, true)
+			for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodOptions} {
+				req := httptest.NewRequest(method, "http://example.test/auth/logout", nil)
+				req.Header.Set("Origin", "http://example.test")
+				req.Header.Set("Authorization", "Bearer "+expired)
+				recorder := httptest.NewRecorder()
+				mux.ServeHTTP(recorder, req)
+				if recorder.Code != 405 || recorder.Header().Get("Allow") != "POST" || len(recorder.Result().Cookies()) != 0 {
+					t.Fatal("expired logout bypassed method protection")
+				}
+			}
+			for _, origin := range []string{"", "null", "https://untrusted.test"} {
+				req := httptest.NewRequest(http.MethodPost, "http://example.test/auth/logout", nil)
+				req.Header.Set("Origin", origin)
+				req.Header.Set("Authorization", "Bearer "+expired)
+				recorder := httptest.NewRecorder()
+				mux.ServeHTTP(recorder, req)
+				if recorder.Code != 403 || len(recorder.Result().Cookies()) != 0 {
+					t.Fatal("expired logout bypassed source protection")
+				}
+			}
+		})
+	}
+}

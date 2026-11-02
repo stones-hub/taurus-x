@@ -3,11 +3,13 @@ package service
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 
 	"github.com/google/wire"
 
 	"{{ .Module }}/app/dto"
+	"{{ .Module }}/app/helper"
 	"{{ .Module }}/app/model"
 	"{{ .Module }}/app/repo"
 )
@@ -35,6 +37,7 @@ func NewAdminDeptService(store *repo.Store) *AdminDeptService {
 
 // GetDeptList 分页查询部门列表（名称模糊 + 状态过滤，回填父部门名和员工数）
 func (s *AdminDeptService) GetDeptList(ctx context.Context, page, pageSize int, deptName string, status int) (*dto.DeptListResponse, error) {
+	page, pageSize = helper.NormalizePagination(page, pageSize, 15)
 	depts, total, err := s.deptRepo.ListWithFilter(ctx, page, pageSize, repo.AdminDeptListFilter{
 		DeptName: deptName,
 		Status:   status,
@@ -210,6 +213,12 @@ func (s *AdminDeptService) UpdateDeptStatus(ctx context.Context, deptID uint64, 
 
 // DeleteDept 删除部门（软删：状态置 0，有员工或子部门则拒绝）
 func (s *AdminDeptService) DeleteDept(ctx context.Context, deptID uint64) error {
+	return s.withDeptMembersTx(ctx, deptID, func(scoped *AdminDeptService) error {
+		return scoped.deleteDept(ctx, deptID)
+	})
+}
+
+func (s *AdminDeptService) deleteDept(ctx context.Context, deptID uint64) error {
 	dept, err := s.deptRepo.FindByDeptID(ctx, deptID)
 	if err != nil {
 		return err
@@ -263,6 +272,7 @@ func (s *AdminDeptService) GetAllDepts(ctx context.Context, excludeDeptID uint64
 
 // GetDeptUserList 获取部门员工列表（分页）
 func (s *AdminDeptService) GetDeptUserList(ctx context.Context, deptID uint64, page, pageSize int) (*dto.DeptUserListResponse, error) {
+	page, pageSize = helper.NormalizePagination(page, pageSize, 15)
 	dept, err := s.deptRepo.FindByDeptID(ctx, deptID)
 	if err != nil {
 		return nil, err
@@ -310,6 +320,7 @@ func (s *AdminDeptService) GetDeptUserList(ctx context.Context, deptID uint64, p
 // 只返回选人必需的字段。选项接口不做接口权限校验，
 // 带上手机号就等于让任何登录用户都能按部门拉通讯录。
 func (s *AdminDeptService) GetDeptUserOptions(ctx context.Context, deptID uint64, page, pageSize int) (*dto.UserOptionListResponse, error) {
+	page, pageSize = helper.NormalizePagination(page, pageSize, 15)
 	dept, err := s.deptRepo.FindByDeptID(ctx, deptID)
 	if err != nil {
 		return nil, err
@@ -343,6 +354,12 @@ func (s *AdminDeptService) GetDeptUserOptions(ctx context.Context, deptID uint64
 
 // AddDeptUser 添加部门员工（一个部门只能有一个 leader）
 func (s *AdminDeptService) AddDeptUser(ctx context.Context, req *dto.AddDeptUserRequest) error {
+	return s.withDeptMembersTx(ctx, req.DeptID, func(scoped *AdminDeptService) error {
+		return scoped.addDeptUser(ctx, req)
+	})
+}
+
+func (s *AdminDeptService) addDeptUser(ctx context.Context, req *dto.AddDeptUserRequest) error {
 	dept, err := s.deptRepo.FindByDeptID(ctx, req.DeptID)
 	if err != nil {
 		return err
@@ -401,6 +418,19 @@ func (s *AdminDeptService) AddDeptUser(ctx context.Context, req *dto.AddDeptUser
 
 // UpdateDeptUser 更新部门员工（主部门/leader 唯一约束）
 func (s *AdminDeptService) UpdateDeptUser(ctx context.Context, req *dto.UpdateDeptUserRequest) error {
+	member, err := s.userDeptRepo.FindByID(ctx, uint(req.ID))
+	if err != nil {
+		return err
+	}
+	if member == nil {
+		return errors.New("关联记录不存在")
+	}
+	return s.withDeptMembersTx(ctx, member.DeptID, func(scoped *AdminDeptService) error {
+		return scoped.updateDeptUser(ctx, req)
+	})
+}
+
+func (s *AdminDeptService) updateDeptUser(ctx context.Context, req *dto.UpdateDeptUserRequest) error {
 	userDept, err := s.userDeptRepo.FindByID(ctx, uint(req.ID))
 	if err != nil {
 		return err
@@ -438,6 +468,19 @@ func (s *AdminDeptService) UpdateDeptUser(ctx context.Context, req *dto.UpdateDe
 
 // RemoveDeptUser 移除部门员工（物理删除关联）
 func (s *AdminDeptService) RemoveDeptUser(ctx context.Context, req *dto.RemoveDeptUserRequest) error {
+	member, err := s.userDeptRepo.FindByID(ctx, uint(req.ID))
+	if err != nil {
+		return err
+	}
+	if member == nil {
+		return errors.New("关联记录不存在")
+	}
+	return s.withDeptMembersTx(ctx, member.DeptID, func(scoped *AdminDeptService) error {
+		return scoped.removeDeptUser(ctx, req)
+	})
+}
+
+func (s *AdminDeptService) removeDeptUser(ctx context.Context, req *dto.RemoveDeptUserRequest) error {
 	userDept, err := s.userDeptRepo.FindByID(ctx, uint(req.ID))
 	if err != nil {
 		return err
@@ -450,6 +493,29 @@ func (s *AdminDeptService) RemoveDeptUser(ctx context.Context, req *dto.RemoveDe
 
 // BatchUpdateDeptUser 批量更新部门员工（先求差集：删不在提交列表的，增不在已存在的）
 func (s *AdminDeptService) BatchUpdateDeptUser(ctx context.Context, req *dto.BatchUpdateDeptUserRequest) error {
+	return s.withDeptMembersTx(ctx, req.DeptID, func(scoped *AdminDeptService) error {
+		return scoped.batchUpdateDeptUser(ctx, req)
+	})
+}
+
+func (s *AdminDeptService) withDeptMembersTx(ctx context.Context, deptID uint64, write func(*AdminDeptService) error) error {
+	return s.store.RunInTx(ctx, func(tx *repo.Tx) error {
+		dept, err := tx.Dept().LockByDeptID(ctx, deptID)
+		if err != nil {
+			return err
+		}
+		if dept == nil {
+			return errors.New("部门不存在")
+		}
+		scoped := *s
+		scoped.deptRepo = tx.Dept()
+		scoped.userDeptRepo = tx.UserDept()
+		scoped.userRepo = tx.User()
+		return write(&scoped)
+	})
+}
+
+func (s *AdminDeptService) batchUpdateDeptUser(ctx context.Context, req *dto.BatchUpdateDeptUserRequest) error {
 	dept, err := s.deptRepo.FindByDeptID(ctx, req.DeptID)
 	if err != nil {
 		return err
@@ -469,6 +535,20 @@ func (s *AdminDeptService) BatchUpdateDeptUser(ctx context.Context, req *dto.Bat
 	for _, uid := range req.UserIDs {
 		target[uid] = true
 	}
+	userIDs := make([]uint64, 0, len(target))
+	for uid := range target {
+		userIDs = append(userIDs, uid)
+	}
+	sort.Slice(userIDs, func(left, right int) bool { return userIDs[left] < userIDs[right] })
+	for _, uid := range userIDs {
+		user, err := s.userRepo.LockByUserID(ctx, uid)
+		if err != nil {
+			return err
+		}
+		if user == nil {
+			return errors.New("用户不存在")
+		}
+	}
 	// 删除：已存在但不在提交列表
 	for uid, relID := range existingMap {
 		if !target[uid] {
@@ -485,11 +565,8 @@ func (s *AdminDeptService) BatchUpdateDeptUser(ctx context.Context, req *dto.Bat
 	}
 	// 新增：在提交列表但不存在
 	var toCreate []model.AdminUserDept
-	for _, uid := range req.UserIDs {
+	for _, uid := range userIDs {
 		if _, ok := existingMap[uid]; !ok {
-			if u, _ := s.userRepo.FindByUserID(ctx, uid); u == nil {
-				return errors.New("用户不存在")
-			}
 			toCreate = append(toCreate, model.AdminUserDept{
 				UserID:    uid,
 				DeptID:    req.DeptID,

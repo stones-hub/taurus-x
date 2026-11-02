@@ -191,17 +191,10 @@ func (c *UserController) AddUser(w http.ResponseWriter, r *http.Request) {
 		Fail(w, http.StatusBadRequest, "用户名长度必须在5-20位之间")
 		return
 	}
-	userID, err := c.UserService.AddUser(r.Context(), &req)
+	_, err := c.UserService.AddUser(r.Context(), operatorID, &req)
 	if err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
-	}
-	// 分配角色
-	if len(req.RoleIDs) > 0 {
-		if err := c.RoleService.UpdateUserRoles(r.Context(), operatorID, userID, req.RoleIDs); err != nil {
-			FailByError(w, err)
-			return
-		}
 	}
 	OK(w, map[string]string{"status": "success"})
 }

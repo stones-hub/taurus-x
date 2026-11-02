@@ -18,8 +18,13 @@ import (
 	"github.com/stones-hub/taurus-x/templates"
 )
 
-// tmpRoot 测试产物统一放到 /tmp/taurusx-test-*，不落在仓库里。
-const tmpRoot = "/tmp"
+// tmpRoot 可隔离本轮测试产物，不覆盖正在运行的候选。
+var tmpRoot = func() string {
+	if root := os.Getenv("TAURUSX_TEST_ROOT"); root != "" {
+		return root
+	}
+	return "/tmp/taurusx-t7"
+}()
 
 // 三种组件组合：只要必选、必选 + grpc + opentelemetry、全选。
 func TestGenerate_Combinations(t *testing.T) {
@@ -94,12 +99,63 @@ func TestGenerate_Combinations(t *testing.T) {
 			assertDockerCrossPlatform(t, outDir)
 			assertComposeNoFixedPlatform(t, outDir)
 			assertBaseline(t, outDir, tc.project)
+			assertCommercialHardening(t, outDir)
 
 			backend := filepath.Join(outDir, "backend")
 			runGo(t, backend, "build", "./...")
 			runGo(t, backend, "vet", "./...")
 			runGo(t, backend, "test", "./...")
 		})
+	}
+}
+
+func assertCommercialHardening(t *testing.T, outDir string) {
+	t.Helper()
+	backend := filepath.Join(outDir, "backend", "app")
+	user := funcBody(readFile(t, filepath.Join(backend, "service", "user_service.go")), "func (s *AdminUserService) AddUser(")
+	if hash, transaction := strings.Index(user, "helper.HashPassword("), strings.Index(user, "s.store.RunInTx("); hash < 0 || transaction < 0 || hash >= transaction {
+		t.Error("新增账号必须在事务外计算 bcrypt，随后执行完整业务事务")
+	}
+	for _, required := range []string{"guardUserWrite(", "CheckRoleAssignmentAllowed(", "CheckRoleStatusAssignable(", "tx.User().Create(", "tx.UserLogin().SyncPasswordHash(", "replaceUserRolesTx("} {
+		if !strings.Contains(user, required) {
+			t.Errorf("AddUser 缺少事务契约 %s", required)
+		}
+	}
+	dept := readFile(t, filepath.Join(backend, "service", "dept_service.go"))
+	for _, method := range []string{"AddDeptUser", "UpdateDeptUser", "RemoveDeptUser", "BatchUpdateDeptUser", "DeleteDept"} {
+		if !strings.Contains(funcBody(dept, "func (s *AdminDeptService) "+method+"("), "s.withDeptMembersTx(") {
+			t.Errorf("%s 未遵循部门成员锁协议", method)
+		}
+	}
+	lock := funcBody(dept, "func (s *AdminDeptService) withDeptMembersTx(")
+	if !strings.Contains(lock, "s.store.RunInTx(") || !strings.Contains(lock, "tx.Dept().LockByDeptID(") {
+		t.Error("部门成员修改必须在事务中先锁稳定部门行")
+	}
+	auth := readFile(t, filepath.Join(backend, "controller", "auth_controller.go"))
+	for _, method := range []string{"Login", "RefreshToken"} {
+		if !strings.Contains(funcBody(auth, "func (c *AuthController) "+method+"("), "middleware.AllowAuthRequest(") {
+			t.Errorf("%s 缺少认证方法/来源保护", method)
+		}
+	}
+	if !strings.Contains(funcBody(auth, "func (c *AuthController) Logout("), "middleware.AllowLogoutRequest(") {
+		t.Error("退出控制器必须使用独立退出方法/来源/有效JWT的CSRF策略")
+	}
+	routes := readFile(t, filepath.Join(backend, "routes", "routes.go"))
+	logoutGroup := groupContaining(routes, `{Path: "/logout"`)
+	if logoutGroup == "" || !strings.Contains(logoutGroup, "tmid.LogoutRequestMiddleware()") || strings.Contains(logoutGroup, "tmid.AuthRequestMiddleware(true)") {
+		t.Error("退出路由必须使用独立退出策略，不能先被刷新CSRF策略拒绝")
+	}
+	if strings.Contains(auth, "http.SetCookie(") || strings.Contains(auth, "24 * time.Hour") {
+		t.Error("认证控制器不得另写 Cookie 或有效期策略")
+	}
+	frontend := filepath.Join(outDir, "frontend", "src")
+	store := readFile(t, filepath.Join(frontend, "store", "auth.ts"))
+	if !strings.Contains(store, "revoke: apiLogout") || !strings.Contains(store, "registerLocalReset(clearLocal)") {
+		t.Error("前端必须区分服务端退出与本地清理")
+	}
+	httpSource := readFile(t, filepath.Join(frontend, "api", "http.ts"))
+	if strings.Count(httpSource, "clearLocalAuth()") != 2 || strings.Contains(httpSource, ".logout(") {
+		t.Error("两条401路径必须只做本地清理，不递归退出")
 	}
 }
 
@@ -360,7 +416,7 @@ func assertSessionRevocationWiring(t *testing.T, outDir string) {
 	}
 	// 刷新必须沿用 ValidateSession 返回的旧版本；现读当前版本会让刷新
 	// 变成绕过改密/禁用吊销的后门。
-	if !strings.Contains(rotate, "RegisterSession(userID, newJTI, ttl, authVersion)") {
+	if !strings.Contains(rotate, "RotateSession(userID, oldJTI, newJTI, ttl, authVersion)") {
 		t.Error("rotateSession 必须以旧会话校验时拿到的版本登记新会话")
 	}
 	if strings.Contains(rotate, "CurrentAuthVersion") {
@@ -1224,7 +1280,10 @@ func assertAdminRateLimit(t *testing.T, outDir string) {
 	//    所以断言也必须是全集扫描，没有白名单。
 	//    计入方式有两种：直接挂 tmid.AdminRateLimitMiddleware()，
 	//    或复用上面三条已经挂了它的后台链。
-	backendChains := []string{"userBaseChain", "userSelfServiceChain", "userProtectedChain"}
+	backendChains := []string{"userBaseChain", "userSelfServiceChain", "userProtectedChain", "refreshChain"}
+	if !strings.Contains(routes, "refreshChain := append([]router.MiddlewareFunc{tmid.AuthRequestMiddleware(true)}, userBaseChain...)") {
+		t.Error("refreshChain 必须先校验认证方法/来源/CSRF，再复用完整 userBaseChain")
+	}
 	groups := routerGroups(routes)
 	if len(groups) < 11 {
 		// 解析兜底：真实数量是 13（含两个 /auth 组）。切片解析一旦失效，

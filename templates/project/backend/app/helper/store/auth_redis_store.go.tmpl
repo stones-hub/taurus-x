@@ -47,6 +47,28 @@ type KVStore interface {
 	Del(ctx context.Context, keys ...string) error
 }
 
+type sessionRotator interface {
+	Rotate(ctx context.Context, oldKey, newKey, value string, ttl time.Duration) (bool, error)
+}
+
+type redisSessionKV struct {
+	KVStore
+	eval func(context.Context, string, []string, ...interface{}) (interface{}, error)
+}
+
+const rotateSessionScript = `
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+if redis.call('EXISTS', KEYS[2]) ~= 0 then return 0 end
+redis.call('SET', KEYS[2], ARGV[1], 'PX', ARGV[2])
+redis.call('DEL', KEYS[1])
+return 1
+`
+
+func (s redisSessionKV) Rotate(ctx context.Context, oldKey, newKey, value string, ttl time.Duration) (bool, error) {
+	result, err := s.eval(ctx, rotateSessionScript, []string{oldKey, newKey}, value, ttl.Milliseconds())
+	return result == int64(1), err
+}
+
 // AuthVersionResolver 读取用户认证版本的权威来源（生产实现是 admin_users 表）。
 //
 // 接口声明在本包、实现放在 repo 层，由 main 注入：store 直接 import repo 会和
@@ -101,7 +123,32 @@ func (s *AuthRedisStore) kvStore() (KVStore, error) {
 	if taurus.Container == nil || taurus.Container.Redis == nil {
 		return nil, ErrSessionStoreUnavailable
 	}
-	return taurus.Container.Redis, nil
+	client := taurus.Container.Redis
+	return redisSessionKV{KVStore: client, eval: func(ctx context.Context, script string, keys []string, args ...interface{}) (interface{}, error) {
+		return client.GetClient().Eval(ctx, script, keys, args...).Result()
+	}}, nil
+}
+
+func (s *AuthRedisStore) RotateSession(userID uint64, oldJTI, newJTI string, ttl time.Duration, authVersion int64) error {
+	if oldJTI == "" || newJTI == "" || oldJTI == newJTI || ttl.Milliseconds() <= 0 || authVersion <= 0 {
+		return ErrSessionRevoked
+	}
+	kv, err := s.kvStore()
+	if err != nil {
+		return err
+	}
+	rotator, ok := kv.(sessionRotator)
+	if !ok {
+		return ErrSessionStoreUnavailable
+	}
+	rotated, err := rotator.Rotate(context.Background(), sessionJTIKeyPrefix+oldJTI, sessionJTIKeyPrefix+newJTI, fmt.Sprintf("%d:%d", userID, authVersion), ttl)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrSessionStoreUnavailable, err)
+	}
+	if !rotated {
+		return ErrSessionRevoked
+	}
+	return nil
 }
 
 // authVersions 解析认证版本权威来源；没有来源就不校验是不可接受的，直接 fail closed。

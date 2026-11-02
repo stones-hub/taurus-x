@@ -1,0 +1,26 @@
+package helper
+
+const MaxPageSize = 200
+
+func NormalizePagination(page, pageSize, defaultSize int) (int, int) {
+	if defaultSize <= 0 || defaultSize > MaxPageSize {
+		defaultSize = 15
+	}
+	if pageSize <= 0 {
+		pageSize = defaultSize
+	}
+	if pageSize > MaxPageSize {
+		pageSize = MaxPageSize
+	}
+	if page <= 0 {
+		page = 1
+	}
+	maxPage := int(^uint(0) >> 1)
+	if pageSize > 1 {
+		maxPage = maxPage/pageSize + 1
+	}
+	if page > maxPage {
+		page = maxPage
+	}
+	return page, pageSize
+}

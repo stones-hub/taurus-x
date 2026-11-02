@@ -8,6 +8,7 @@ import (
 	"github.com/google/wire"
 
 	"{{ .Module }}/app/dto"
+	"{{ .Module }}/app/helper"
 	"{{ .Module }}/app/model"
 	"{{ .Module }}/app/repo"
 )
@@ -39,6 +40,7 @@ func NewAdminPermissionsService(store *repo.Store) *AdminPermissionsService {
 
 // GetPermissionList 获取权限列表（分页，名称模糊 + 状态 + 类型过滤）
 func (s *AdminPermissionsService) GetPermissionList(ctx context.Context, page, pageSize int, name string, status, permissionType int) (*dto.PermissionListResponse, error) {
+	page, pageSize = helper.NormalizePagination(page, pageSize, 50)
 	filter := repo.AdminPermissionsListFilter{
 		PermissionName: name,
 		Status:         status,

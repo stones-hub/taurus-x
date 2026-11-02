@@ -9,6 +9,7 @@ import (
 
 	"{{ .Module }}/app/constants"
 	"{{ .Module }}/app/dto"
+	"{{ .Module }}/app/helper"
 	"{{ .Module }}/app/model"
 	"{{ .Module }}/app/repo"
 )
@@ -235,6 +236,7 @@ func (s *AdminRoleService) sortFrontendMenuTree(nodes []*dto.MenuNode) {
 
 // GetRoleList 获取角色列表（分页，支持名称模糊 + 状态过滤）
 func (s *AdminRoleService) GetRoleList(ctx context.Context, page, pageSize int, roleName string, status int) (*dto.RoleListResponse, error) {
+	page, pageSize = helper.NormalizePagination(page, pageSize, 15)
 	roles, total, err := s.roleRepo.ListWithFilter(ctx, page, pageSize, repo.AdminRoleListFilter{
 		RoleName: roleName,
 		Status:   status,

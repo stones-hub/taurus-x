@@ -96,6 +96,20 @@ func (f *fakeSessionStore) RevokeSession(jti string) error {
 	return nil
 }
 
+func (f *fakeSessionStore) RotateSession(userID uint64, oldJTI, newJTI string, ttl time.Duration, authVersion int64) error {
+	if f.unavailable {
+		return store.ErrSessionStoreUnavailable
+	}
+	old, ok := f.live[oldJTI]
+	if !ok || old.uid != userID || old.version != authVersion {
+		return store.ErrSessionRevoked
+	}
+	if err := f.RegisterSession(userID, newJTI, ttl, authVersion); err != nil {
+		return err
+	}
+	return f.RevokeSession(oldJTI)
+}
+
 // withFakeSessionStore 安装假存储并在用例结束后还原，避免用例间互相影响。
 func withFakeSessionStore(t *testing.T) *fakeSessionStore {
 	t.Helper()

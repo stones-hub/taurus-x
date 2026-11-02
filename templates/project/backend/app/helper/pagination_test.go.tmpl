@@ -1,0 +1,18 @@
+package helper
+
+import "testing"
+
+func TestPaginationBounds(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	for _, page := range []int{-maxInt, -1, 0, 1, 2, maxInt} {
+		for _, size := range []int{-maxInt, -1, 0, 1, 15, 50, 200, 201, maxInt} {
+			actualPage, actualSize := NormalizePagination(page, size, 15)
+			if actualPage < 1 || actualSize < 1 || actualSize > 200 || actualPage-1 > maxInt/actualSize {
+				t.Fatalf("unsafe pagination (%d,%d) => (%d,%d)", page, size, actualPage, actualSize)
+			}
+		}
+	}
+	if page, size := NormalizePagination(0, 0, 50); page != 1 || size != 50 {
+		t.Fatalf("permission default changed: %d %d", page, size)
+	}
+}

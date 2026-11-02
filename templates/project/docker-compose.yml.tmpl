@@ -154,6 +154,8 @@ services:
       REDIS_PORT: 6379
       # jwt（生产务必改成随机长串：openssl rand -hex 32）
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET 必须在 .env 里显式设置}
+      JWT_COOKIE_SECURE: ${JWT_COOKIE_SECURE:false}
+      AUTH_TRUSTED_ORIGINS: ${AUTH_TRUSTED_ORIGINS:none}
 {{- if .Has.consul }}
       # consul（服务注册发现）
       CONSUL_ENABLE: "true"

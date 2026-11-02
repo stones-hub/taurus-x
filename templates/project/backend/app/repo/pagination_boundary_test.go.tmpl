@@ -1,0 +1,37 @@
+package repo
+
+import (
+	"context"
+	"testing"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+
+	"{{ .Module }}/app/helper"
+	"{{ .Module }}/app/model"
+)
+
+func TestRepositoryPaginationDirectCallBounds(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	for _, values := range [][2]int{
+		{-1, -1}, {0, 0}, {maxInt, maxInt}, {maxInt, 1}, {2, 201},
+	} {
+		database := newDryRunDB(t)
+		var actual *clause.Limit
+		if err := database.Callback().Query().After("gorm:query").Register("test:pagination-limit", func(query *gorm.DB) {
+			if limit, ok := query.Statement.Clauses["LIMIT"].Expression.(clause.Limit); ok {
+				actual = &limit
+			}
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var result []model.AdminUser
+		if _, err := paginate(database.Model(&model.AdminUser{}).WithContext(context.Background()), values[0], values[1], "user_id DESC", &result); err != nil {
+			t.Fatal(err)
+		}
+		page, size := helper.NormalizePagination(values[0], values[1], 15)
+		if actual == nil || actual.Limit == nil || *actual.Limit != size || actual.Offset != (page-1)*size {
+			t.Fatalf("direct repo query bypassed pagination normalization for %v", values)
+		}
+	}
+}

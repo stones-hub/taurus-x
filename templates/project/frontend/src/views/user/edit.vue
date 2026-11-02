@@ -8,6 +8,7 @@ import { apiAddUser, apiGetUserInfo, apiUpdateUser } from '../../api/user-manage
 import { apiGetRoleList } from '../../api/role'
 import type { RoleListResponseItem, UserInfo } from '../../types'
 import { QUERY_ALL } from '../../types'
+import { collectPages } from '../../utils/pagination'
 
 const route = useRoute()
 const router = useRouter()
@@ -15,6 +16,7 @@ const router = useRouter()
 const isEdit = computed(() => Boolean(route.query.user_id))
 
 const submitLoading = ref(false)
+const dataReady = ref(false)
 const roles = ref<RoleListResponseItem[]>([])
 const checkedRoleIds = ref<number[]>([])
 // 进入编辑页时目标账号真实持有的角色（后端给的，不是当前勾选状态）。
@@ -38,8 +40,7 @@ const form = reactive({
 // 加载角色列表（含已禁用：目标账号可能持有某个后来被禁用的角色，
 // 不列出来就会在保存时把这条关联静默删掉）
 async function loadRoles() {
-  const res = await apiGetRoleList({ page_no: 1, page_size: 200, role_name: '', status: QUERY_ALL })
-  roles.value = res.list ?? []
+  roles.value = await collectPages((page_no, page_size) => apiGetRoleList({ page_no, page_size, role_name: '', status: QUERY_ALL }), (role) => role.role_id)
 }
 
 // 禁用角色只有「已经持有」时才可勾选（即只能保留或取消，不能新增）
@@ -114,6 +115,10 @@ function checkForm(): boolean {
 }
 
 async function onSubmit() {
+  if (!dataReady.value) {
+    ElMessage.error('角色及用户资料尚未完整加载，请重新加载后保存')
+    return
+  }
   if (!checkForm()) return
   submitLoading.value = true
   try {
@@ -163,6 +168,7 @@ onMounted(async () => {
     if (isEdit.value) {
       await loadEditData()
     }
+    dataReady.value = true
   } catch {
     // 已提示，无需额外处理
   }

@@ -22,6 +22,10 @@ func (r *AdminDeptRepository) FindByDeptID(ctx context.Context, deptID uint64) (
 	return r.firstBy(ctx, "dept_id = ?", deptID)
 }
 
+func (r *AdminDeptRepository) LockByDeptID(ctx context.Context, deptID uint64) (*model.AdminDept, error) {
+	return r.firstLocking(ctx, lockForUpdate, "dept_id = ?", deptID)
+}
+
 // FindByDeptCode 根据部门编码查找部门
 func (r *AdminDeptRepository) FindByDeptCode(ctx context.Context, deptCode string) (*model.AdminDept, error) {
 	return r.firstBy(ctx, "dept_code = ?", deptCode)

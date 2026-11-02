@@ -2,6 +2,7 @@ package controller
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 
 	"{{ .Module }}/app/constants"
 	"{{ .Module }}/app/dto"
+	"{{ .Module }}/app/helper/store"
 	"{{ .Module }}/app/middleware"
 	"{{ .Module }}/app/service"
 )
@@ -26,6 +28,9 @@ var AuthControllerSet = wire.NewSet(wire.Struct(new(AuthController), "*"))
 
 // Login 用户登录
 func (c *AuthController) Login(w http.ResponseWriter, r *http.Request) {
+	if !middleware.AllowAuthRequest(w, r, false) {
+		return
+	}
 	var req dto.LoginRequest
 	if r.Header.Get("Content-Type") == "application/json" {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -67,19 +72,15 @@ func (c *AuthController) Login(w http.ResponseWriter, r *http.Request) {
 
 	c.recordLogin(r, user.UserID, service.LoginStatusSuccess, "")
 
-	expiresAt := time.Now().Add(24 * time.Hour)
+	expiresAt, err := middleware.JWTExpiresAt(token)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, "令牌有效期读取失败")
+		return
+	}
 	response := dto.LoginResponse{Token: token, User: dto.ToUserInfo(user), ExpiresAt: expiresAt}
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     "jwt_token",
-		Value:    token,
-		Expires:  expiresAt,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   false,
-		SameSite: http.SameSiteLaxMode,
-	})
-	setCSRFCookie(w)
+	middleware.SetJWTToken(w, token)
+	setCSRFCookie(w, expiresAt)
 
 	OK(w, response)
 }
@@ -94,6 +95,9 @@ func (c *AuthController) Login(w http.ResponseWriter, r *http.Request) {
 // Cookie 和 Bearer 时「认证用的是 Cookie，登出吊销的却是 Bearer」，
 // 结果请求真正在用的那个会话毫发无伤。
 func (c *AuthController) Logout(w http.ResponseWriter, r *http.Request) {
+	if !middleware.AllowLogoutRequest(w, r) {
+		return
+	}
 	// Token 解析不出来（缺失/过期/签名不对）时无需吊销：这种 Token 本来就过不了认证。
 	if token := middleware.GetJWTToken(r); token != "" {
 		if claims, _, err := middleware.ValidateJWTToken(token); err == nil && claims.JTI != "" {
@@ -105,16 +109,16 @@ func (c *AuthController) Logout(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	http.SetCookie(w, &http.Cookie{
-		Name: "jwt_token", Value: "", Expires: time.Now().Add(-1 * time.Hour), Path: "/",
-		HttpOnly: true, Secure: false, SameSite: http.SameSiteLaxMode,
-	})
+	middleware.ClearJWTToken(w)
 	middleware.ClearCSRFToken(w)
 	Fail(w, http.StatusOK, "登出成功")
 }
 
 // RefreshToken 刷新 JWT 令牌
 func (c *AuthController) RefreshToken(w http.ResponseWriter, r *http.Request) {
+	if !middleware.AllowAuthRequest(w, r, true) {
+		return
+	}
 	token := middleware.GetJWTToken(r)
 	if token == "" {
 		Fail(w, http.StatusUnauthorized, "缺少JWT令牌")
@@ -122,15 +126,20 @@ func (c *AuthController) RefreshToken(w http.ResponseWriter, r *http.Request) {
 	}
 	newToken, err := middleware.RefreshJWTToken(w, token)
 	if err != nil {
+		if errors.Is(err, store.ErrSessionStoreUnavailable) {
+			Fail(w, http.StatusServiceUnavailable, "认证服务暂时不可用")
+			return
+		}
 		Fail(w, http.StatusUnauthorized, "令牌刷新失败: "+err.Error())
 		return
 	}
-	expiresAt := time.Now().Add(24 * time.Hour)
+	expiresAt, err := middleware.JWTExpiresAt(newToken)
+	if err != nil {
+		Fail(w, http.StatusInternalServerError, "令牌有效期读取失败")
+		return
+	}
 	response := dto.LoginResponse{Token: newToken, ExpiresAt: expiresAt}
-	http.SetCookie(w, &http.Cookie{
-		Name: "jwt_token", Value: newToken, Expires: expiresAt, Path: "/",
-		HttpOnly: true, Secure: false, SameSite: http.SameSiteLaxMode,
-	})
+	middleware.SetCSRFToken(w, middleware.GetCSRFTokenByCookie(r), expiresAt)
 	OK(w, response)
 }
 
@@ -147,10 +156,10 @@ func (c *AuthController) recordLogin(r *http.Request, userID uint64, status int8
 }
 
 // setCSRFCookie 下发 CSRF Token Cookie（供受 CSRF 保护的写请求使用）
-func setCSRFCookie(w http.ResponseWriter) {
+func setCSRFCookie(w http.ResponseWriter, expiresAt time.Time) {
 	csrfToken, err := middleware.GenerateCSRFToken()
 	if err != nil {
 		return
 	}
-	middleware.SetCSRFToken(w, csrfToken)
+	middleware.SetCSRFToken(w, csrfToken, expiresAt)
 }
