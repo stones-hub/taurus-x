@@ -43,7 +43,7 @@
 
 ### 技术栈
 
-- 后端：Go 1.25、Taurus Pro 组件、GORM、Google Wire。
+- 后端：Go 1.27.3、Taurus Pro 组件、GORM、Google Wire。
 - 前端：Vue 3、TypeScript、Vite、Element Plus、Pinia。
 - 数据库与缓存：MySQL 8.0、Redis 7。
 - 运行方式：前端编译为静态文件，由 Go 后端托管，一个 HTTP 端口提供页面和接口；开发时前端用 Vite 开发服务器。
@@ -108,9 +108,13 @@ taurus-x new my-admin
 | `.ProjectNameLower` | 小写项目名，用于 npm 包名 | `my-admin` |
 | `.Module` | Go module 路径，用于所有 import | `github.com/stones-hub/my-admin` |
 | `.DBName` | 默认数据库名和账号名 | `my_admin` |
-| `.GoVersion` | 生成项目 `go.mod` 声明的 Go 版本 | `1.25.1` |
+| `.GoVersion` | 生成项目 `go.mod` 声明的 Go 版本 | `1.27.3` |
+| `.WireVersion` | 生成项目 `go.mod` 中 `github.com/google/wire` 的版本 | `v0.7.0` |
+| `.JWTVersion` | 生成项目 `go.mod` 中 `github.com/golang-jwt/jwt/v5` 的版本 | `v5.3.1` |
 | `.Has.<组件>` | 是否选了某个组件，用于条件裁剪 | `{{ if .Has.milvus }}` |
-| 初始管理员 bcrypt 散列 | 只写进 `init.sql` | - |
+| `.Requires` | 所选组件列表（含 `.Package`、`.Version`），生成 `go.mod` 的 require 块 | `{{ range .Requires }}` |
+| `.AdminUsername` | 初始管理员账号，写进 `init.sql` 和生成项目 README | `admin` |
+| `.AdminPasswordHash` | 初始管理员密码的 bcrypt 散列，只写进 `init.sql`；明文不进模板数据 | `$2a$10$...` |
 
 - **引用了不存在的变量会直接报错**（`missingkey=error`），不会悄悄生成一个空值。
 - 少数文件为了不影响 taurus-x 自己的仓库而改了名，输出时还原，例如模板里的 `gitignore` 输出为 `.gitignore`。
@@ -183,7 +187,7 @@ taurus-x/
 
 | 工具 | 用途 | 是否必须 |
 | --- | --- | --- |
-| Go 1.25 或兼容版本 | 安装 taurus-x；生成项目时执行依赖整理和 Wire；运行后端 | 必须 |
+| Go 1.27.3 或更高版本 | 安装 taurus-x；生成项目时执行依赖整理和 Wire；运行后端 | 必须 |
 | Git | 从源码构建 taurus-x 时使用 | 可选 |
 | Node.js | 运行前端；Vite 要求 20.19+ 或 22.12+，建议 22.12+ | 本机跑前端时必须 |
 | pnpm | 前端包管理；本文用 `npm exec` 临时调用固定版本，不要求全局安装 | 同上 |
@@ -212,7 +216,7 @@ go install github.com/stones-hub/taurus-x@latest
 也可以安装指定版本，所有版本见 GitHub 的 [Releases](https://github.com/stones-hub/taurus-x/releases) 页面：
 
 ```bash
-go install github.com/stones-hub/taurus-x@v0.2.1
+go install github.com/stones-hub/taurus-x@v0.3.0
 ```
 
 安装后命令通常位于 `$(go env GOPATH)/bin`，需要该目录在 `PATH` 中。如果提示找不到命令，先检查安装目录，不必重复安装。
@@ -341,8 +345,10 @@ export MYSQL_ROOT_PASSWORD=ReplaceWithYourLocalRootPassword
 ```
 
 ```bash
-docker run -d --name my-admin-test-mysql -p 127.0.0.1:23309:3306 -e MYSQL_ROOT_PASSWORD -e MYSQL_DATABASE=my_admin mysql:8.0
+docker run -d --name my-admin-test-mysql -p 127.0.0.1:23309:3306 -e MYSQL_ROOT_PASSWORD -e MYSQL_DATABASE=my_admin -e TZ=Asia/Shanghai mysql:8.0 --default-time-zone=+08:00
 ```
+
+时区与生成项目的 `docker-compose.yml` 一致（`TZ=Asia/Shanghai`、`--default-time-zone=+08:00`）。**数据库时区要和后端 DSN 的 `loc` 一致**：DSN 用 `loc=Local` 时，数据库时区应等于后端所在机器的本地时区，否则数据库用 `CURRENT_TIMESTAMP` 生成的 `created_at`/`updated_at` 会和后端写入的时间相差时区差（例如 UTC 与东八区差 8 小时）。
 
 启动独立 Redis：
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -131,6 +132,21 @@ func TestPermission_CheckErrorFailsClosed(t *testing.T) {
 	}
 	if reached {
 		t.Error("权限检查出错时不应进入 handler")
+	}
+}
+
+// TestPermission_CheckErrorHidesInternalDetail 检查器出错时，数据库等内部错误文本不能回给客户端。
+func TestPermission_CheckErrorHidesInternalDetail(t *testing.T) {
+	withPermissionChecker(t, &fakePermissionChecker{err: errors.New("dial tcp 10.0.0.9:3306: internal-detail-marker")})
+	handler := PermissionMiddleware()(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("权限检查出错时不应进入 handler")
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/admin/user/list", nil)
+	req = req.WithContext(context.WithValue(req.Context(), JWTTokenClaimsKey, JWTClaims{UID: "7", JTI: "jti-1"}))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if strings.Contains(rec.Body.String(), "internal-detail-marker") {
+		t.Fatalf("权限检查失败的响应泄漏了内部错误: %s", rec.Body.String())
 	}
 }
 

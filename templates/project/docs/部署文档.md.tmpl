@@ -741,8 +741,8 @@ docker compose up -d app
 
 ```bash
 # 示例：从某个明确选定的加速源拉取，再 tag 回 Dockerfile 中的原始标签
-docker pull <明确选定的加速源>/library/golang:1.25-alpine
-docker tag <明确选定的加速源>/library/golang:1.25-alpine golang:1.25-alpine
+docker pull <明确选定的加速源>/library/golang:{{ .GoVersion }}-alpine
+docker tag <明确选定的加速源>/library/golang:{{ .GoVersion }}-alpine golang:{{ .GoVersion }}-alpine
 
 docker pull <明确选定的加速源>/library/node:22-alpine
 docker tag <明确选定的加速源>/library/node:22-alpine node:22-alpine

@@ -33,13 +33,10 @@ func ToUserInfo(u *model.AdminUser) *UserInfo {
 	if u.Birthday != nil {
 		birthday = u.Birthday.Format("2006-01-02")
 	}
-	lastLoginTime := "1900-01-01 00:00:00"
+	// 从未登录过时两项都返回空串，由前端显示「-」，不再造假的时间和 IP。
+	lastLoginTime := ""
 	if u.LastLoginTime != nil {
 		lastLoginTime = u.LastLoginTime.Format("2006-01-02 15:04:05")
-	}
-	lastLoginIP := u.LastLoginIP
-	if lastLoginIP == "" {
-		lastLoginIP = "127.0.0.1"
 	}
 	return &UserInfo{
 		UserID:        u.UserID,
@@ -55,7 +52,7 @@ func ToUserInfo(u *model.AdminUser) *UserInfo {
 		Status:        u.Status,
 		UserSource:    u.UserSource,
 		LastLoginTime: lastLoginTime,
-		LastLoginIP:   lastLoginIP,
+		LastLoginIP:   u.LastLoginIP,
 		CreatedAt:     u.CreatedAt.Format("2006-01-02 15:04:05"),
 		UpdatedAt:     u.UpdatedAt.Format("2006-01-02 15:04:05"),
 	}

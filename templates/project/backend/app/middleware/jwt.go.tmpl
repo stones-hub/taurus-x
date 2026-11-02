@@ -2,7 +2,9 @@ package middleware
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -21,6 +23,13 @@ const (
 	// JWTTokenClaimsKey context 中存放 JWT claims 的键
 	JWTTokenClaimsKey contextKey = "jwt_claims"
 )
+
+// ErrJWTMissingExpiry 令牌没有 exp。本项目签发的令牌总带 exp，缺失 exp 的令牌
+// 一律按无效处理，避免出现无法过期的会话凭证。
+var ErrJWTMissingExpiry = errors.New("JWT令牌缺少过期时间")
+
+// ErrJWTWriteFailed 令牌已签发并登记，但写入响应失败；此时会话已被尽力吊销。
+var ErrJWTWriteFailed = errors.New("JWT令牌写入失败")
 
 // JWTClaims JWT 声明
 type JWTClaims struct {
@@ -94,11 +103,11 @@ func signJWT(uid, username string) (token, jti string, ttl time.Duration, err er
 	}
 
 	// jti 由签发库生成，回读一次拿到它
-	claims, err := tcrypt.ParseTokenWithSecret(token, secret)
+	claims, err := parseJWT(token, secret)
 	if err != nil {
 		return "", "", 0, err
 	}
-	return token, claims.Id, ttl, nil
+	return token, claims.ID, ttl, nil
 }
 
 // GenerateJWTToken 生成 JWT 令牌，并以 authVersion 把它登记进会话白名单。
@@ -112,48 +121,96 @@ func signJWT(uid, username string) (token, jti string, ttl time.Duration, err er
 // 两种情况都不存在「旧凭证换到可用会话」的窗口。反过来，如果在登记时现读版本，
 // 旧凭证的并发登录就会登记到新版本上，这正是不能只把自增提前到 SQL 之前的原因。
 func GenerateJWTToken(uid, username string, authVersion int64) (string, error) {
+	token, _, err := registerJWT(uid, username, authVersion)
+	return token, err
+}
+
+// registerJWT 是 GenerateJWTToken 的实现，额外返回 jti，供写入失败时吊销。
+func registerJWT(uid, username string, authVersion int64) (token, jti string, err error) {
 	userID, err := strconv.ParseUint(uid, 10, 64)
 	if err != nil {
-		return "", fmt.Errorf("签发 Token 失败: 用户 ID 非法")
+		return "", "", fmt.Errorf("签发 Token 失败: 用户 ID 非法")
 	}
 	token, jti, ttl, err := signJWT(uid, username)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if err := AuthSessionStore().RegisterSession(userID, jti, ttl, authVersion); err != nil {
-		return "", fmt.Errorf("签发 Token 失败: %w", err)
+		return "", "", fmt.Errorf("签发 Token 失败: %w", err)
 	}
-	return token, nil
+	return token, jti, nil
+}
+
+// IssueLoginJWT 登录专用：签发并登记会话（同 GenerateJWTToken），再把令牌写入响应，
+// 返回令牌与过期时间。
+//
+// 写入失败时返回 ErrJWTWriteFailed，并尽力吊销刚登记的会话（吊销失败只记日志）：
+// 客户端拿不到令牌，这个会话不应在白名单里留到过期。
+func IssueLoginJWT(w http.ResponseWriter, uid, username string, authVersion int64) (string, time.Time, error) {
+	token, jti, err := registerJWT(uid, username, authVersion)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	expiresAt, err := JWTExpiresAt(token)
+	if err != nil {
+		if revokeErr := AuthSessionStore().RevokeSession(jti); revokeErr != nil {
+			log.Printf("登录令牌写入失败后吊销会话失败: %v\n", revokeErr)
+		}
+		return "", time.Time{}, fmt.Errorf("%w: %v", ErrJWTWriteFailed, err)
+	}
+	setJWTCookie(w, token, expiresAt)
+	return token, expiresAt, nil
 }
 
 // ValidateJWTToken 验证 JWT 令牌签名与有效期（不含会话白名单校验，
 // 白名单由 SessionValidatorMiddleware 负责）
 func ValidateJWTToken(token string) (*JWTClaims, *tcrypt.Claims, error) {
-	c, err := tcrypt.ParseTokenWithSecret(token, taurus.Container.Config.GetString("http.jwt.secret"))
+	c, err := parseJWT(token, taurus.Container.Config.GetString("http.jwt.secret"))
 	if err != nil {
 		return nil, nil, err
 	}
-	return &JWTClaims{UID: c.Uid, Username: c.Username, JTI: c.Id}, c, nil
+	return &JWTClaims{UID: c.Uid, Username: c.Username, JTI: c.ID}, c, nil
 }
 
-// RefreshJWTToken 刷新 JWT 令牌：校验旧 Token 仍在白名单内，签发新 Token 后吊销旧的。
-func RefreshJWTToken(w http.ResponseWriter, token string) (string, error) {
-	claims, err := tcrypt.ParseTokenWithSecret(token, taurus.Container.Config.GetString("http.jwt.secret"))
+// parseJWT 校验签名与时间点，并要求令牌带 exp（缺失返回 ErrJWTMissingExpiry）。
+func parseJWT(token, secret string) (*tcrypt.Claims, error) {
+	c, err := tcrypt.ParseTokenWithSecret(token, secret)
 	if err != nil {
-		return "", err
+		return nil, err
+	}
+	if c.ExpiresAt == nil {
+		return nil, ErrJWTMissingExpiry
+	}
+	return c, nil
+}
+
+// RefreshJWTToken 刷新 JWT 令牌：校验旧 Token 仍在白名单内，签发新 Token 后吊销旧的，
+// 写入响应后返回新令牌与过期时间。
+//
+// 顺序是先轮换会话、再写 Cookie。写 Cookie 失败时旧会话已被消费、新令牌也没交给客户端，
+// 用户只能重新登录。这是有意的失败即关闭：反过来先写 Cookie 再轮换，轮换失败时客户端
+// 会拿到一个不在白名单里的令牌，或者旧令牌在轮换失败后仍可用，都比强制重新登录更糟。
+func RefreshJWTToken(w http.ResponseWriter, token string) (string, time.Time, error) {
+	claims, err := parseJWT(token, taurus.Container.Config.GetString("http.jwt.secret"))
+	if err != nil {
+		return "", time.Time{}, err
 	}
 	userID, err := strconv.ParseUint(claims.Uid, 10, 64)
 	if err != nil {
-		return "", fmt.Errorf("刷新 Token 失败: 用户 ID 非法")
+		return "", time.Time{}, errors.New("用户 ID 非法")
 	}
-	newToken, err := rotateSession(AuthSessionStore(), userID, claims.Id, func() (string, string, time.Duration, error) {
+	newToken, err := rotateSession(AuthSessionStore(), userID, claims.ID, func() (string, string, time.Duration, error) {
 		return signJWT(claims.Uid, claims.Username)
 	})
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
-	SetJWTToken(w, newToken)
-	return newToken, nil
+	expiresAt, err := JWTExpiresAt(newToken)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("写入 JWT Cookie 失败: %w", err)
+	}
+	setJWTCookie(w, newToken, expiresAt)
+	return newToken, expiresAt, nil
 }
 
 // rotateSession 把旧会话轮换成新会话，是刷新 Token 的全部安全逻辑。
@@ -175,25 +232,33 @@ func rotateSession(s SessionStore, userID uint64, oldJTI string,
 		return "", err
 	}
 	if err := s.RotateSession(userID, oldJTI, newJTI, ttl, authVersion); err != nil {
-		return "", fmt.Errorf("刷新 Token 失败: %w", err)
+		return "", fmt.Errorf("轮换会话失败: %w", err)
 	}
 	return newToken, nil
 }
 
-// SetJWTToken 设置 JWT 令牌到响应头与 Cookie
+// JWTExpiresAt 校验令牌并返回其过期时间（exp）；令牌无效或缺少 exp 时返回错误。
 func JWTExpiresAt(token string) (time.Time, error) {
 	_, claims, err := ValidateJWTToken(token)
 	if err != nil {
 		return time.Time{}, err
 	}
-	return time.Unix(claims.ExpiresAt, 0), nil
+	return claims.ExpiresAt.Time, nil
 }
 
-func SetJWTToken(w http.ResponseWriter, token string) {
+// SetJWTToken 设置 JWT 令牌到响应头与 Cookie，Cookie 过期时间与令牌 exp 一致。
+// 读不出 exp 时不写任何头并返回错误，由调用方决定响应，不能静默当成成功。
+func SetJWTToken(w http.ResponseWriter, token string) error {
 	expiresAt, err := JWTExpiresAt(token)
 	if err != nil {
-		return
+		return fmt.Errorf("写入 JWT Cookie 失败: %w", err)
 	}
+	setJWTCookie(w, token, expiresAt)
+	return nil
+}
+
+// setJWTCookie 把已校验过的令牌写入响应头与 Cookie，expiresAt 必须取自该令牌的 exp。
+func setJWTCookie(w http.ResponseWriter, token string, expiresAt time.Time) {
 	w.Header().Set(JWTTokenKey, token)
 	http.SetCookie(w, &http.Cookie{
 		Name:     JWTTokenKey,

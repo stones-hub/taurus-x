@@ -2,6 +2,7 @@
 // 个人信息管理（三区块：基本信息/修改密码/手机号管理）
 import { onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
+import { useRouter } from 'vue-router'
 import {
   apiBindMobile,
   apiChangePassword,
@@ -10,7 +11,10 @@ import {
   apiUnbindMobile,
   apiUpdateProfile,
 } from '../../api/user'
+import { clearLocalAuth } from '../../store/session'
 import type { UserInfo } from '../../types'
+
+const router = useRouter()
 
 const userInfo = ref<UserInfo | null>(null)
 
@@ -84,10 +88,14 @@ async function onChangePassword() {
       old_password: passwordForm.old_password,
       new_password: passwordForm.new_password,
     })
-    ElMessage.success('密码修改成功')
     passwordForm.old_password = ''
     passwordForm.new_password = ''
     passwordForm.confirm_password = ''
+    // 后端改密会让该用户的全部会话失效：当前令牌已不可用，直接清本地登录态回登录页，
+    // 不要等下一次请求才弹「会话已失效」。
+    ElMessage.success('密码已修改，请重新登录')
+    clearLocalAuth()
+    await router.replace('/login')
   } finally {
     passwordLoading.value = false
   }
@@ -213,12 +221,12 @@ onMounted(() => {
           </el-col>
           <el-col :span="12">
             <el-form-item label="最后登录时间">
-              <el-input :model-value="userInfo?.last_login_time" disabled />
+              <el-input :model-value="userInfo?.last_login_time || '-'" disabled />
             </el-form-item>
           </el-col>
           <el-col :span="12">
             <el-form-item label="最后登录IP">
-              <el-input :model-value="userInfo?.last_login_ip" disabled />
+              <el-input :model-value="userInfo?.last_login_ip || '-'" disabled />
             </el-form-item>
           </el-col>
         </el-row>

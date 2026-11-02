@@ -3,6 +3,7 @@ package repo
 import (
 	"context"
 	"errors"
+	"time"
 
 	"gorm.io/gorm"
 
@@ -40,6 +41,21 @@ func (r repoSet) User() *AdminUserRepository { return NewAdminUserRepositoryWith
 // UpdateByID 按主键更新指定字段
 func (r *AdminUserRepository) UpdateByID(ctx context.Context, id uint64, updates interface{}) error {
 	return r.db.WithContext(ctx).Model(&model.AdminUser{}).Where("user_id = ?", id).Updates(updates).Error
+}
+
+// UpdateLastLogin 只更新最后登录时间与 IP 两列，登录不算对用户资料的修改。
+//
+// 用 UpdateColumns，不整行保存，不会覆盖同一时刻对该用户其他字段的修改，GORM 也不会自动写 updated_at。
+// 但 admin_users.updated_at 在表结构里是 ON UPDATE CURRENT_TIMESTAMP，MySQL 会在任何 UPDATE 时自动刷新它；
+// 所以同一条语句里显式写 updated_at = updated_at：ON UPDATE 列被显式赋值后，MySQL 就不再自动更新，
+// 用户管理列表的「修改时间」不会随每次登录变化。
+func (r *AdminUserRepository) UpdateLastLogin(ctx context.Context, userID uint64, at time.Time, ip string) error {
+	return r.db.WithContext(ctx).Model(&model.AdminUser{}).Where("user_id = ?", userID).
+		UpdateColumns(map[string]interface{}{
+			"last_login_time": at,
+			"last_login_ip":   ip,
+			"updated_at":      gorm.Expr("`updated_at`"),
+		}).Error
 }
 
 // FindByUsername 根据用户名查找用户

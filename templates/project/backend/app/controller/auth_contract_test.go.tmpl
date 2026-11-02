@@ -3,22 +3,25 @@ package controller
 import (
 	"bytes"
 	"crypto/rand"
+	"database/sql/driver"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
-	"github.com/dgrijalva/jwt-go"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/stones-hub/taurus-pro-common/pkg/util/tcrypt"
 	"github.com/stones-hub/taurus-pro-config/pkg/config"
 	"github.com/stones-hub/taurus-pro-http/pkg/router"
 
 	"{{ .Module }}/app/dto"
 	"{{ .Module }}/app/helper"
+	"{{ .Module }}/app/helper/store"
 	"{{ .Module }}/app/middleware"
 	"{{ .Module }}/app/repo"
 	"{{ .Module }}/app/service"
@@ -26,24 +29,54 @@ import (
 )
 
 type authPolicySessions struct {
-	revokeError error
-	rotations   int
-	revocations int
-	validations int
+	revokeError   error
+	registerError error
+	validateError error
+	rotations     int
+	revocations   int
+	validations   int
+	// onRegister / onRotate 在登记、轮换会话时回调，用来模拟签发与写入之间配置发生变化。
+	onRegister  func()
+	onRotate    func()
+	registered  []string
+	revokedJTIs []string
 }
 
-func (s *authPolicySessions) RegisterSession(uint64, string, time.Duration, int64) error { return nil }
+func (s *authPolicySessions) RegisterSession(_ uint64, jti string, _ time.Duration, _ int64) error {
+	if s.registerError != nil {
+		return s.registerError
+	}
+	s.registered = append(s.registered, jti)
+	if s.onRegister != nil {
+		s.onRegister()
+	}
+	return nil
+}
 func (s *authPolicySessions) ValidateSession(uint64, string) (int64, error) {
 	s.validations++
+	if s.validateError != nil {
+		return 0, s.validateError
+	}
 	return 1, nil
 }
 func (s *authPolicySessions) RotateSession(uint64, string, string, time.Duration, int64) error {
 	s.rotations++
+	if s.onRotate != nil {
+		s.onRotate()
+	}
 	return nil
 }
-func (s *authPolicySessions) RevokeSession(string) error {
+func (s *authPolicySessions) RevokeSession(jti string) error {
 	s.revocations++
+	s.revokedJTIs = append(s.revokedJTIs, jti)
 	return s.revokeError
+}
+
+// rotatePolicySecret 换掉 JWT 密钥，让此前签发的令牌在写入阶段校验失败。
+func rotatePolicySecret() {
+	taurus.Container.Config.MergeMap(map[string]interface{}{"http": map[string]interface{}{
+		"jwt": map[string]interface{}{"secret": "rotated-policy-secret-0123456789abcdef"},
+	}})
 }
 
 func authPolicyConfig(t *testing.T, secure bool) *authPolicySessions {
@@ -176,6 +209,7 @@ func TestAuthCookieLoginRefreshLogoutPolicy(t *testing.T) {
 			mock.ExpectQuery("SELECT .* FROM `admin_user_logins`").WillReturnRows(sqlmock.NewRows([]string{"login_id", "user_id", "login_credential", "salt", "status"}).AddRow(7, 7, hash, "", 1))
 			mock.ExpectCommit()
 			mock.ExpectExec("INSERT INTO `admin_user_login_logs`").WillReturnResult(sqlmock.NewResult(1, 1))
+			expectLastLoginUpdate(mock).WillReturnResult(sqlmock.NewResult(0, 1))
 			body, err := json.Marshal(dto.LoginRequest{Username: "policy-user", Password: password})
 			if err != nil {
 				t.Fatal(err)
@@ -198,6 +232,9 @@ func TestAuthCookieLoginRefreshLogoutPolicy(t *testing.T) {
 			if authPolicyCode(t, failed) != 500 || len(failed.Result().Cookies()) != 0 {
 				t.Fatal("failed logout cleared cookies or reported success")
 			}
+			if bytes.Contains(failed.Body.Bytes(), []byte("simulated revocation failure")) {
+				t.Fatal("logout response leaked internal session store error")
+			}
 			sessions.revokeError = nil
 			logout := httptest.NewRecorder()
 			controller.Logout(logout, authPolicyRequest("/auth/logout", nil, cookie.Value))
@@ -209,6 +246,403 @@ func TestAuthCookieLoginRefreshLogoutPolicy(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+// policyClientIP 是 authPolicyRequest 的 RemoteAddr（httptest 默认 192.0.2.1:1234）解析出的客户端 IP。
+const policyClientIP = "192.0.2.1"
+
+// recentTime 匹配刚写入的时间参数：必须是 time.Time，且在最近一分钟内、不在未来。
+type recentTime struct{}
+
+func (recentTime) Match(v driver.Value) bool {
+	at, ok := v.(time.Time)
+	return ok && !at.After(time.Now()) && time.Since(at) < time.Minute
+}
+
+// expectLastLoginUpdate 登录成功后只更新 last_login_ip、last_login_time 两列，条件是本人的 user_id；
+// 同一条语句显式写 updated_at = updated_at，压住 MySQL 的 ON UPDATE CURRENT_TIMESTAMP。
+func expectLastLoginUpdate(mock sqlmock.Sqlmock) *sqlmock.ExpectedExec {
+	return mock.ExpectExec("^UPDATE `admin_users` SET `last_login_ip`=\\?,`last_login_time`=\\?,`updated_at`=`updated_at` WHERE user_id = \\?$").
+		WithArgs(policyClientIP, recentTime{}, 7)
+}
+
+// expectPolicyCredentials 期望一次成功的凭证校验事务（用户 7，密码散列 hash）。
+func expectPolicyCredentials(mock sqlmock.Sqlmock, hash string) {
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT .* FROM `admin_users`").WillReturnRows(sqlmock.NewRows([]string{"user_id", "username", "status", "auth_version"}).AddRow(7, "policy-user", 1, 1))
+	mock.ExpectQuery("SELECT .* FROM `admin_user_logins`").WillReturnRows(sqlmock.NewRows([]string{"login_id", "user_id", "login_credential", "salt", "status"}).AddRow(7, 7, hash, "", 1))
+	mock.ExpectCommit()
+}
+
+// policyLoginBody 登录请求体（用户 policy-user）。
+func policyLoginBody(t *testing.T, password string) []byte {
+	t.Helper()
+	body, err := json.Marshal(dto.LoginRequest{Username: "policy-user", Password: password})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+// TestLoginRecordsLastLogin 登录成功（令牌已写入、记了「登录成功」）后更新最后登录时间与 IP；
+// IP 与登录日志同源。更新失败只记日志，登录照常成功。
+func TestLoginRecordsLastLogin(t *testing.T) {
+	for _, updateError := range []error{nil, errors.New("simulated last login update failure")} {
+		t.Run(fmt.Sprintf("updateError=%v", updateError), func(t *testing.T) {
+			authPolicyConfig(t, false)
+			database, mock := newMockDB(t)
+			repoStore := repo.NewStoreWithDB(database)
+			controller := &AuthController{AuthService: service.NewAuthService(repoStore), LoginLogService: service.NewAdminLoginLogService(repoStore)}
+			hash, err := helper.HashPassword("policy-password-0001")
+			if err != nil {
+				t.Fatal(err)
+			}
+			expectPolicyCredentials(mock, hash)
+			mock.ExpectExec("INSERT INTO `admin_user_login_logs`").
+				WithArgs(7, sqlmock.AnyArg(), policyClientIP, sqlmock.AnyArg(), service.LoginStatusSuccess, "", sqlmock.AnyArg()).
+				WillReturnResult(sqlmock.NewResult(1, 1))
+			update := expectLastLoginUpdate(mock)
+			if updateError != nil {
+				update.WillReturnError(updateError)
+			} else {
+				update.WillReturnResult(sqlmock.NewResult(0, 1))
+			}
+			recorder := httptest.NewRecorder()
+			controller.Login(recorder, authPolicyRequest("/auth/login", policyLoginBody(t, "policy-password-0001"), ""))
+			if authPolicyCode(t, recorder) != 200 {
+				t.Fatal("login must succeed regardless of last login update result")
+			}
+			assertJWTCookie(t, recorder, false, false)
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// TestLoginBackendErrorHidesInternalError 凭证校验时数据库出错：返回 500 通用提示，
+// 不回显内部错误、不下发 Cookie，登录日志记失败且不写入内部错误文本。
+func TestLoginBackendErrorHidesInternalError(t *testing.T) {
+	authPolicyConfig(t, false)
+	database, mock := newMockDB(t)
+	repoStore := repo.NewStoreWithDB(database)
+	controller := &AuthController{AuthService: service.NewAuthService(repoStore), LoginLogService: service.NewAdminLoginLogService(repoStore)}
+	mock.ExpectBegin().WillReturnError(errors.New("dial tcp 10.0.0.9:3306: internal-detail-marker"))
+	mock.ExpectExec("INSERT INTO `admin_user_login_logs`").
+		WithArgs(0, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), service.LoginStatusFailure, "登录服务异常", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	recorder := httptest.NewRecorder()
+	controller.Login(recorder, authPolicyRequest("/auth/login", policyLoginBody(t, "policy-password-0001"), ""))
+	if authPolicyCode(t, recorder) != 500 {
+		t.Fatal("login backend failure must return 500")
+	}
+	if bytes.Contains(recorder.Body.Bytes(), []byte("internal-detail-marker")) {
+		t.Fatalf("login response leaked internal error: %s", recorder.Body.String())
+	}
+	if len(recorder.Result().Cookies()) != 0 || recorder.Header().Get(middleware.JWTTokenKey) != "" {
+		t.Fatal("login backend failure still issued cookies or token header")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// policyMessage 取出 Fail 响应里 data.message 的原文。
+func policyMessage(t *testing.T, recorder *httptest.ResponseRecorder) string {
+	t.Helper()
+	var response struct {
+		Data struct {
+			Message string `json:"message"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	return response.Data.Message
+}
+
+// TestLoginRejectionsKeepMessageAndBackendErrorsDoNot 登录失败的两类响应：
+// 凭证 / 账号状态被拒返回 401 和原文案；事务中途的查询出错返回 500 通用提示，不泄漏内部错误。
+func TestLoginRejectionsKeepMessageAndBackendErrorsDoNot(t *testing.T) {
+	hash, err := helper.HashPassword("policy-password-0001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	userRow := func(status int) *sqlmock.Rows {
+		return sqlmock.NewRows([]string{"user_id", "username", "status", "auth_version"}).AddRow(7, "policy-user", status, 1)
+	}
+	loginRow := func() *sqlmock.Rows {
+		return sqlmock.NewRows([]string{"login_id", "user_id", "login_credential", "salt", "status"}).AddRow(7, 7, hash, "", 1)
+	}
+	const detail = "dial tcp 10.0.0.9:3306: internal-detail-marker"
+	cases := []struct {
+		name     string
+		password string
+		// expect 登记凭证校验事务内的语句（Begin 之后、Rollback 之前）
+		expect  func(sqlmock.Sqlmock)
+		lookup  *sqlmock.Rows // 拒绝时按用户名回查 user_id；nil 表示不回查（后端错误）
+		logUser int
+		reason  string
+		code    int
+		message string
+	}{
+		{
+			name: "用户不存在", password: "policy-password-0001",
+			expect: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery("SELECT .* FROM `admin_users`").WillReturnRows(sqlmock.NewRows([]string{"user_id", "username", "status", "auth_version"}))
+			},
+			lookup: sqlmock.NewRows([]string{"user_id", "username", "status", "auth_version"}), logUser: 0,
+			reason: "用户名或密码错误", code: 401, message: "用户名或密码错误",
+		},
+		{
+			name: "密码错误", password: "wrong-password-0001",
+			expect: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery("SELECT .* FROM `admin_users`").WillReturnRows(userRow(1))
+				mock.ExpectQuery("SELECT .* FROM `admin_user_logins`").WillReturnRows(loginRow())
+			},
+			lookup: userRow(1), logUser: 7,
+			reason: "用户名或密码错误", code: 401, message: "用户名或密码错误",
+		},
+		{
+			name: "账号被禁用", password: "policy-password-0001",
+			expect: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery("SELECT .* FROM `admin_users`").WillReturnRows(userRow(0))
+				mock.ExpectQuery("SELECT .* FROM `admin_user_logins`").WillReturnRows(loginRow())
+			},
+			lookup: userRow(0), logUser: 7,
+			reason: "账号状态非法", code: 401, message: "账号状态非法",
+		},
+		{
+			name: "用户表查询出错", password: "policy-password-0001",
+			expect: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery("SELECT .* FROM `admin_users`").WillReturnError(errors.New(detail))
+			},
+			reason: "登录服务异常", code: 500, message: service.ErrLoginBackend.Error(),
+		},
+		{
+			name: "凭证表查询出错", password: "policy-password-0001",
+			expect: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery("SELECT .* FROM `admin_users`").WillReturnRows(userRow(1))
+				mock.ExpectQuery("SELECT .* FROM `admin_user_logins`").WillReturnError(errors.New(detail))
+			},
+			reason: "登录服务异常", code: 500, message: service.ErrLoginBackend.Error(),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			authPolicyConfig(t, false)
+			database, mock := newMockDB(t)
+			repoStore := repo.NewStoreWithDB(database)
+			controller := &AuthController{AuthService: service.NewAuthService(repoStore), LoginLogService: service.NewAdminLoginLogService(repoStore)}
+			mock.ExpectBegin()
+			tc.expect(mock)
+			mock.ExpectRollback()
+			if tc.lookup != nil {
+				mock.ExpectQuery("SELECT .* FROM `admin_users`").WillReturnRows(tc.lookup)
+			}
+			mock.ExpectExec("INSERT INTO `admin_user_login_logs`").
+				WithArgs(tc.logUser, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), service.LoginStatusFailure, tc.reason, sqlmock.AnyArg()).
+				WillReturnResult(sqlmock.NewResult(1, 1))
+			recorder := httptest.NewRecorder()
+			controller.Login(recorder, authPolicyRequest("/auth/login", policyLoginBody(t, tc.password), ""))
+			if authPolicyCode(t, recorder) != tc.code {
+				t.Fatalf("应返回 %d", tc.code)
+			}
+			if got := policyMessage(t, recorder); got != tc.message {
+				t.Fatalf("提示应为 %q，实际 %q", tc.message, got)
+			}
+			if bytes.Contains(recorder.Body.Bytes(), []byte("internal-detail-marker")) {
+				t.Fatalf("登录响应泄漏了内部错误: %s", recorder.Body.String())
+			}
+			if len(recorder.Result().Cookies()) != 0 || recorder.Header().Get(middleware.JWTTokenKey) != "" {
+				t.Fatal("登录失败仍下发了 Cookie 或令牌头")
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// TestRefreshTokenHidesInternalError 刷新失败时不回显内部错误：会话存储不可用回 503，
+// 其他错误回 401 通用提示「令牌刷新失败，请重新登录」；都不下发 Cookie、不轮换会话。
+func TestRefreshTokenHidesInternalError(t *testing.T) {
+	const internalDetail = "dial tcp 10.0.0.9:6379: internal-detail-marker"
+	cases := []struct {
+		err  error
+		code int
+	}{
+		{fmt.Errorf("%w: %s", store.ErrSessionStoreUnavailable, internalDetail), 503},
+		{errors.New(internalDetail), 401},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("code=%d", tc.code), func(t *testing.T) {
+			sessions := authPolicyConfig(t, false)
+			token, err := middleware.GenerateJWTToken("7", "policy-user", 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sessions.validateError = tc.err
+			recorder := httptest.NewRecorder()
+			(&AuthController{}).RefreshToken(recorder, authPolicyRequest("/user/refresh-token", nil, token))
+			if authPolicyCode(t, recorder) != tc.code {
+				t.Fatalf("refresh failure must return %d", tc.code)
+			}
+			if bytes.Contains(recorder.Body.Bytes(), []byte("internal-detail-marker")) {
+				t.Fatalf("refresh response leaked internal error: %s", recorder.Body.String())
+			}
+			if tc.code == 401 && !bytes.Contains(recorder.Body.Bytes(), []byte("令牌刷新失败，请重新登录")) {
+				t.Fatalf("refresh 401 must use the generic message, got %s", recorder.Body.String())
+			}
+			if len(recorder.Result().Cookies()) != 0 || sessions.rotations != 0 {
+				t.Fatal("failed refresh issued cookies or rotated the session")
+			}
+		})
+	}
+}
+
+// failedPolicyLogin 用合法凭证登录一次，并要求审计表写入一条原因为 reason 的失败记录。
+func failedPolicyLogin(t *testing.T, reason string) *httptest.ResponseRecorder {
+	t.Helper()
+	database, mock := newMockDB(t)
+	repoStore := repo.NewStoreWithDB(database)
+	controller := &AuthController{AuthService: service.NewAuthService(repoStore), LoginLogService: service.NewAdminLoginLogService(repoStore)}
+	hash, err := helper.HashPassword("policy-password-0001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT .* FROM `admin_users`").WillReturnRows(sqlmock.NewRows([]string{"user_id", "username", "status", "auth_version"}).AddRow(7, "policy-user", 1, 1))
+	mock.ExpectQuery("SELECT .* FROM `admin_user_logins`").WillReturnRows(sqlmock.NewRows([]string{"login_id", "user_id", "login_credential", "salt", "status"}).AddRow(7, 7, hash, "", 1))
+	mock.ExpectCommit()
+	mock.ExpectExec("INSERT INTO `admin_user_login_logs`").
+		WithArgs(7, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), service.LoginStatusFailure, reason, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	body, err := json.Marshal(dto.LoginRequest{Username: "policy-user", Password: "policy-password-0001"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	controller.Login(recorder, authPolicyRequest("/auth/login", body, ""))
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+	if len(recorder.Result().Cookies()) != 0 || recorder.Header().Get(middleware.JWTTokenKey) != "" {
+		t.Fatal("failed login still issued cookies or token header")
+	}
+	return recorder
+}
+
+// TestLoginTokenWriteFailureRevokesSession 令牌已登记、但写入响应失败时：
+// 不能下发任何 Cookie/令牌头，刚登记的会话要被吊销，审计日志记失败而不是成功。
+// 用「登记会话时轮换密钥」模拟签发与写入之间配置变化，让写入阶段的校验失败。
+// 吊销本身失败时结果不变（只多一条服务端日志）。
+func TestLoginTokenWriteFailureRevokesSession(t *testing.T) {
+	for _, revokeError := range []error{nil, errors.New("simulated revoke outage")} {
+		t.Run(fmt.Sprintf("revokeError=%v", revokeError), func(t *testing.T) {
+			sessions := authPolicyConfig(t, false)
+			sessions.onRegister = rotatePolicySecret
+			sessions.revokeError = revokeError
+			recorder := failedPolicyLogin(t, "令牌写入失败")
+			if authPolicyCode(t, recorder) != 500 {
+				t.Fatal("token write failure reported as login success")
+			}
+			if len(sessions.registered) != 1 || len(sessions.revokedJTIs) != 1 || sessions.revokedJTIs[0] != sessions.registered[0] {
+				t.Fatalf("registered session not revoked: registered=%v revoked=%v", sessions.registered, sessions.revokedJTIs)
+			}
+		})
+	}
+}
+
+// TestLoginSessionRegisterFailureHidesInternalError 登记会话失败时，登录不能把内部错误
+// （Redis 地址等）回给客户端：会话存储不可用回 503（与刷新、会话中间件一致），其他错误回 500。
+func TestLoginSessionRegisterFailureHidesInternalError(t *testing.T) {
+	const internalDetail = "dial tcp 10.0.0.9:6379: internal-detail-marker"
+	cases := []struct {
+		err  error
+		code int
+	}{
+		{fmt.Errorf("%w: %s", store.ErrSessionStoreUnavailable, internalDetail), 503},
+		{errors.New(internalDetail), 500},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("code=%d", tc.code), func(t *testing.T) {
+			sessions := authPolicyConfig(t, false)
+			sessions.registerError = tc.err
+			recorder := failedPolicyLogin(t, "生成令牌失败")
+			if authPolicyCode(t, recorder) != tc.code {
+				t.Fatalf("session register failure must return %d", tc.code)
+			}
+			if bytes.Contains(recorder.Body.Bytes(), []byte("internal-detail-marker")) {
+				t.Fatal("login response leaked internal session store error")
+			}
+		})
+	}
+}
+
+// TestRefreshTokenWriteFailureAfterRotation 轮换已成功、但写入新令牌失败：
+// 返回 401、不下发 Cookie，旧会话已被消费（失败即关闭，用户需重新登录）。
+func TestRefreshTokenWriteFailureAfterRotation(t *testing.T) {
+	sessions := authPolicyConfig(t, false)
+	token, err := middleware.GenerateJWTToken("7", "policy-user", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions.onRotate = rotatePolicySecret
+	recorder := httptest.NewRecorder()
+	(&AuthController{}).RefreshToken(recorder, authPolicyRequest("/user/refresh-token", nil, token))
+	if authPolicyCode(t, recorder) != 401 {
+		t.Fatal("refresh write failure must return 401")
+	}
+	if len(recorder.Result().Cookies()) != 0 || recorder.Header().Get(middleware.JWTTokenKey) != "" {
+		t.Fatal("refresh write failure still issued cookies or token header")
+	}
+	if sessions.validations != 1 || sessions.rotations != 1 {
+		t.Fatalf("old session must be consumed exactly once: validations=%d rotations=%d", sessions.validations, sessions.rotations)
+	}
+}
+
+// TestAdminChainRejectsTokenWithoutExpiry 缺 exp 的令牌走 /admin/** 的认证链
+// （JWTMiddleware + SessionValidatorMiddleware）必须返回 401，且不访问会话存储；
+// 同一条链上合法令牌能放行，证明拒绝来自缺 exp 而不是链本身没开。
+func TestAdminChainRejectsTokenWithoutExpiry(t *testing.T) {
+	sessions := authPolicyConfig(t, false)
+	taurus.Container.Config.MergeMap(map[string]interface{}{"http": map[string]interface{}{
+		"jwt": map[string]interface{}{"enabled": true},
+	}})
+	reached := 0
+	chain := middleware.JWTMiddleware()(middleware.SessionValidatorMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached++
+		OK(w, map[string]bool{"reached": true})
+	})))
+	noExpiry, err := jwt.NewWithClaims(jwt.SigningMethodHS256, &tcrypt.Claims{
+		Uid: "7", Username: "policy-user",
+		RegisteredClaims: jwt.RegisteredClaims{ID: "no-expiry-admin-session"},
+	}).SignedString([]byte(taurus.Container.Config.GetString("http.jwt.secret")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://example.test/admin/user/info", nil)
+	req.Header.Set("Authorization", "Bearer "+noExpiry)
+	recorder := httptest.NewRecorder()
+	chain.ServeHTTP(recorder, req)
+	if authPolicyCode(t, recorder) != 401 || reached != 0 || sessions.validations != 0 {
+		t.Fatal("admin chain accepted a token without exp or consulted the session store")
+	}
+	if !bytes.Contains(recorder.Body.Bytes(), []byte(middleware.ErrJWTMissingExpiry.Error())) {
+		t.Fatalf("admin chain rejection must be caused by missing exp, got %s", recorder.Body.String())
+	}
+	valid, err := middleware.GenerateJWTToken("7", "policy-user", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodGet, "http://example.test/admin/user/info", nil)
+	req.Header.Set("Authorization", "Bearer "+valid)
+	recorder = httptest.NewRecorder()
+	chain.ServeHTTP(recorder, req)
+	if authPolicyCode(t, recorder) != 200 || reached != 1 || sessions.validations != 1 {
+		t.Fatal("admin chain rejected a valid token")
 	}
 }
 
@@ -273,19 +707,29 @@ func TestLogoutExpiredCookiePolicyThroughRoute(t *testing.T) {
 			secret := taurus.Container.Config.GetString("http.jwt.secret")
 			expired, err := jwt.NewWithClaims(jwt.SigningMethodHS256, &tcrypt.Claims{
 				Uid: "7", Username: "policy-user",
-				StandardClaims: jwt.StandardClaims{Id: "expired-policy-session", ExpiresAt: time.Now().Add(-time.Hour).Unix()},
+				RegisteredClaims: jwt.RegisteredClaims{ID: "expired-policy-session", ExpiresAt: jwt.NewNumericDate(time.Now().Add(-time.Hour))},
 			}).SignedString([]byte(secret))
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, _, err := middleware.ValidateJWTToken(expired); err == nil {
-				t.Fatal("expired fixture unexpectedly authenticatable")
+			if _, _, err := middleware.ValidateJWTToken(expired); !errors.Is(err, jwt.ErrTokenExpired) {
+				t.Fatalf("expired fixture must fail with ErrTokenExpired, got %v", err)
+			}
+			noExpiry, err := jwt.NewWithClaims(jwt.SigningMethodHS256, &tcrypt.Claims{
+				Uid: "7", Username: "policy-user",
+				RegisteredClaims: jwt.RegisteredClaims{ID: "no-expiry-policy-session"},
+			}).SignedString([]byte(secret))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := middleware.ValidateJWTToken(noExpiry); !errors.Is(err, middleware.ErrJWTMissingExpiry) {
+				t.Fatalf("token without exp must be rejected, got %v", err)
 			}
 			invalidSignature, err := tcrypt.GenerateTokenWithExpiration("7", "policy-user", "policy-test", secret+"-different-key", time.Hour)
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, token := range []string{"", expired, invalidSignature, "malformed-jwt"} {
+			for _, token := range []string{"", expired, noExpiry, invalidSignature, "malformed-jwt"} {
 				for _, handler := range []http.Handler{http.HandlerFunc(controller.Logout), mux} {
 					req := httptest.NewRequest(http.MethodPost, "http://example.test/auth/logout", nil)
 					req.Header.Set("Origin", "http://example.test")
@@ -303,7 +747,7 @@ func TestLogoutExpiredCookiePolicyThroughRoute(t *testing.T) {
 			if sessions.revocations != 0 || sessions.validations != 0 || sessions.rotations != 0 {
 				t.Fatal("invalid JWT cleanup consulted or changed session store")
 			}
-			for _, token := range []string{"", expired} {
+			for _, token := range []string{"", expired, noExpiry} {
 				req := httptest.NewRequest(http.MethodPost, "http://example.test/user/refresh-token", nil)
 				req.Header.Set("Origin", "http://example.test")
 				req.Header.Set("Authorization", "Bearer "+token)
@@ -311,6 +755,15 @@ func TestLogoutExpiredCookiePolicyThroughRoute(t *testing.T) {
 				middleware.AuthRequestMiddleware(true)(http.HandlerFunc(controller.RefreshToken)).ServeHTTP(recorder, req)
 				if recorder.Code != 403 || len(recorder.Result().Cookies()) != 0 || sessions.rotations != 0 {
 					t.Fatal("refresh bypassed strict CSRF for expired or absent JWT")
+				}
+			}
+			for _, token := range []string{expired, noExpiry} {
+				for _, handler := range []http.Handler{http.HandlerFunc(controller.RefreshToken), middleware.AuthRequestMiddleware(true)(http.HandlerFunc(controller.RefreshToken))} {
+					recorder := httptest.NewRecorder()
+					handler.ServeHTTP(recorder, authPolicyRequest("/user/refresh-token", nil, token))
+					if authPolicyCode(t, recorder) != 401 || len(recorder.Result().Cookies()) != 0 || sessions.rotations != 0 || sessions.validations != 0 {
+						t.Fatal("refresh with valid CSRF accepted an expired or exp-less JWT")
+					}
 				}
 			}
 			valid, err := middleware.GenerateJWTToken("7", "policy-user", 1)

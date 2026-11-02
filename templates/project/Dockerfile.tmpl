@@ -14,7 +14,7 @@ RUN pnpm build
 
 # ============ 阶段 2：编译后端（纯静态） ============
 # 同样原生跑编译器，用 Go 自带的交叉编译出目标架构的二进制。
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS backend-builder
+FROM --platform=$BUILDPLATFORM golang:{{ .GoVersion }}-alpine AS backend-builder
 WORKDIR /build/backend
 # BuildKit 自动注入的目标平台变量（不要给 TARGETARCH 写死默认值，
 # 否则 BuildKit 被关掉时会悄悄编出错架构的二进制；留空等于「构建机原生架构」，

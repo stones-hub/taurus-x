@@ -30,6 +30,14 @@ const tmplSuffix = ".tmpl"
 // wirePkg wire 代码生成器的包路径；用 `go run` 调用，不要求全局安装 wire。
 const wirePkg = "github.com/google/wire/cmd/wire"
 
+// 生成项目的 Go 版本与模板写死的依赖版本；模板（go.mod、Dockerfile、文档）和测试都从这里取值，
+// 升级时只改这一处。Docker 构建镜像为 golang:<goVersion>-alpine。
+const (
+	goVersion   = "1.27.3"
+	wireVersion = "v0.7.0"
+	jwtVersion  = "v5.3.1"
+)
+
 // projectNamePattern 合法项目名：字母、数字、下划线、短横线。
 var projectNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
@@ -87,7 +95,7 @@ type templateData struct {
 	Module           string
 	// DBName 默认数据库名：项目名里的短横线换成下划线，避免 MySQL 需要反引号。
 	DBName string
-	// GoVersion 生成项目 go.mod 的 go 指令版本。
+	// GoVersion 生成项目 go.mod 的 go 指令版本，同时决定 Docker 构建镜像标签。
 	GoVersion string
 	// Has 组件选中情况，模板里用 `{{ if .Has.consul }}` 判断。
 	Has map[string]bool
@@ -95,6 +103,8 @@ type templateData struct {
 	Requires []components.Component
 	// WireVersion google/wire 版本。
 	WireVersion string
+	// JWTVersion github.com/golang-jwt/jwt/v5 版本。
+	JWTVersion string
 
 	// AdminUsername 初始管理员账号。
 	AdminUsername string
@@ -279,10 +289,11 @@ func buildTemplateData(opts Options, selected []string) (*templateData, string, 
 		ProjectNameLower:  npmName(opts.ProjectName),
 		Module:            opts.Module,
 		DBName:            strings.ReplaceAll(opts.ProjectName, "-", "_"),
-		GoVersion:         "1.25.1",
+		GoVersion:         goVersion,
 		Has:               has,
 		Requires:          requires,
-		WireVersion:       "v0.6.0",
+		WireVersion:       wireVersion,
+		JWTVersion:        jwtVersion,
 		AdminUsername:     adminUsername,
 		AdminPasswordHash: adminPasswordHash,
 	}, adminPassword, nil

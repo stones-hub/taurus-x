@@ -58,9 +58,9 @@ type AccessLogResponse struct {
 
 // AccessLogListResponse 访问日志列表响应
 type AccessLogListResponse struct {
-	PageNo      int                 `json:"page_no"`
-	PageSize    int                 `json:"page_size"`
-	ResultTotal int64               `json:"result_total"`
+	PageNo      int                  `json:"page_no"`
+	PageSize    int                  `json:"page_size"`
+	ResultTotal int64                `json:"result_total"`
 	List        []*AccessLogResponse `json:"list"`
 }
 
@@ -69,11 +69,11 @@ type AccessLogListResponse struct {
 // OperationLogListRequest 操作日志查询请求
 type OperationLogListRequest struct {
 	PageQuery
-	UserID   uint64 `json:"user_id"`   // 用户ID（0=不过滤）
-	Method   string `json:"method"`    // HTTP 方法（空=不过滤）
-	Path     string `json:"path"`      // 接口路径（模糊匹配，空=不过滤）
-	Action   string `json:"action"`    // 动作类型（空=不过滤）
-	Resource string `json:"resource"`  // 资源模块（空=不过滤）
+	UserID   uint64 `json:"user_id"`  // 用户ID（0=不过滤）
+	Method   string `json:"method"`   // HTTP 方法（空=不过滤）
+	Path     string `json:"path"`     // 接口路径（模糊匹配，空=不过滤）
+	Action   string `json:"action"`   // 动作类型（空=不过滤）
+	Resource string `json:"resource"` // 资源模块（空=不过滤）
 }
 
 // OperationLogResponse 操作日志列表项
@@ -96,9 +96,9 @@ type OperationLogResponse struct {
 
 // OperationLogListResponse 操作日志列表响应
 type OperationLogListResponse struct {
-	PageNo      int                   `json:"page_no"`
-	PageSize    int                   `json:"page_size"`
-	ResultTotal int64                 `json:"result_total"`
+	PageNo      int                     `json:"page_no"`
+	PageSize    int                     `json:"page_size"`
+	ResultTotal int64                   `json:"result_total"`
 	List        []*OperationLogResponse `json:"list"`
 }
 
@@ -129,9 +129,9 @@ type FrontErrorLogResponse struct {
 
 // FrontErrorLogListResponse 前端错误日志列表响应
 type FrontErrorLogListResponse struct {
-	PageNo      int                    `json:"page_no"`
-	PageSize    int                    `json:"page_size"`
-	ResultTotal int64                  `json:"result_total"`
+	PageNo      int                      `json:"page_no"`
+	PageSize    int                      `json:"page_size"`
+	ResultTotal int64                    `json:"result_total"`
 	List        []*FrontErrorLogResponse `json:"list"`
 }
 

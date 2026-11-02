@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"strconv"
 
@@ -45,7 +46,9 @@ func PermissionMiddleware() func(next http.Handler) http.Handler {
 
 			hasPermission, err := permissionChecker.CheckAPIPermission(r.Context(), userID, r.URL.Path)
 			if err != nil {
-				httpx.SendResponse(w, http.StatusInternalServerError, "权限检查失败: "+err.Error(), nil)
+				// 数据库等内部错误只进服务端日志，不回给客户端。
+				log.Printf("权限检查失败: %v\n", err)
+				httpx.SendResponse(w, http.StatusInternalServerError, "权限检查失败", nil)
 				return
 			}
 			if !hasPermission {

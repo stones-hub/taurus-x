@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"time"
 
@@ -14,6 +15,14 @@ import (
 	"{{ .Module }}/app/model"
 	"{{ .Module }}/app/repo"
 )
+
+// ErrLoginBackend 登录校验时数据库等基础设施出错。详细原因只进服务端日志，不回给客户端。
+var ErrLoginBackend = errors.New("登录服务暂时不可用")
+
+// loginRejection 凭证或账号状态导致的登录拒绝，文本可以直接展示给用户。
+type loginRejection string
+
+func (e loginRejection) Error() string { return string(e) }
 
 // AuthService 账号认证与个人信息服务
 type AuthService struct {
@@ -62,7 +71,7 @@ func (s *AuthService) PasswordLogin(ctx context.Context, account, password strin
 			return err
 		}
 		if u == nil {
-			return errors.New("用户名或密码错误")
+			return loginRejection("用户名或密码错误")
 		}
 
 		login, err := tx.UserLogin().FindByUserIDAndLoginTypeAnyStatus(ctx, u.UserID, string(constants.LoginTypeUsername))
@@ -70,21 +79,21 @@ func (s *AuthService) PasswordLogin(ctx context.Context, account, password strin
 			return err
 		}
 		if login == nil {
-			return errors.New("请用其他方式登录后设置密码")
+			return loginRejection("请用其他方式登录后设置密码")
 		}
 
 		if login.Status != constants.LoginMethodStatusEnabled || u.Status != constants.UserStatusEnabled {
-			return errors.New("账号状态非法")
+			return loginRejection("账号状态非法")
 		}
 
 		if !helper.VerifyPassword(password, login.LoginCredential, login.Salt) {
-			return errors.New("用户名或密码错误")
+			return loginRejection("用户名或密码错误")
 		}
 
 		// auth_version 列的默认值是 1，读到 <=0 说明数据被改坏或列缺失：
 		// 这种情况下签出来的会话无法被吊销，宁可拒绝登录（fail closed）。
 		if u.AuthVersion <= 0 {
-			return errors.New("账号认证状态异常，请联系管理员")
+			return loginRejection("账号认证状态异常，请联系管理员")
 		}
 
 		if helper.NeedsRehash(login.LoginCredential) {
@@ -95,7 +104,11 @@ func (s *AuthService) PasswordLogin(ctx context.Context, account, password strin
 		return nil
 	})
 	if err != nil {
-		return nil, 0, err
+		var rejected loginRejection
+		if errors.As(err, &rejected) {
+			return nil, 0, err
+		}
+		return nil, 0, fmt.Errorf("%w: %v", ErrLoginBackend, err)
 	}
 
 	// 散列升级放在事务**提交之后**、单独一条语句里，有两个原因：
@@ -109,6 +122,11 @@ func (s *AuthService) PasswordLogin(ctx context.Context, account, password strin
 	}
 
 	return user, authVersion, nil
+}
+
+// RecordLastLogin 登录成功后记录最后登录时间与 IP（取法与登录日志一致，由调用方传入）。
+func (s *AuthService) RecordLastLogin(ctx context.Context, userID uint64, ip string) error {
+	return s.userRepo.UpdateLastLogin(ctx, userID, time.Now(), clampLen(ip, maxLoginIPLen))
 }
 
 // upgradeLegacyCredential 把旧 SHA-256 散列原地换成 bcrypt，salt 置空。

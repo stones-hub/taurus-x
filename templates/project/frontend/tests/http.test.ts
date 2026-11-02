@@ -44,13 +44,14 @@ function httpHarness(code: number, transportFailure = false, cookie = 'x-csrf-to
       },
     }),
   }
+  const location = { pathname: '/home', href: '' }
   const http = evaluateModule('../src/api/http.ts', {
     axios: mockAxios,
     'element-plus': { ElMessage: (message: unknown) => { messages.push(message) } },
     '../store/session': session,
-  }, { localStorage, document: { cookie }, window: { location: { pathname: '/home', href: '' } } })
+  }, { localStorage, document: { cookie }, window: { location } })
   const auth = evaluateModule('../src/api/auth.ts', { './http': http })
-  return { http, auth, calls, messages, resets: () => resets, token: () => storedToken }
+  return { http, auth, calls, messages, location, resets: () => resets, token: () => storedToken }
 }
 
 for (const transportFailure of [false, true]) {
@@ -62,6 +63,9 @@ for (const transportFailure of [false, true]) {
     assert.equal(harness.calls.length, 1)
     assert.equal(harness.calls[0].url, '/admin/user/current-info')
     assert.equal(harness.messages.length, 1)
+    assert.equal((harness.messages[0] as { message: string }).message, '登录已过期，请重新登录')
+    assert.equal((harness.messages[0] as { grouping: boolean }).grouping, true)
+    assert.equal(harness.location.href, '/login')
   })
 
   test(`logout rejection preserves local state and sends POST (transport=${transportFailure})`, async () => {
@@ -73,6 +77,29 @@ for (const transportFailure of [false, true]) {
     assert.equal(harness.calls[0].url, '/auth/logout')
     assert.equal(harness.calls[0].method, 'post')
     assert.equal(harness.messages.length, 1)
+    assert.equal(harness.location.href, '')
+  })
+
+  test(`login 401 shows the server message without clearing state or redirect (transport=${transportFailure})`, async () => {
+    const harness = httpHarness(401, transportFailure)
+    await assert.rejects(harness.auth.apiLogin({ username: 'policy-user', password: 'wrong-password' }))
+    assert.equal(harness.calls.length, 1)
+    assert.equal(harness.calls[0].url, '/auth/login')
+    assert.equal(harness.resets(), 0)
+    assert.equal(harness.token(), 'local-session-marker')
+    assert.equal(harness.messages.length, 1)
+    assert.equal((harness.messages[0] as { message: string }).message, 'simulated response')
+    assert.equal(harness.location.href, '')
+  })
+
+  test(`non-401 errors show the server message without redirect (transport=${transportFailure})`, async () => {
+    const harness = httpHarness(500, transportFailure)
+    await assert.rejects(harness.http.request({ url: '/admin/user/list', method: 'get' }))
+    assert.equal(harness.resets(), 0)
+    assert.equal(harness.token(), 'local-session-marker')
+    assert.equal(harness.messages.length, 1)
+    assert.equal((harness.messages[0] as { message: string }).message, 'simulated response')
+    assert.equal(harness.location.href, '')
   })
 }
 

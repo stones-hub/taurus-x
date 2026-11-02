@@ -11,7 +11,7 @@
 - HTTPS在反向代理终止时，显式设置`AUTH_TRUSTED_ORIGINS=https://实际后台域名`；多个精确Origin用逗号分隔，不使用通配符或不受控域名。Compose已透传该配置。
 - HTTPS设置`JWT_COOKIE_SECURE=true`，Compose同样透传；本地HTTP默认false。JWT Cookie始终HttpOnly、Path=/、SameSite=Lax，无Domain，删除沿用同一策略并设置Max-Age=-1。
 - 登录与刷新各只写一个JWT Cookie；响应expires_at、JWT Cookie及CSRF Cookie有效期都来自已签名JWT的exp。刷新同时续期CSRF Cookie，避免JWT仍有效但写请求已无法通过CSRF。
-- 前端主动退出先调用后端，成功后才清本地状态和跳转。失败会明确提示，不冒充服务端吊销成功。HTTP401和业务401只清本地认证及权限，不递归调用退出。
+- 前端主动退出先调用后端，成功后才清本地状态和跳转。失败会明确提示，不冒充服务端吊销成功。HTTP401和业务401（`/auth/login`、`/auth/logout`除外）清本地认证及权限，固定提示一次「登录已过期，请重新登录」（并发401合并为一条），不在`/login`时跳转到`/login`，不递归调用退出。登录接口的401是凭证被拒，按普通错误显示服务端提示，不清登录态、不跳转。改密成功后后端吊销该用户全部会话，个人中心随即清本地登录态并跳转登录页。
 - 前端刷新与主动退出串行执行，刷新结果保存后才发送退出；退出成功后不再刷新。其他标签页和外部客户端不受这把前端锁约束。
 
 ## Redis轮换边界

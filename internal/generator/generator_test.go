@@ -2,6 +2,7 @@ package generator
 
 import (
 	"bytes"
+	"go/format"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -100,12 +101,190 @@ func TestGenerate_Combinations(t *testing.T) {
 			assertComposeNoFixedPlatform(t, outDir)
 			assertBaseline(t, outDir, tc.project)
 			assertCommercialHardening(t, outDir)
+			assertToolchainAndDeps(t, outDir, result.Components)
+			assertGoFilesFormatted(t, outDir)
+			assertPasswordChangeRelogin(t, outDir)
 
 			backend := filepath.Join(outDir, "backend")
 			runGo(t, backend, "build", "./...")
 			runGo(t, backend, "vet", "./...")
 			runGo(t, backend, "test", "./...")
 		})
+	}
+}
+
+// golangImageTag 匹配任意 golang 镜像引用 golang:<标签>，包括 alpine、latest 这类不含版本号的标签，
+// 以及 ${GO_VERSION} 这类变量拼接的标签。
+var golangImageTag = regexp.MustCompile(`golang:[A-Za-z0-9_.${}-]+`)
+
+// assertToolchainAndDeps 生成项目的 go 指令必须是生成器常量 goVersion、所选组件为固定版本、
+// golang-jwt/jwt/v5 为常量 jwtVersion，不能再依赖已停维护的 dgrijalva/jwt-go；
+// 生成项目里出现的每一个 golang 镜像标签都必须是 golang:<goVersion>-alpine。
+func assertToolchainAndDeps(t *testing.T, outDir string, selected []string) {
+	t.Helper()
+	goMod := readFile(t, filepath.Join(outDir, "backend", "go.mod"))
+	if strings.Count(goVersion, ".") != 2 {
+		t.Fatalf("goVersion 必须写到补丁版本（如 1.27.3），实际 %q", goVersion)
+	}
+	if !strings.Contains(goMod, "\ngo "+goVersion+"\n") {
+		t.Errorf("生成项目 go.mod 的 go 指令应为 %s", goVersion)
+	}
+	for _, c := range components.All {
+		if contains(selected, c.Name) && !strings.Contains(goMod, c.Package+" "+c.Version+"\n") {
+			t.Errorf("生成项目 go.mod 应 require %s %s", c.Package, c.Version)
+		}
+	}
+	if !strings.Contains(goMod, "github.com/golang-jwt/jwt/v5 "+jwtVersion+"\n") {
+		t.Errorf("生成项目 go.mod 应 require github.com/golang-jwt/jwt/v5 %s", jwtVersion)
+	}
+	if strings.Contains(goMod, "dgrijalva") {
+		t.Error("生成项目 go.mod 不应再出现 dgrijalva/jwt-go")
+	}
+	image := "golang:" + goVersion + "-alpine"
+	dockerfile := readFile(t, filepath.Join(outDir, "Dockerfile"))
+	if !strings.Contains(dockerfile, "FROM --platform=$BUILDPLATFORM "+image+" AS backend-builder") {
+		t.Errorf("Dockerfile 后端构建镜像应为 %s（与 go.mod 的 go 指令一致）", image)
+	}
+	deployDoc := readFile(t, filepath.Join(outDir, "docs", "部署文档.md"))
+	if strings.Count(deployDoc, image) != 3 {
+		t.Errorf("部署文档预拉的 golang 镜像应与 Dockerfile 一致：%s", image)
+	}
+	// 扫描生成项目的全部文件：golang:1.27-alpine、golang:alpine、golang:latest 这类标签会随上游漂移。
+	err := filepath.WalkDir(outDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if d.Name() == "node_modules" || d.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(outDir, path)
+		for _, tag := range golangImageTag.FindAllString(string(data), -1) {
+			if tag != image {
+				t.Errorf("%s 出现了与 %s 不一致的 golang 镜像标签 %s", rel, image, tag)
+			}
+		}
+		for _, ref := range untaggedGolangImages(string(data)) {
+			t.Errorf("%s 出现了不带标签的 golang 镜像引用 %q（隐含 latest），应写成 %s", rel, ref, image)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("扫描生成项目失败: %v", err)
+	}
+}
+
+// imageRefLine 会出现镜像引用的行：Dockerfile 的 FROM、compose 的 image:、docker pull/run/tag/create。
+var imageRefLine = regexp.MustCompile(`^\s*(FROM\s|image:|-?\s*image:|.*\bdocker\s+(pull|run|tag|create)\s)`)
+
+// untaggedGolangImages 找出镜像引用行里不带标签的 golang 镜像（golang、library/golang、
+// <镜像源>/library/golang、golang@sha256:...），例如 `FROM golang AS x`。
+// 只看镜像引用行，正文里提到 golang 这个词（如「golang、node 等官方镜像」）不算。
+func untaggedGolangImages(src string) []string {
+	var found []string
+	for _, line := range strings.Split(src, "\n") {
+		if !imageRefLine.MatchString(line) {
+			continue
+		}
+		for _, field := range strings.Fields(strings.ReplaceAll(line, "image:", "image: ")) {
+			field = strings.Trim(field, "\"'`")
+			name := field[strings.LastIndex(field, "/")+1:]
+			if name == "golang" || strings.HasPrefix(name, "golang@") {
+				found = append(found, field)
+			}
+		}
+	}
+	return found
+}
+
+// TestUntaggedGolangImages 镜像扫描的自测：不带标签的 golang 镜像引用都要被找出来，
+// 带标签的引用、正文里提到的 golang 一词、golang.org 之类的路径都不算。
+func TestUntaggedGolangImages(t *testing.T) {
+	flagged := map[string]string{
+		"FROM golang":                                "golang",
+		"FROM golang AS builder":                     "golang",
+		"FROM --platform=$BUILDPLATFORM golang AS x": "golang",
+		"  image: golang":                            "golang",
+		"    image: \"library/golang\"":              "library/golang",
+		"docker pull mirror.example/library/golang":  "mirror.example/library/golang",
+		"\tdocker run --rm golang go version":        "golang",
+		"FROM golang@sha256:0123456789abcdef AS b":   "golang@sha256:0123456789abcdef",
+	}
+	for line, want := range flagged {
+		got := untaggedGolangImages(line)
+		if len(got) != 1 || got[0] != want {
+			t.Errorf("%q 应找出 %q，实际 %v", line, want, got)
+		}
+	}
+	for _, line := range []string{
+		"FROM golang:1.27.3-alpine AS backend-builder",
+		"docker pull mirror.example/library/golang:1.27.3-alpine",
+		"若官方基础镜像（`golang`、`node`、`alpine` 等）拉取超时",
+		"go env -w GOPROXY=https://proxy.golang.org,direct",
+		"# FROM golang AS commented",
+	} {
+		if got := untaggedGolangImages(line); len(got) != 0 {
+			t.Errorf("%q 不应被当成不带标签的镜像引用，实际 %v", line, got)
+		}
+	}
+}
+
+// assertGoFilesFormatted 生成项目的所有 .go 文件都必须已按 gofmt 格式化（等价于 gofmt -l 无输出）。
+func assertGoFilesFormatted(t *testing.T, outDir string) {
+	t.Helper()
+	err := filepath.WalkDir(outDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if d.Name() == "node_modules" || d.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		src, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		formatted, err := format.Source(src)
+		rel, _ := filepath.Rel(outDir, path)
+		if err != nil {
+			t.Errorf("%s 无法被 gofmt 解析: %v", rel, err)
+		} else if !bytes.Equal(src, formatted) {
+			t.Errorf("%s 未按 gofmt 格式化", rel)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("扫描生成项目失败: %v", err)
+	}
+}
+
+// assertPasswordChangeRelogin 改密成功后后端已吊销该用户全部会话，个人中心必须立即
+// 清本地登录态并回登录页，而不是停在原页面等下一次请求报「会话已失效」。
+func assertPasswordChangeRelogin(t *testing.T, outDir string) {
+	t.Helper()
+	profile := readFile(t, filepath.Join(outDir, "frontend", "src", "views", "profile", "index.vue"))
+	body := funcBody(profile, "async function onChangePassword(")
+	if body == "" {
+		t.Fatal("profile/index.vue 找不到 onChangePassword")
+	}
+	for _, must := range []string{"await apiChangePassword(", "请重新登录", "clearLocalAuth()", "router.replace('/login')"} {
+		if !strings.Contains(body, must) {
+			t.Errorf("改密成功后必须提示重新登录、清本地登录态并跳转登录页，缺少 %q", must)
+		}
+	}
+	if strings.Index(body, "clearLocalAuth()") < strings.Index(body, "await apiChangePassword(") {
+		t.Error("只能在改密接口成功之后清理本地登录态")
 	}
 }
 

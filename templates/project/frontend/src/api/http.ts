@@ -50,6 +50,30 @@ function showError(message: string) {
   ElMessage({ message, type: 'error', grouping: true })
 }
 
+/**
+ * 返回 401 时不代表会话失效的接口：登录的 401 是凭证被拒（用户名或密码错误、账号状态非法等），
+ * 登出的 401 由调用方自己处理。这两个接口按普通错误显示服务端提示，不清登录态、不跳转。
+ */
+const SESSION_EXEMPT_URLS = new Set(['/auth/login', '/auth/logout'])
+
+/** 是否按「会话失效」处理：401 且不是登录 / 登出接口。 */
+function isSessionExpired(code: number | undefined, url: string | undefined): boolean {
+  return code === 401 && !SESSION_EXEMPT_URLS.has(url ?? '')
+}
+
+/**
+ * 会话失效（HTTP 401 或业务 code 401，登录 / 登出接口除外）后的统一收尾：提示一次并跳转登录页。
+ * 本地登录态由调用方先调用 clearLocalAuth 清掉。提示文本固定并开启 grouping，
+ * 并发请求一起撞上 401 时只合并成一条提示，也不会再和 showError 叠一条。
+ */
+function redirectToLogin() {
+  localStorage.removeItem('token')
+  ElMessage({ message: '登录已过期，请重新登录', type: 'error', grouping: true })
+  if (window.location.pathname !== '/login') {
+    window.location.href = '/login'
+  }
+}
+
 /** 从 cookie 读取指定 key（CSRF token 存于 cookie，HttpOnly=false）。 */
 function getCookie(name: string): string {
   const m = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'))
@@ -99,13 +123,9 @@ instance.interceptors.response.use(
     // 与业务错误走同一套取值优先级：真实非 2xx（429 等）的中文提示在 data 里，
     // 只读 data.message 的话用户看到的永远是兜底的「请求失败」。
     const msg = extractError(error.response?.data as ApiResponse | undefined)
-    if (status === 401 && error.config?.url !== '/auth/logout') {
+    if (isSessionExpired(status, error.config?.url)) {
       clearLocalAuth()
-      localStorage.removeItem('token')
-      ElMessage({ message: '登录已过期，请重新登录', type: 'error', grouping: true })
-      if (window.location.pathname !== '/login') {
-        window.location.href = '/login'
-      }
+      redirectToLogin()
     } else {
       showError(msg)
     }
@@ -119,11 +139,12 @@ export async function request<T>(config: AxiosRequestConfig): Promise<T> {
   const body = res.data
   if (body.code < 200 || body.code >= 300) {
     const msg = extractError(body)
-    if (body.code === 401 && config.url !== '/auth/logout') {
+    if (isSessionExpired(body.code, config.url)) {
       clearLocalAuth()
-      localStorage.removeItem('token')
+      redirectToLogin()
+    } else {
+      showError(msg)
     }
-    showError(msg)
     // 抛 ApiError 而不是裸 Error：调用方的 catch 行为不变（message 照旧），
     // 但 frontError.ts 能据此认出「这是接口失败，不是前端异常」，不再上报。
     throw new ApiError(msg, body.code)
