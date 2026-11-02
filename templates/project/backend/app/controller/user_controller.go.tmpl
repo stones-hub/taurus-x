@@ -29,7 +29,7 @@ func (c *UserController) GetCurrentUserInfo(w http.ResponseWriter, r *http.Reque
 	}
 	info, err := c.AuthService.GetCurrentUserInfo(r.Context(), userID)
 	if err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, info)
@@ -47,7 +47,7 @@ func (c *UserController) UpdateProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := c.AuthService.UpdateProfile(r.Context(), userID, &req); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -65,7 +65,7 @@ func (c *UserController) ChangePassword(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err := c.AuthService.ChangePassword(r.Context(), userID, &req); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -83,7 +83,7 @@ func (c *UserController) BindMobile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := c.AuthService.BindMobile(r.Context(), userID, &req); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -101,7 +101,7 @@ func (c *UserController) UnbindMobile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := c.AuthService.UnbindMobile(r.Context(), userID, &req); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -114,7 +114,7 @@ func (c *UserController) SendCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := c.AuthService.SendSMSCode(r.Context(), req.LoginValue); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -129,7 +129,7 @@ func (c *UserController) GetUserList(w http.ResponseWriter, r *http.Request) {
 	req.Normalize()
 	resp, err := c.UserService.GetUserList(r.Context(), req.PageNo, req.PageSize, req.UsernameMobileEmail, req.Status)
 	if err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, resp)
@@ -144,7 +144,7 @@ func (c *UserController) GetUserOptions(w http.ResponseWriter, r *http.Request) 
 	req.Normalize()
 	resp, err := c.UserService.GetUserOptions(r.Context(), req.PageNo, req.PageSize, req.UsernameMobileEmail, req.Status)
 	if err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, resp)
@@ -162,12 +162,12 @@ func (c *UserController) GetUserInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	user, err := c.UserService.GetUserInfo(r.Context(), req.UserID)
 	if err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	permissions, err := c.RoleService.GetUserRolesAndPermissions(r.Context(), req.UserID)
 	if err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]interface{}{

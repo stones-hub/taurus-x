@@ -11,8 +11,47 @@
 - HTTPS在反向代理终止时，显式设置`AUTH_TRUSTED_ORIGINS=https://实际后台域名`；多个精确Origin用逗号分隔，不使用通配符或不受控域名。Compose已透传该配置。
 - HTTPS设置`JWT_COOKIE_SECURE=true`，Compose同样透传；本地HTTP默认false。JWT Cookie始终HttpOnly、Path=/、SameSite=Lax，无Domain，删除沿用同一策略并设置Max-Age=-1。
 - 登录与刷新各只写一个JWT Cookie；响应expires_at、JWT Cookie及CSRF Cookie有效期都来自已签名JWT的exp。刷新同时续期CSRF Cookie，避免JWT仍有效但写请求已无法通过CSRF。
-- 前端主动退出先调用后端，成功后才清本地状态和跳转。失败会明确提示，不冒充服务端吊销成功。HTTP401和业务401（`/auth/login`、`/auth/logout`除外）清本地认证及权限，固定提示一次「登录已过期，请重新登录」（并发401合并为一条），不在`/login`时跳转到`/login`，不递归调用退出。登录接口的401是凭证被拒，按普通错误显示服务端提示，不清登录态、不跳转。改密成功后后端吊销该用户全部会话，个人中心随即清本地登录态并跳转登录页。
+- 前端主动退出先调用后端，成功后才清本地状态和跳转。失败会明确提示，不冒充服务端吊销成功。HTTP401和业务401（`/auth/login`、`/auth/logout`除外）清本地认证及权限，固定提示一次「登录已过期，请重新登录」（并发401合并为一条），不在`/login`时整页跳转到`/login?reason=expired`，不递归调用退出。登录接口的401是凭证被拒，按普通错误显示服务端提示，不清登录态、不跳转。改密成功后后端吊销该用户全部会话，个人中心随即清本地登录态并跳转`/login?reason=password_changed`。
 - 前端刷新与主动退出串行执行，刷新结果保存后才发送退出；退出成功后不再刷新。其他标签页和外部客户端不受这把前端锁约束。
+
+## 浏览器端只用 HttpOnly Cookie（v0.4.0 起）
+
+- 登录与刷新的响应体只有 `user`（刷新为 null）和 `expires_at`，**不含令牌**；令牌也不写进任何自定义响应头，只通过 `Set-Cookie: jwt_token=...; HttpOnly` 下发。
+- 后端只从 `jwt_token` Cookie 读取令牌（JWT 中间件、刷新、退出共用 `middleware.GetJWTToken`），**不再接受** `Authorization: Bearer` 和 `jwt_token` 请求头：只带这些头访问 `/admin/**` 或刷新接口返回 401，只带这些头退出按「没有可认证令牌」处理（只清 Cookie，不吊销任何会话）。
+- 前端不再把令牌存进 localStorage，请求不附加 `Authorization`；启动时删除旧版本残留在 localStorage 里的 `token`。路由守卫用非 HttpOnly 的 CSRF Cookie 是否存在作为登录提示（它与 JWT 同时下发、同样有效期，刷新同时续期，退出同时清除）；改密、退出、会话失效时前端删除这个 Cookie。提示只影响页面跳转，是否登录以服务端 401 为准。
+- 取舍：HttpOnly 降低的是前端 JS 直接读取令牌的风险，**不能**阻止 XSS 借用户浏览器发起请求；CSRF 与来源校验策略保持不变。不收 Bearer 是只保留一种令牌通道的明确决定，需要给非浏览器客户端开放 Bearer 时应另行设计。
+- 会话失效整页跳转到 `/login?reason=expired`，改密后跳转到 `/login?reason=password_changed`；登录页只认这两个固定值并显示对应提示，随后用 `history.replaceState` 清掉参数。
+
+### 用 curl 调用接口（Cookie 方式）
+
+```bash
+JAR=$(mktemp)                     # cookie jar，用完删除
+BASE=http://127.0.0.1:9080
+# 登录：凭证写进 cookie jar（jwt_token 为 HttpOnly，x-csrf-token 供写请求回传）；Origin 必须是可信来源
+curl -s -c "$JAR" -H "Origin: $BASE" -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"<密码>"}' "$BASE/auth/login"
+CSRF=$(awk '$6=="x-csrf-token"{print $7}' "$JAR")
+# 读接口：只带 Cookie
+curl -s -b "$JAR" "$BASE/admin/user/current-info"
+# 写接口：带 Cookie + 同值的 x-csrf-token 头
+curl -s -b "$JAR" -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' \
+  -d '{"page_no":1,"page_size":15}' "$BASE/admin/user/list"
+# 刷新 / 退出：POST + 可信 Origin + CSRF；刷新后用 -c 写回新的 Cookie
+curl -s -b "$JAR" -c "$JAR" -H "Origin: $BASE" -H "x-csrf-token: $CSRF" -X POST "$BASE/user/refresh-token"
+curl -s -b "$JAR" -c "$JAR" -H "Origin: $BASE" -H "x-csrf-token: $CSRF" -X POST "$BASE/auth/logout"
+rm -f "$JAR"
+```
+
+> cookie jar 文件里有有效的会话令牌，按凭证对待：不要提交、不要贴进问题报告，用完删除。
+
+## 接口错误提示
+
+service 返回的错误统一由 `controller.FailByError` 输出：越权回 403；`helper.NewBizError` 构造的业务校验错误（参数非法、名称重复、状态冲突等）回原文案；其余错误（数据库、Redis、文件系统等）只回「服务内部错误，请稍后重试」，原文记服务端日志。判定是白名单，未标记的错误默认不回显。
+
+## 访问日志与操作日志
+
+- 操作日志的成败按响应体业务 code 判断（只解析前 4KB，取不到时回退 HTTP 状态），HTTP 200 + code≠2xx 记「失败」。
+- 两类日志进入有界队列，由固定数量 worker 写库；队列满时丢弃并计数，丢弃与写库失败每分钟最多告警一条汇总；优雅退出分 HTTP 关闭 → 日志排空 → 资源关闭三段、各自计时（默认 5 / 5 / 5 秒，总上限加 0.5 秒），排空超时取消剩余写入。HTTP 超时只代表不再等待，仍在执行的请求不会被终止，其后的日志被丢弃计数；忽略取消的写入可能在资源关闭后才结束。配置项 `http.request_log.queue_capacity` / `workers` / `drain_timeout_seconds`（默认 1000 / 2 / 5 秒，`.env` 中为 `REQUEST_LOG_QUEUE_CAPACITY` / `REQUEST_LOG_WORKERS` / `REQUEST_LOG_DRAIN_TIMEOUT_SECONDS`）。退出超时或进程被强杀时，队列里未写完的日志仍会丢失。
 
 ## Redis轮换边界
 
@@ -41,4 +80,6 @@
 
 Pi须对当前代码重新进行全新只读复审，并用隔离MySQL8.0/Redis7验证失败回滚、同部门并发替换、双刷新、退出先完成及故障恢复不复活。隔离HTTPS实测Secure Cookie属性、唯一性和清理，浏览器检查登录、退出成功/失败提示、401不递归、改密及基础页面。历史版本运行验收不自动适用于本候选。
 
-一期不覆盖：可靠异步日志队列及退出drain、业务审计失败记成功、IP白名单接线、Consul/Milvus/OTEL完整生产配置和运行、短信供应商、权限升级与角色删除等其他并发窗口、许可证/SBOM完整交付、Go依赖漏洞审计、备份恢复及容量验收。不得将本期代码修复等同于无条件商用。
+v0.4.0 已补：日志有界队列及退出drain、操作日志按业务code判定成败；IP白名单不在应用内实现（HostMiddleware已删除，改由Nginx/防火墙负责，见部署文档7.5）。
+
+一期仍不覆盖：Consul/Milvus/OTEL完整生产配置和运行、短信供应商、权限升级与角色删除等其他并发窗口、许可证/SBOM完整交付、Go依赖漏洞审计、备份恢复及容量验收。不得将本期代码修复等同于无条件商用。

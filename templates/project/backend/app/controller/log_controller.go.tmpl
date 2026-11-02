@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"log"
 	"net/http"
 
 	"github.com/google/wire"
@@ -27,7 +28,7 @@ func (c *LogController) GetAccessLogList(w http.ResponseWriter, r *http.Request)
 	req.Normalize()
 	resp, err := c.LogService.GetAccessLogList(r.Context(), req)
 	if err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, resp)
@@ -42,7 +43,7 @@ func (c *LogController) GetOperationLogList(w http.ResponseWriter, r *http.Reque
 	req.Normalize()
 	resp, err := c.LogService.GetOperationLogList(r.Context(), req)
 	if err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, resp)
@@ -57,7 +58,7 @@ func (c *LogController) GetFrontErrorLogList(w http.ResponseWriter, r *http.Requ
 	req.Normalize()
 	resp, err := c.LogService.GetFrontErrorLogList(r.Context(), req)
 	if err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, resp)
@@ -76,7 +77,8 @@ func (c *LogController) ReportFrontError(w http.ResponseWriter, r *http.Request)
 	}
 
 	if err := c.LogService.ReportFrontError(r.Context(), &req, userID, tmid.ClientIP(r), r.UserAgent()); err != nil {
-		// 错误上报兜底失败：不打日志会静默吞掉，这里降级记录但不影响对前端的 200 响应
+		// 错误上报兜底失败：原因只记服务端日志（不回显给前端），响应保持原来的固定降级提示
+		log.Printf("前端错误上报入库失败: %v\n", err)
 		Fail(w, http.StatusInternalServerError, "前端错误上报失败")
 		return
 	}

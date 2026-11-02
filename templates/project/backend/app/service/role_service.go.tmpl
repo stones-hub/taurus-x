@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
 	"sort"
 
 	"github.com/google/wire"
@@ -279,14 +278,14 @@ func (s *AdminRoleService) AddRole(ctx context.Context, req *dto.AddRoleRequest)
 		return err
 	}
 	if existing != nil {
-		return errors.New("角色编码已存在")
+		return helper.NewBizError("角色编码已存在")
 	}
 	existing, err = s.roleRepo.FindByRoleName(ctx, req.RoleName)
 	if err != nil {
 		return err
 	}
 	if existing != nil {
-		return errors.New("角色名称已存在")
+		return helper.NewBizError("角色名称已存在")
 	}
 
 	// 事务前校验权限 ID（只读，避免事务内校验失败才回滚）
@@ -296,7 +295,7 @@ func (s *AdminRoleService) AddRole(ctx context.Context, req *dto.AddRoleRequest)
 			return err
 		}
 		if perm == nil {
-			return errors.New("权限ID不存在")
+			return helper.NewBizError("权限ID不存在")
 		}
 	}
 
@@ -341,7 +340,7 @@ func (s *AdminRoleService) UpdateRole(ctx context.Context, req *dto.UpdateRoleRe
 			return err
 		}
 		if perm == nil {
-			return errors.New("权限ID不存在")
+			return helper.NewBizError("权限ID不存在")
 		}
 	}
 
@@ -384,7 +383,7 @@ func (s *AdminRoleService) DeleteRole(ctx context.Context, roleID uint64) error 
 		return err
 	}
 	if len(userRoles) > 0 {
-		return errors.New("该角色已绑定用户，无法删除")
+		return helper.NewBizError("该角色已绑定用户，无法删除")
 	}
 
 	// 删权限关联 + 删角色，任一失败整体回滚
@@ -405,7 +404,7 @@ func (s *AdminRoleService) DeleteRole(ctx context.Context, roleID uint64) error 
 // UpdateRoleStatus 更新角色状态（角色必须存在，系统角色不能改状态）
 func (s *AdminRoleService) UpdateRoleStatus(ctx context.Context, roleID uint64, status int) error {
 	if status != int(constants.UserStatusEnabled) && status != int(constants.UserStatusDisabled) {
-		return errors.New("状态值必须为0(禁用)或1(启用)")
+		return helper.NewBizError("状态值必须为0(禁用)或1(启用)")
 	}
 	role, err := s.roleRepo.FindByRoleIDAnyStatus(ctx, roleID)
 	if err != nil {
@@ -563,7 +562,7 @@ func txRoleFactsByIDs(ctx context.Context, tx *repo.Tx, roleIDs []uint64) ([]Rol
 			return nil, err
 		}
 		if role == nil {
-			return nil, errors.New("角色ID不存在")
+			return nil, helper.NewBizError("角色ID不存在")
 		}
 		facts = append(facts, RoleFactOf(role))
 	}
@@ -596,7 +595,7 @@ func (s *AdminRoleService) GetEditRoleInfo(ctx context.Context, roleID uint64) (
 		return nil, err
 	}
 	if role == nil {
-		return nil, errors.New("角色不存在")
+		return nil, helper.NewBizError("角色不存在")
 	}
 
 	// 全量启用权限

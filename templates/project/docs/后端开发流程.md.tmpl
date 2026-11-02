@@ -177,7 +177,7 @@ func (c *NoticeController) GetNoticeList(w http.ResponseWriter, r *http.Request)
     req.Normalize()
     resp, err := c.NoticeService.GetNoticeList(r.Context(), req)
     if err != nil {
-        Fail(w, http.StatusInternalServerError, err.Error())
+        FailByError(w, err) // 业务错误回原文，数据库等内部错误只记日志、回通用提示
         return
     }
     OK(w, resp)
@@ -188,6 +188,10 @@ func (c *NoticeController) GetNoticeList(w http.ResponseWriter, r *http.Request)
 - controller **只做参数解析 + 校验 + 委托**，业务逻辑全在 service。
 - 统一走 `app/controller/common.go` 的三个深 helper（`BindJSON` / `OK` / `Fail`），**禁止裸写 `json.NewDecoder` + `httpx.SendResponse` 样板**。
 - 业务错误用 `http.StatusInternalServerError` 包裹 message；参数错误用 `StatusBadRequest`。
+- **service 返回的错误一律交给 `FailByError(w, err)`，不要 `Fail(w, 500, err.Error())`**：要给用户看的业务校验错误
+  （参数非法、名称重复、状态冲突）在 service 里用 `helper.NewBizError("...")` 构造；其余错误（数据库、Redis、文件系统……）
+  `FailByError` 只回「服务内部错误，请稍后重试」，原文用 `log.Printf` 记服务端日志。判定是白名单：
+  没用 `NewBizError` 的错误默认不回显，避免把 SQL、库表名、内网地址带给客户端。越权（`service.ErrForbidden`）回 403。
 - 文件上传用 `httpx.ParseMultipartData(r)` 或 `helper.ParseMultipartOrJSON`。
 
 ✅ 验收：只做参数解析 + 校验 + 委托；统一响应；无业务逻辑。
@@ -419,6 +423,22 @@ wire:
 	# @wire ./internal/taurus/wire.go # ❌ 单文件，看不到同包函数
 ```
 
-### 9.4 日志领域公共代码收敛
+### 9.4 访问日志 / 操作日志走有界队列
+
+两个日志中间件不再每个请求起一个 `go func` 写库，而是把日志交给 `app/middleware/request_log_queue.go` 的有界队列，
+由固定数量的 worker 写库：队列满时直接丢弃并计数（请求不等日志），丢弃与写库失败每分钟最多告警一条汇总；
+进程优雅退出分三个阶段、各自计时（`app/helper/lifecycle`，由 `app/bootstrap.go` 的 `gracefulShutdown` 编排）：
+HTTP 关闭（`http.shutdown_timeout`，超时后强制断开连接，但仍在执行的 handler 不会被终止）→ 日志排空
+（`http.request_log.drain_timeout_seconds`，超时取消在写的写入、剩余日志不再写入）→ 资源关闭（cleanups，5 秒）。
+HTTP 关得慢不会占用后两个阶段的预算；总退出上限 = 三者之和 + 0.5 秒（默认 15.5 秒），守护进程的停止等待必须更长。
+日志队列关闭后，还在跑的 handler 再写日志会被丢弃计数。写入回调若不理会 ctx，worker 可能在资源关闭后才结束（会记录告警），
+这是 Go 无法强杀协程带来的限制。
+容量、worker 数、等待时间见 `config/autoload/http/http.yaml`
+的 `http.request_log`（默认 1000 / 2 / 5 秒，对应 `.env` 的 `REQUEST_LOG_*`）。新增类似的异步写入也复用这个队列，不要再起无上限的协程。
+
+操作日志的「结果」按响应体里的业务 code 判定（httpx 的错误响应多数是 HTTP 200 + `body.code`）：只解析响应体前 4KB，
+取不到 code 时回退到 HTTP 状态；HTTP 状态 ≥ 400 或业务 code 不在 2xx 都记「失败」。
+
+### 9.5 日志领域公共代码收敛
 
 访问日志/操作日志中间件共享的「响应体捕获（statusRecorder）、请求体读取（readBody）、字符串截断（truncate）、大小上限（maxBodyLogSize）、跳过判断（shouldSkipLogging）」应收敛到 `app/middleware/log_common.go`，不要散落在多个中间件文件里重复定义。

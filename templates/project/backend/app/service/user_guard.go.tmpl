@@ -48,16 +48,16 @@ package service
 
 import (
 	"context"
-	"errors"
 	"sort"
 
 	"{{ .Module }}/app/constants"
+	"{{ .Module }}/app/helper"
 	"{{ .Module }}/app/model"
 	"{{ .Module }}/app/repo"
 )
 
 // errUserNotFound 目标账号的用户行不存在（含被删除）。
-var errUserNotFound = errors.New("用户不存在")
+var errUserNotFound = helper.NewBizError("用户不存在")
 
 // HoldsSuperAdminRole 判断一组角色事实里是否含超管角色。
 //

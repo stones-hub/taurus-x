@@ -1,16 +1,25 @@
 <script setup lang="ts">
-import { reactive, ref } from 'vue'
+import { onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { User, Lock } from '@element-plus/icons-vue'
 import { useAuthStore } from '../../store/auth'
 import { appInitial, appSubtitle, appTitle } from '../../utils/brand'
+import { takeLoginReason } from '../../utils/login-reason'
 
 const router = useRouter()
 const auth = useAuthStore()
 
 const form = reactive({ username: '', password: '' })
 const loading = ref(false)
+
+// 被登出后跳到这里时显示原因（只认固定值），并把 reason 从地址栏清掉
+onMounted(() => {
+  const reason = takeLoginReason(window.location, window.history)
+  if (reason) {
+    ElMessage({ message: reason, type: 'warning', grouping: true })
+  }
+})
 
 async function onSubmit() {
   if (!form.username || !form.password) {

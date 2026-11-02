@@ -27,7 +27,7 @@ func (c *PermissionController) GetPermissionList(w http.ResponseWriter, r *http.
 	req.NormalizePageSize(50)
 	resp, err := c.PermissionService.GetPermissionList(r.Context(), req.PageNo, req.PageSize, req.PermissionName, req.Status, req.PermissionType)
 	if err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, resp)
@@ -45,7 +45,7 @@ func (c *PermissionController) GetPermissionTree(w http.ResponseWriter, r *http.
 		tree, err = c.PermissionService.GetPermissionTree(r.Context(), req.ParentID)
 	}
 	if err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]interface{}{"tree": tree})
@@ -65,7 +65,7 @@ func (c *PermissionController) AddPermission(w http.ResponseWriter, r *http.Requ
 		req.Status = 1
 	}
 	if err := c.PermissionService.AddPermission(r.Context(), req.ParentID, req.PermissionName, req.PermissionCode, req.PermissionType, req.Path, req.Icon, req.SortOrder, req.Status, req.IsSystem); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -82,7 +82,7 @@ func (c *PermissionController) UpdatePermission(w http.ResponseWriter, r *http.R
 		return
 	}
 	if err := c.PermissionService.UpdatePermission(r.Context(), req.PermissionID, req.ParentID, req.PermissionName, req.PermissionCode, req.PermissionType, req.Path, req.Icon, req.SortOrder, req.Status, req.IsSystem); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -99,7 +99,7 @@ func (c *PermissionController) DeletePermission(w http.ResponseWriter, r *http.R
 		return
 	}
 	if err := c.PermissionService.DeletePermission(r.Context(), req.PermissionID); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -116,7 +116,7 @@ func (c *PermissionController) UpdatePermissionStatus(w http.ResponseWriter, r *
 		return
 	}
 	if err := c.PermissionService.UpdatePermissionStatus(r.Context(), req.PermissionID, req.Status); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -133,7 +133,7 @@ func (c *PermissionController) UpdatePermissionIsSystem(w http.ResponseWriter, r
 		return
 	}
 	if err := c.PermissionService.UpdatePermissionIsSystem(r.Context(), req.PermissionID, req.IsSystem); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -151,7 +151,7 @@ func (c *PermissionController) GetEditPermissionInfo(w http.ResponseWriter, r *h
 	}
 	resp, err := c.PermissionService.GetEditPermissionInfo(r.Context(), req.PermissionID)
 	if err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, resp)

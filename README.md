@@ -216,7 +216,7 @@ go install github.com/stones-hub/taurus-x@latest
 也可以安装指定版本，所有版本见 GitHub 的 [Releases](https://github.com/stones-hub/taurus-x/releases) 页面：
 
 ```bash
-go install github.com/stones-hub/taurus-x@v0.3.0
+go install github.com/stones-hub/taurus-x@v0.4.0
 ```
 
 安装后命令通常位于 `$(go env GOPATH)/bin`，需要该目录在 `PATH` 中。如果提示找不到命令，先检查安装目录，不必重复安装。
@@ -642,7 +642,11 @@ cd backend && go mod tidy && make wire
 
 HTTPS代理终止TLS时须配置`AUTH_TRUSTED_ORIGINS=https://实际后台域名`和`JWT_COOKIE_SECURE=true`；Vite代理保留Host。分页默认15（权限50）、每页最多200，全量选择逐页读取并阻止不完整数据提交。前端测试要求Node22.18+；冻结安装后运行`pnpm test`及`pnpm build`。
 
-一期仍保留异步日志退出丢失、审计结果准确性、IP白名单接线、可选组件生产运行、其他权限并发窗口、许可证/SBOM、Go漏洞审计、备份恢复与容量验收等风险。
+从 v0.4.0 起，生成项目的浏览器端只用 HttpOnly Cookie：登录 / 刷新的响应体和响应头不再返回令牌，后端不再接受 `Authorization: Bearer`，前端不再把令牌存进 localStorage（旧版本残留的会在启动时删除）。自己写脚本或用 curl 调接口时改用 cookie jar + `x-csrf-token` 头，示例见生成项目 `docs/商用加固一期说明.md`。HttpOnly 降低的是 JS 直接读取令牌的风险，不能阻止 XSS 借用户浏览器发请求。
+
+v0.4.0 同时补上：访问日志 / 操作日志改为有界队列 + 固定 worker（队列满丢弃并限频告警，退出分 HTTP 关闭 / 日志排空 / 资源关闭三段各自计时，默认总上限 15.5 秒）、操作日志按业务 code 判定成败、接口不再回显数据库等内部错误原文；未接入路由的 HostMiddleware 与 `http.host_white_list` 已删除，按 IP 限制后台访问请用 Nginx 或防火墙。
+
+仍保留可选组件生产运行、其他权限并发窗口、许可证/SBOM、Go漏洞审计、备份恢复与容量验收等风险；日志队列在退出超时或进程被强杀时仍可能丢失少量日志。
 
 **当前不是“所有场景均已验证的生产成品”。**
 

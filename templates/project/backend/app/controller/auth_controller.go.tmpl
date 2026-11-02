@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"time"
 
 	"github.com/google/wire"
 
@@ -34,12 +33,12 @@ func (c *AuthController) Login(w http.ResponseWriter, r *http.Request) {
 	var req dto.LoginRequest
 	if r.Header.Get("Content-Type") == "application/json" {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			Fail(w, http.StatusBadRequest, "请求参数解析失败: "+err.Error())
+			Fail(w, http.StatusBadRequest, "请求参数解析失败")
 			return
 		}
 	} else {
 		if err := r.ParseForm(); err != nil {
-			Fail(w, http.StatusBadRequest, "请求参数解析失败: "+err.Error())
+			Fail(w, http.StatusBadRequest, "请求参数解析失败")
 			return
 		}
 		req.Username = r.FormValue("username")
@@ -68,11 +67,22 @@ func (c *AuthController) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// CSRF Token 在签发 JWT **之前**生成：随机数失败时直接让这次登录失败，
+	// 不登记会话、不下发任何 Cookie、不记「登录成功」。放到签发之后的话，失败时会话已登记、
+	// JWT 已写进响应，用户却拿不到 CSRF Cookie —— 前端守卫判为未登录，写请求全部被 CSRF 拒绝。
+	csrfToken, err := generateCSRFToken()
+	if err != nil {
+		log.Printf("登录生成 CSRF Token 失败: %v\n", err)
+		c.recordLogin(r, user.UserID, service.LoginStatusFailure, "生成CSRF令牌失败")
+		Fail(w, http.StatusInternalServerError, "生成令牌失败")
+		return
+	}
+
 	// authVersion 必须是校验凭证那一刻的值，原样传下去：
 	// 让签发侧现查当前版本会给「旧密码并发登录」留出可用会话。
 	// 令牌写入响应之后才记「登录成功」：写入失败时会话已被吊销，客户端也没拿到令牌，
 	// 这次登录实际没有成功，审计日志必须如实记失败。
-	token, expiresAt, err := middleware.IssueLoginJWT(w, fmt.Sprintf("%d", user.UserID), user.Username, authVersion)
+	expiresAt, err := middleware.IssueLoginJWT(w, fmt.Sprintf("%d", user.UserID), user.Username, authVersion)
 	if err != nil {
 		if errors.Is(err, middleware.ErrJWTWriteFailed) {
 			log.Printf("登录写入令牌失败: %v\n", err)
@@ -93,12 +103,17 @@ func (c *AuthController) Login(w http.ResponseWriter, r *http.Request) {
 
 	c.recordLogin(r, user.UserID, service.LoginStatusSuccess, "")
 	// IP 取法与登录日志一致（middleware.ClientIP，遵守 trusted_proxies）；失败只记日志，不影响登录。
-	if err := c.AuthService.RecordLastLogin(r.Context(), user.UserID, middleware.ClientIP(r)); err != nil {
+	// 写入成功时响应里的最后登录信息就是本次的时间和 IP；写入失败时保留读到的上一次的值，
+	// 与数据库里的实际内容一致（数据库没更新，就不在响应里假装更新了）。
+	if at, ip, err := c.AuthService.RecordLastLogin(r.Context(), user.UserID, middleware.ClientIP(r)); err != nil {
 		log.Printf("更新最后登录信息失败: %v\n", err)
+	} else {
+		user.LastLoginTime, user.LastLoginIP = &at, ip
 	}
 
-	response := dto.LoginResponse{Token: token, User: dto.ToUserInfo(user), ExpiresAt: expiresAt}
-	setCSRFCookie(w, expiresAt)
+	// 令牌只在 HttpOnly Cookie 里，响应体不带令牌。
+	response := dto.LoginResponse{User: dto.ToUserInfo(user), ExpiresAt: expiresAt}
+	middleware.SetCSRFToken(w, csrfToken, expiresAt)
 
 	OK(w, response)
 }
@@ -108,10 +123,9 @@ func (c *AuthController) Login(w http.ResponseWriter, r *http.Request) {
 // 除了清 Cookie，还必须把当前 Token 的 jti 从会话白名单里删掉：
 // 不吊销的话，登出只是「浏览器忘记了 Token」，Token 本身到期前仍然可用。
 //
-// Token 的提取统一走 middleware.GetJWTToken —— 认证中间件用的就是它。
-// controller 自己再写一套优先级（旧实现 Authorization 优先）会导致同时带
-// Cookie 和 Bearer 时「认证用的是 Cookie，登出吊销的却是 Bearer」，
-// 结果请求真正在用的那个会话毫发无伤。
+// Token 的提取统一走 middleware.GetJWTToken（只认 HttpOnly Cookie）—— 认证中间件
+// 用的就是它。controller 不能自己再写一套提取逻辑，否则「认证用的令牌」和
+// 「登出吊销的令牌」可能不是同一个，请求真正在用的那个会话毫发无伤。
 func (c *AuthController) Logout(w http.ResponseWriter, r *http.Request) {
 	if !middleware.AllowLogoutRequest(w, r) {
 		return
@@ -143,7 +157,7 @@ func (c *AuthController) RefreshToken(w http.ResponseWriter, r *http.Request) {
 		Fail(w, http.StatusUnauthorized, "缺少JWT令牌")
 		return
 	}
-	newToken, expiresAt, err := middleware.RefreshJWTToken(w, token)
+	expiresAt, err := middleware.RefreshJWTToken(w, token)
 	if err != nil {
 		if errors.Is(err, store.ErrSessionStoreUnavailable) {
 			Fail(w, http.StatusServiceUnavailable, "认证服务暂时不可用")
@@ -153,7 +167,8 @@ func (c *AuthController) RefreshToken(w http.ResponseWriter, r *http.Request) {
 		Fail(w, http.StatusUnauthorized, "令牌刷新失败，请重新登录")
 		return
 	}
-	response := dto.LoginResponse{Token: newToken, ExpiresAt: expiresAt}
+	// 新令牌已写入 HttpOnly Cookie，响应体只回过期时间。
+	response := dto.LoginResponse{ExpiresAt: expiresAt}
 	middleware.SetCSRFToken(w, middleware.GetCSRFTokenByCookie(r), expiresAt)
 	OK(w, response)
 }
@@ -170,11 +185,5 @@ func (c *AuthController) recordLogin(r *http.Request, userID uint64, status int8
 	}
 }
 
-// setCSRFCookie 下发 CSRF Token Cookie（供受 CSRF 保护的写请求使用）
-func setCSRFCookie(w http.ResponseWriter, expiresAt time.Time) {
-	csrfToken, err := middleware.GenerateCSRFToken()
-	if err != nil {
-		return
-	}
-	middleware.SetCSRFToken(w, csrfToken, expiresAt)
-}
+// generateCSRFToken 生成登录下发的 CSRF Token。声明成变量只为测试能构造随机数失败。
+var generateCSRFToken = middleware.GenerateCSRFToken

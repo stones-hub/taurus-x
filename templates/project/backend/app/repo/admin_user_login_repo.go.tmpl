@@ -66,12 +66,17 @@ func (r *AdminUserLoginRepository) SyncPasswordHash(ctx context.Context, userID 
 // 如果期间本人改密或管理员重置了密码，无条件更新就会用旧密码的 bcrypt 覆盖
 // 新密码 —— 相当于把密码改回去。带旧值的条件更新在这种情况下命中 0 行，
 // 调用方据此放弃升级（见 AuthService.upgradeLegacyCredential）。
+//
+// 散列升级不是用户改了什么，修改时间不该变：用 UpdateColumns（GORM 的 Updates 会自动补
+// updated_at = 当前时间），并在同一条语句里显式写 updated_at = updated_at，压住表上的
+// ON UPDATE CURRENT_TIMESTAMP（与 AdminUserRepository.UpdateLastLogin 同样的处理）。
 func (r *AdminUserLoginRepository) UpgradeCredentialIfUnchanged(ctx context.Context, loginID uint64, oldCredential, newCredential string) (bool, error) {
 	res := r.db.WithContext(ctx).Model(&model.AdminUserLogin{}).
 		Where("login_id = ? AND login_credential = ?", loginID, oldCredential).
-		Updates(map[string]interface{}{
+		UpdateColumns(map[string]interface{}{
 			"login_credential": newCredential,
 			"salt":             "",
+			"updated_at":       gorm.Expr("`updated_at`"),
 		})
 	if res.Error != nil {
 		return false, res.Error

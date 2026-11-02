@@ -15,6 +15,30 @@ import (
 	"{{ .Module }}/internal/taurus"
 )
 
+// VerificationCodeStore 验证码存取所需的最小能力，运行时由 taurus.Container.Redis 满足。
+type VerificationCodeStore interface {
+	Get(ctx context.Context, key string) (string, error)
+	Set(ctx context.Context, key string, value interface{}, expiration time.Duration) error
+	Del(ctx context.Context, keys ...string) error
+}
+
+// verificationCodeStore 为 nil 时用 taurus.Container.Redis（惰性取，容器装配之后才可用）。
+var verificationCodeStore VerificationCodeStore
+
+// SetVerificationCodeStore 替换验证码存储（测试用），返回还原函数。
+func SetVerificationCodeStore(s VerificationCodeStore) (restore func()) {
+	previous := verificationCodeStore
+	verificationCodeStore = s
+	return func() { verificationCodeStore = previous }
+}
+
+func codeStore() VerificationCodeStore {
+	if verificationCodeStore != nil {
+		return verificationCodeStore
+	}
+	return taurus.Container.Redis
+}
+
 // VerificationCodeManager 短信验证码管理器（基于 Redis）
 type VerificationCodeManager struct {
 	expires time.Duration
@@ -41,19 +65,19 @@ func (m *VerificationCodeManager) GenerateCode() (string, error) {
 // SendSMSCode 发送短信验证码（当前伪实现：限频 + 存 Redis）
 func (m *VerificationCodeManager) SendSMSCode(ctx context.Context, mobile string) (string, error) {
 	if mobile == "" {
-		return "", fmt.Errorf("手机号不能为空")
+		return "", NewBizError("手机号不能为空")
 	}
 
 	// 简单限频：1 分钟最多 1 次
 	rateKey := fmt.Sprintf("sms:rate:1m:%s", mobile)
-	if v, _ := taurus.Container.Redis.Get(ctx, rateKey); v != "" {
-		return "", fmt.Errorf("发送过于频繁，请稍后再试")
+	if v, _ := codeStore().Get(ctx, rateKey); v != "" {
+		return "", NewBizError("发送过于频繁，请稍后再试")
 	}
-	_ = taurus.Container.Redis.Set(ctx, rateKey, "1", time.Minute)
+	_ = codeStore().Set(ctx, rateKey, "1", time.Minute)
 
 	code, err := m.GenerateCode()
 	if err != nil {
-		return "", fmt.Errorf("生成验证码失败: %v", err)
+		return "", fmt.Errorf("生成验证码失败: %w", err)
 	}
 
 	// TODO: 接入第三方短信服务。
@@ -62,8 +86,8 @@ func (m *VerificationCodeManager) SendSMSCode(ctx context.Context, mobile string
 	log.Printf("发送短信验证码到 %s\n", MaskMobile(mobile))
 
 	key := fmt.Sprintf("verification_code:mobile:%s", mobile)
-	if err := taurus.Container.Redis.Set(ctx, key, code, m.expires); err != nil {
-		return "", fmt.Errorf("存储验证码失败: %v", err)
+	if err := codeStore().Set(ctx, key, code, m.expires); err != nil {
+		return "", fmt.Errorf("存储验证码失败: %w", err)
 	}
 	return code, nil
 }
@@ -71,18 +95,18 @@ func (m *VerificationCodeManager) SendSMSCode(ctx context.Context, mobile string
 // VerifyCode 验证验证码（一次性）
 func (m *VerificationCodeManager) VerifyCode(ctx context.Context, loginType, loginValue, inputCode string) (bool, error) {
 	key := fmt.Sprintf("verification_code:%s:%s", loginType, loginValue)
-	cached, err := taurus.Container.Redis.Get(ctx, key)
+	cached, err := codeStore().Get(ctx, key)
 	if err != nil {
-		return false, fmt.Errorf("获取验证码失败: %v", err)
+		return false, fmt.Errorf("获取验证码失败: %w", err)
 	}
 	if cached == "" {
-		return false, fmt.Errorf("验证码不存在或已过期")
+		return false, NewBizError("验证码不存在或已过期")
 	}
 	// 定长比较，避免按字节短路泄露「前几位猜对了」的时序信息
 	if subtle.ConstantTimeCompare([]byte(cached), []byte(inputCode)) != 1 {
-		return false, fmt.Errorf("验证码错误")
+		return false, NewBizError("验证码错误")
 	}
-	_ = taurus.Container.Redis.Del(ctx, key)
+	_ = codeStore().Del(ctx, key)
 	return true, nil
 }
 

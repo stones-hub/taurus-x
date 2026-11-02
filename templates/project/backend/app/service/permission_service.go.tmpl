@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
 	"sort"
 
 	"github.com/google/wire"
@@ -122,15 +121,15 @@ func (s *AdminPermissionsService) AddPermission(ctx context.Context, parentID ui
 		return err
 	}
 	if existing != nil {
-		return errors.New("权限编码已存在")
+		return helper.NewBizError("权限编码已存在")
 	}
 	if permType < 1 || permType > 3 {
-		return errors.New("权限类型必须为1(菜单)、2(按钮)或3(接口)")
+		return helper.NewBizError("权限类型必须为1(菜单)、2(按钮)或3(接口)")
 	}
 	// 只收 0/1：全代码库判定系统权限用的都是 `IsSystem == 1`，
 	// 存进一个 2 既不是系统权限也不是普通权限，后续判定会跟着一起含糊。
 	if isSystem != 0 && isSystem != 1 {
-		return errors.New("是否系统权限只能为 1(是) 或 0(否)")
+		return helper.NewBizError("是否系统权限只能为 1(是) 或 0(否)")
 	}
 	if parentID > 0 {
 		parent, err := s.permissionRepo.FindByPermissionID(ctx, parentID)
@@ -138,7 +137,7 @@ func (s *AdminPermissionsService) AddPermission(ctx context.Context, parentID ui
 			return err
 		}
 		if parent == nil {
-			return errors.New("父权限不存在")
+			return helper.NewBizError("父权限不存在")
 		}
 	}
 	perm := &model.AdminPermissions{
@@ -168,10 +167,10 @@ func (s *AdminPermissionsService) UpdatePermission(ctx context.Context, permissi
 		return err
 	}
 	if perm == nil {
-		return errors.New("权限不存在")
+		return helper.NewBizError("权限不存在")
 	}
 	if perm.IsSystem == 1 {
-		return errors.New("系统权限不能修改")
+		return helper.NewBizError("系统权限不能修改")
 	}
 	if code != perm.PermissionCode {
 		existing, err := s.permissionRepo.FindByPermissionCode(ctx, code)
@@ -179,7 +178,7 @@ func (s *AdminPermissionsService) UpdatePermission(ctx context.Context, permissi
 			return err
 		}
 		if existing != nil && existing.PermissionID != permissionID {
-			return errors.New("权限编码已被其他权限使用")
+			return helper.NewBizError("权限编码已被其他权限使用")
 		}
 	}
 	updateData := map[string]interface{}{
@@ -203,24 +202,24 @@ func (s *AdminPermissionsService) DeletePermission(ctx context.Context, permissi
 		return err
 	}
 	if perm == nil {
-		return errors.New("权限不存在")
+		return helper.NewBizError("权限不存在")
 	}
 	if perm.IsSystem == 1 {
-		return errors.New("系统权限不能删除")
+		return helper.NewBizError("系统权限不能删除")
 	}
 	children, err := s.permissionRepo.ListByParentID(ctx, permissionID)
 	if err != nil {
 		return err
 	}
 	if len(children) > 0 {
-		return errors.New("该权限下存在子权限，无法删除")
+		return helper.NewBizError("该权限下存在子权限，无法删除")
 	}
 	rolePerms, err := s.rolePermissionRepo.ListByPermissionID(ctx, permissionID)
 	if err != nil {
 		return err
 	}
 	if len(rolePerms) > 0 {
-		return errors.New("该权限已被角色使用，无法删除")
+		return helper.NewBizError("该权限已被角色使用，无法删除")
 	}
 	return s.permissionRepo.Delete(ctx, perm)
 }
@@ -232,7 +231,7 @@ func (s *AdminPermissionsService) UpdatePermissionStatus(ctx context.Context, pe
 		return err
 	}
 	if perm == nil {
-		return errors.New("权限不存在")
+		return helper.NewBizError("权限不存在")
 	}
 	return s.permissionRepo.UpdateByID(ctx, permissionID, map[string]interface{}{"status": status})
 }
@@ -251,17 +250,17 @@ func (s *AdminPermissionsService) UpdatePermissionStatus(ctx context.Context, pe
 // `IsSystem == 1`，写进一个 2 就等于降级，只是绕了一步。
 func (s *AdminPermissionsService) UpdatePermissionIsSystem(ctx context.Context, permissionID uint64, isSystem int8) error {
 	if isSystem != 0 && isSystem != 1 {
-		return errors.New("是否系统权限只能为 1(是) 或 0(否)")
+		return helper.NewBizError("是否系统权限只能为 1(是) 或 0(否)")
 	}
 	perm, err := s.permissionRepo.FindByPermissionID(ctx, permissionID)
 	if err != nil {
 		return err
 	}
 	if perm == nil {
-		return errors.New("权限不存在")
+		return helper.NewBizError("权限不存在")
 	}
 	if perm.IsSystem == 1 && isSystem == 0 {
-		return errors.New("系统权限不能改为普通权限")
+		return helper.NewBizError("系统权限不能改为普通权限")
 	}
 	if isSystem == 0 {
 		// 当前是 0、要写 0：无事可做。走到这里说明不是降级，直接返回成功，
@@ -280,7 +279,7 @@ func (s *AdminPermissionsService) GetEditPermissionInfo(ctx context.Context, per
 		return nil, err
 	}
 	if perm == nil {
-		return nil, errors.New("权限不存在")
+		return nil, helper.NewBizError("权限不存在")
 	}
 
 	// 按权限类型过滤可选父权限，并排除自身及其子权限（避免循环引用）

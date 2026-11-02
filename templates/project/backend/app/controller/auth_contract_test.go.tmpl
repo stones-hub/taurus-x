@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -145,6 +147,9 @@ func assertJWTCookie(t *testing.T, recorder *httptest.ResponseRecorder, secure, 
 		if cookie.Value != "" || cookie.MaxAge != -1 || !cookie.Expires.Before(time.Now()) {
 			t.Fatal("cookie not cleared")
 		}
+		if recorder.Header().Get(middleware.JWTTokenKey) != "" {
+			t.Fatal("cleared response still carries a token header")
+		}
 	} else {
 		if csrfCookies[0].Value == "" || !csrfCookies[0].Expires.Equal(cookie.Expires) {
 			t.Fatal("CSRF and JWT lifetime differ")
@@ -159,15 +164,50 @@ func assertJWTCookie(t *testing.T, recorder *httptest.ResponseRecorder, secure, 
 		if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
 			t.Fatal(err)
 		}
-		if body.Data.Token != cookie.Value || !body.Data.ExpiresAt.Equal(expiresAt) || !cookie.Expires.Equal(expiresAt) {
+		if !body.Data.ExpiresAt.Equal(expiresAt) || !cookie.Expires.Equal(expiresAt) {
 			t.Fatal("response, signature, cookie expirations differ")
 		}
+		assertTokenOnlyInCookie(t, recorder, cookie.Value)
 		remaining := time.Until(cookie.Expires)
 		if remaining < 119*time.Minute || remaining > 2*time.Hour {
 			t.Fatal("configured lifetime ignored")
 		}
 	}
 	return cookie
+}
+
+// assertTokenOnlyInCookie 令牌只能出现在 Set-Cookie 里：响应体（任何位置、任何字段名）
+// 和除 Set-Cookie 以外的任何响应头都不得包含它，响应 data 也不得再有 token 字段。
+func assertTokenOnlyInCookie(t *testing.T, recorder *httptest.ResponseRecorder, token string) {
+	t.Helper()
+	if token == "" {
+		t.Fatal("expected a non-empty token in the JWT cookie")
+	}
+	if bytes.Contains(recorder.Body.Bytes(), []byte(token)) {
+		t.Fatal("response body leaked the JWT")
+	}
+	var envelope struct {
+		Data map[string]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := envelope.Data["token"]; ok {
+		t.Fatal("response data still has a token field")
+	}
+	for name, values := range recorder.Header() {
+		if http.CanonicalHeaderKey(name) == "Set-Cookie" {
+			continue
+		}
+		for _, value := range values {
+			if bytes.Contains([]byte(value), []byte(token)) {
+				t.Fatalf("response header %s leaked the JWT", name)
+			}
+		}
+	}
+	if recorder.Header().Get(middleware.JWTTokenKey) != "" {
+		t.Fatal("response still sets the jwt_token header")
+	}
 }
 
 func authPolicyCode(t *testing.T, recorder *httptest.ResponseRecorder) int {
@@ -252,12 +292,13 @@ func TestAuthCookieLoginRefreshLogoutPolicy(t *testing.T) {
 // policyClientIP 是 authPolicyRequest 的 RemoteAddr（httptest 默认 192.0.2.1:1234）解析出的客户端 IP。
 const policyClientIP = "192.0.2.1"
 
-// recentTime 匹配刚写入的时间参数：必须是 time.Time，且在最近一分钟内、不在未来。
+// recentTime 匹配刚写入的时间参数：必须是 time.Time，在最近一分钟内、不在未来，
+// 且已截到整秒（last_login_time 是 DATETIME，带小数秒会被 MySQL 四舍五入，和响应对不上）。
 type recentTime struct{}
 
 func (recentTime) Match(v driver.Value) bool {
 	at, ok := v.(time.Time)
-	return ok && !at.After(time.Now()) && time.Since(at) < time.Minute
+	return ok && at.Nanosecond() == 0 && !at.After(time.Now()) && time.Since(at) < time.Minute
 }
 
 // expectLastLoginUpdate 登录成功后只更新 last_login_ip、last_login_time 两列，条件是本人的 user_id；
@@ -287,7 +328,12 @@ func policyLoginBody(t *testing.T, password string) []byte {
 
 // TestLoginRecordsLastLogin 登录成功（令牌已写入、记了「登录成功」）后更新最后登录时间与 IP；
 // IP 与登录日志同源。更新失败只记日志，登录照常成功。
+//
+// 响应里的最后登录信息：更新成功时是本次的时间与 IP；更新失败时保留读到的上一次的值
+// （与数据库实际内容一致）。
 func TestLoginRecordsLastLogin(t *testing.T) {
+	const previousIP = "198.51.100.9"
+	previousAt := time.Date(2020, 1, 2, 3, 4, 5, 0, time.Local)
 	for _, updateError := range []error{nil, errors.New("simulated last login update failure")} {
 		t.Run(fmt.Sprintf("updateError=%v", updateError), func(t *testing.T) {
 			authPolicyConfig(t, false)
@@ -298,7 +344,11 @@ func TestLoginRecordsLastLogin(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			expectPolicyCredentials(mock, hash)
+			mock.ExpectBegin()
+			mock.ExpectQuery("SELECT .* FROM `admin_users`").WillReturnRows(sqlmock.NewRows([]string{"user_id", "username", "status", "auth_version", "last_login_time", "last_login_ip"}).
+				AddRow(7, "policy-user", 1, 1, previousAt, previousIP))
+			mock.ExpectQuery("SELECT .* FROM `admin_user_logins`").WillReturnRows(sqlmock.NewRows([]string{"login_id", "user_id", "login_credential", "salt", "status"}).AddRow(7, 7, hash, "", 1))
+			mock.ExpectCommit()
 			mock.ExpectExec("INSERT INTO `admin_user_login_logs`").
 				WithArgs(7, sqlmock.AnyArg(), policyClientIP, sqlmock.AnyArg(), service.LoginStatusSuccess, "", sqlmock.AnyArg()).
 				WillReturnResult(sqlmock.NewResult(1, 1))
@@ -309,11 +359,31 @@ func TestLoginRecordsLastLogin(t *testing.T) {
 				update.WillReturnResult(sqlmock.NewResult(0, 1))
 			}
 			recorder := httptest.NewRecorder()
+			before := time.Now().Truncate(time.Second)
 			controller.Login(recorder, authPolicyRequest("/auth/login", policyLoginBody(t, "policy-password-0001"), ""))
 			if authPolicyCode(t, recorder) != 200 {
 				t.Fatal("login must succeed regardless of last login update result")
 			}
 			assertJWTCookie(t, recorder, false, false)
+			var body struct {
+				Data dto.LoginResponse `json:"data"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Data.User == nil {
+				t.Fatal("login response must carry the user")
+			}
+			if updateError != nil {
+				if body.Data.User.LastLoginIP != previousIP || body.Data.User.LastLoginTime != previousAt.Format("2006-01-02 15:04:05") {
+					t.Fatalf("failed update must keep the previous last login, got %q %q", body.Data.User.LastLoginTime, body.Data.User.LastLoginIP)
+				}
+			} else {
+				at, err := time.ParseInLocation("2006-01-02 15:04:05", body.Data.User.LastLoginTime, time.Local)
+				if err != nil || body.Data.User.LastLoginIP != policyClientIP || at.Before(before) || at.After(time.Now()) {
+					t.Fatalf("login response must show this login's time and IP, got %q %q", body.Data.User.LastLoginTime, body.Data.User.LastLoginIP)
+				}
+			}
 			if err := mock.ExpectationsWereMet(); err != nil {
 				t.Fatal(err)
 			}
@@ -555,6 +625,33 @@ func TestLoginTokenWriteFailureRevokesSession(t *testing.T) {
 	}
 }
 
+// TestLoginCSRFGenerationFailureIssuesNothing 生成 CSRF Token 的随机数失败时：登录返回 500 通用提示，
+// 不登记会话、不下发任何 Cookie 或令牌头、登录日志记失败而不是成功，响应不含内部错误原文。
+func TestLoginCSRFGenerationFailureIssuesNothing(t *testing.T) {
+	sessions := authPolicyConfig(t, false)
+	previous := generateCSRFToken
+	generateCSRFToken = func() (string, error) { return "", errors.New("crypto/rand: entropy-detail-marker") }
+	t.Cleanup(func() { generateCSRFToken = previous })
+	recorder := failedPolicyLogin(t, "生成CSRF令牌失败")
+	if authPolicyCode(t, recorder) != 500 {
+		t.Fatal("CSRF generation failure must fail the login")
+	}
+	if got := policyMessage(t, recorder); got != "生成令牌失败" {
+		t.Fatalf("应返回通用提示，实际 %q", got)
+	}
+	if bytes.Contains(recorder.Body.Bytes(), []byte("entropy-detail-marker")) {
+		t.Fatalf("登录响应泄漏了内部错误: %s", recorder.Body.String())
+	}
+	if len(sessions.registered) != 0 || len(recorder.Header().Values("Set-Cookie")) != 0 {
+		t.Fatalf("CSRF 生成失败不得登记会话或下发 Cookie: registered=%v cookies=%v", sessions.registered, recorder.Header().Values("Set-Cookie"))
+	}
+	for name := range recorder.Header() {
+		if name != "Content-Type" {
+			t.Fatalf("失败响应不应带额外响应头 %s", name)
+		}
+	}
+}
+
 // TestLoginSessionRegisterFailureHidesInternalError 登记会话失败时，登录不能把内部错误
 // （Redis 地址等）回给客户端：会话存储不可用回 503（与刷新、会话中间件一致），其他错误回 500。
 func TestLoginSessionRegisterFailureHidesInternalError(t *testing.T) {
@@ -603,6 +700,105 @@ func TestRefreshTokenWriteFailureAfterRotation(t *testing.T) {
 	}
 }
 
+// assertFixedJWTInvalidResponse JWT 校验失败的响应：data 恰好是固定提示，且不含 leaked 原文。
+func assertFixedJWTInvalidResponse(t *testing.T, recorder *httptest.ResponseRecorder, leaked string) {
+	t.Helper()
+	var body struct {
+		Data string `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Data != middleware.JWTInvalidMessage {
+		t.Fatalf("JWT 校验失败应返回固定提示 %q，实际 %q", middleware.JWTInvalidMessage, body.Data)
+	}
+	if leaked != "" && bytes.Contains(recorder.Body.Bytes(), []byte(leaked)) {
+		t.Fatalf("响应回显了 JWT 校验的错误原文: %s", recorder.Body.String())
+	}
+}
+
+// TestAdminChainRejectsInvalidTokensWithFixedMessage 过期、签名不对、格式错误的令牌走 /admin/** 认证链：
+// 401、不访问会话存储、不进入业务处理，响应只有固定提示（不含 JWT 库的错误文本）。
+func TestAdminChainRejectsInvalidTokensWithFixedMessage(t *testing.T) {
+	sessions := authPolicyConfig(t, false)
+	taurus.Container.Config.MergeMap(map[string]interface{}{"http": map[string]interface{}{
+		"jwt": map[string]interface{}{"enabled": true},
+	}})
+	reached := 0
+	chain := middleware.JWTMiddleware()(middleware.SessionValidatorMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached++
+		OK(w, map[string]bool{"reached": true})
+	})))
+	secret := taurus.Container.Config.GetString("http.jwt.secret")
+	expired, err := jwt.NewWithClaims(jwt.SigningMethodHS256, &tcrypt.Claims{
+		Uid: "7", Username: "policy-user",
+		RegisteredClaims: jwt.RegisteredClaims{ID: "expired-admin-session", ExpiresAt: jwt.NewNumericDate(time.Now().Add(-time.Hour))},
+	}).SignedString([]byte(secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongKey, err := tcrypt.GenerateTokenWithExpiration("7", "policy-user", "policy-test", secret+"-different-key", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, token := range map[string]string{"过期": expired, "签名不对": wrongKey, "格式错误": "malformed-jwt"} {
+		_, _, validateErr := middleware.ValidateJWTToken(token)
+		if validateErr == nil {
+			t.Fatalf("%s: fixture must be invalid", name)
+		}
+		req := httptest.NewRequest(http.MethodGet, "http://example.test/admin/user/info", nil)
+		req.AddCookie(&http.Cookie{Name: middleware.JWTTokenKey, Value: token})
+		recorder := httptest.NewRecorder()
+		logs := captureLog(t)
+		chain.ServeHTTP(recorder, req)
+		// 客户端只拿固定提示，但服务端日志必须留下可诊断的失败原因
+		if !strings.Contains(logs.String(), "reason="+strconv.Quote(validateErr.Error())) {
+			t.Fatalf("%s: 服务端日志缺少失败原因 %q，实际 %q", name, validateErr.Error(), logs.String())
+		}
+		if strings.Contains(logs.String(), token) && len(token) > 20 {
+			t.Fatalf("%s: 服务端日志不应记录令牌本身", name)
+		}
+		if authPolicyCode(t, recorder) != 401 || reached != 0 || sessions.validations != 0 {
+			t.Fatalf("%s: admin chain accepted an invalid token or consulted the session store", name)
+		}
+		assertFixedJWTInvalidResponse(t, recorder, validateErr.Error())
+	}
+}
+
+// TestJWTFailureLogCannotBeSplitByPath URL.Path 是解码后的值，%0a 会变成真换行：
+// 失败日志对路径和原因转义输出，一次失败只占一条物理行，原因仍然可读。
+func TestJWTFailureLogCannotBeSplitByPath(t *testing.T) {
+	authPolicyConfig(t, false)
+	taurus.Container.Config.MergeMap(map[string]interface{}{"http": map[string]interface{}{
+		"jwt": map[string]interface{}{"enabled": true},
+	}})
+	chain := middleware.JWTMiddleware()(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("invalid token reached the handler")
+	}))
+	req := httptest.NewRequest(http.MethodGet, "http://example.test/admin/user/info%0a2026/11/02%2000:00:00%20FORGED%20login%20ok%0d%0a", nil)
+	if !strings.Contains(req.URL.Path, "\n") {
+		t.Fatalf("fixture path must contain a decoded newline, got %q", req.URL.Path)
+	}
+	req.AddCookie(&http.Cookie{Name: middleware.JWTTokenKey, Value: "malformed-jwt"})
+	_, _, validateErr := middleware.ValidateJWTToken("malformed-jwt")
+	logs := captureLog(t)
+	recorder := httptest.NewRecorder()
+	chain.ServeHTTP(recorder, req)
+	if authPolicyCode(t, recorder) != 401 {
+		t.Fatal("invalid token must be rejected")
+	}
+	out := logs.String()
+	if lines := strings.Count(out, "\n"); lines != 1 || !strings.HasSuffix(out, "\n") {
+		t.Fatalf("一次 JWT 失败应只写一条物理行，实际 %d 行: %q", lines, out)
+	}
+	if strings.Contains(out, "\r") {
+		t.Fatalf("日志里不应出现原始回车: %q", out)
+	}
+	if !strings.Contains(out, `FORGED login ok\r\n`) || !strings.Contains(out, "reason="+strconv.Quote(validateErr.Error())) {
+		t.Fatalf("日志应保留转义后的路径与可诊断的原因，实际 %q", out)
+	}
+}
+
 // TestAdminChainRejectsTokenWithoutExpiry 缺 exp 的令牌走 /admin/** 的认证链
 // （JWTMiddleware + SessionValidatorMiddleware）必须返回 401，且不访问会话存储；
 // 同一条链上合法令牌能放行，证明拒绝来自缺 exp 而不是链本身没开。
@@ -624,26 +820,108 @@ func TestAdminChainRejectsTokenWithoutExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 	req := httptest.NewRequest(http.MethodGet, "http://example.test/admin/user/info", nil)
-	req.Header.Set("Authorization", "Bearer "+noExpiry)
+	req.AddCookie(&http.Cookie{Name: middleware.JWTTokenKey, Value: noExpiry})
 	recorder := httptest.NewRecorder()
 	chain.ServeHTTP(recorder, req)
 	if authPolicyCode(t, recorder) != 401 || reached != 0 || sessions.validations != 0 {
 		t.Fatal("admin chain accepted a token without exp or consulted the session store")
 	}
-	if !bytes.Contains(recorder.Body.Bytes(), []byte(middleware.ErrJWTMissingExpiry.Error())) {
-		t.Fatalf("admin chain rejection must be caused by missing exp, got %s", recorder.Body.String())
+	// 拒绝原因必须是缺 exp（直接校验同一个令牌确认），但响应只给固定提示，不回显 JWT 库的错误原文
+	if _, _, err := middleware.ValidateJWTToken(noExpiry); !errors.Is(err, middleware.ErrJWTMissingExpiry) {
+		t.Fatalf("fixture must be rejected for missing exp, got %v", err)
 	}
+	assertFixedJWTInvalidResponse(t, recorder, middleware.ErrJWTMissingExpiry.Error())
 	valid, err := middleware.GenerateJWTToken("7", "policy-user", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	req = httptest.NewRequest(http.MethodGet, "http://example.test/admin/user/info", nil)
-	req.Header.Set("Authorization", "Bearer "+valid)
+	req.AddCookie(&http.Cookie{Name: middleware.JWTTokenKey, Value: valid})
 	recorder = httptest.NewRecorder()
 	chain.ServeHTTP(recorder, req)
 	if authPolicyCode(t, recorder) != 200 || reached != 1 || sessions.validations != 1 {
 		t.Fatal("admin chain rejected a valid token")
 	}
+}
+
+// headerOnlyTokenCases 把令牌放在 Cookie 以外的位置（Bearer / jwt_token 请求头）。
+func headerOnlyTokenCases(token string) map[string]func(*http.Request) {
+	return map[string]func(*http.Request){
+		"bearer":      func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+token) },
+		"jwt_token 头": func(r *http.Request) { r.Header.Set(middleware.JWTTokenKey, token) },
+	}
+}
+
+// TestAdminChainRejectsHeaderOnlyToken 浏览器端令牌只走 HttpOnly Cookie：
+// 同一个合法令牌放在 Authorization: Bearer 或 jwt_token 请求头里（不带 Cookie）访问 /admin/**，
+// 必须返回 401，且不访问会话存储、不进入业务 Handler。
+// 同一个令牌放进 Cookie 能放行，证明拒绝来自「令牌位置不对」而不是令牌本身无效。
+func TestAdminChainRejectsHeaderOnlyToken(t *testing.T) {
+	sessions := authPolicyConfig(t, false)
+	taurus.Container.Config.MergeMap(map[string]interface{}{"http": map[string]interface{}{
+		"jwt": map[string]interface{}{"enabled": true},
+	}})
+	reached := 0
+	chain := middleware.JWTMiddleware()(middleware.SessionValidatorMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached++
+		OK(w, map[string]bool{"reached": true})
+	})))
+	valid, err := middleware.GenerateJWTToken("7", "policy-user", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, set := range headerOnlyTokenCases(valid) {
+		req := httptest.NewRequest(http.MethodGet, "http://example.test/admin/user/info", nil)
+		set(req)
+		recorder := httptest.NewRecorder()
+		chain.ServeHTTP(recorder, req)
+		if authPolicyCode(t, recorder) != 401 || reached != 0 || sessions.validations != 0 {
+			t.Fatalf("%s: admin chain accepted a token outside the cookie", name)
+		}
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://example.test/admin/user/info", nil)
+	req.AddCookie(&http.Cookie{Name: middleware.JWTTokenKey, Value: valid})
+	recorder := httptest.NewRecorder()
+	chain.ServeHTTP(recorder, req)
+	if authPolicyCode(t, recorder) != 200 || reached != 1 || sessions.validations != 1 {
+		t.Fatal("admin chain rejected the same token in the cookie")
+	}
+}
+
+// TestRefreshRejectsHeaderOnlyToken 刷新接口同样只认 Cookie：CSRF 正确、合法令牌只放在
+// Authorization: Bearer 或 jwt_token 头里时返回 401，不校验、不轮换会话，也不下发任何 Cookie。
+// 既直接调 Handler，也走与生产路由同构的刷新链（AuthRequest + JWT + 会话校验 + Handler）。
+func TestRefreshRejectsHeaderOnlyToken(t *testing.T) {
+	sessions := authPolicyConfig(t, false)
+	taurus.Container.Config.MergeMap(map[string]interface{}{"http": map[string]interface{}{
+		"jwt": map[string]interface{}{"enabled": true},
+	}})
+	valid, err := middleware.GenerateJWTToken("7", "policy-user", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := &AuthController{}
+	refreshChain := middleware.AuthRequestMiddleware(true)(middleware.JWTMiddleware()(middleware.SessionValidatorMiddleware()(http.HandlerFunc(controller.RefreshToken))))
+	for _, handler := range []http.Handler{http.HandlerFunc(controller.RefreshToken), refreshChain} {
+		for name, set := range headerOnlyTokenCases(valid) {
+			req := authPolicyRequest("/user/refresh-token", nil, "")
+			set(req)
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, req)
+			if authPolicyCode(t, recorder) != 401 || len(recorder.Result().Cookies()) != 0 || recorder.Header().Get(middleware.JWTTokenKey) != "" {
+				t.Fatalf("%s: refresh accepted a token outside the cookie", name)
+			}
+			if sessions.validations != 0 || sessions.rotations != 0 {
+				t.Fatalf("%s: refresh consulted or rotated the session store", name)
+			}
+		}
+	}
+	recorder := httptest.NewRecorder()
+	refreshChain.ServeHTTP(recorder, authPolicyRequest("/user/refresh-token", nil, valid))
+	if authPolicyCode(t, recorder) != 200 || sessions.rotations != 1 {
+		t.Fatal("refresh chain rejected the same token in the cookie")
+	}
+	assertJWTCookie(t, recorder, false, false)
 }
 
 func TestAuthMethodAndCSRFBeforeSideEffects(t *testing.T) {
@@ -734,7 +1012,7 @@ func TestLogoutExpiredCookiePolicyThroughRoute(t *testing.T) {
 					req := httptest.NewRequest(http.MethodPost, "http://example.test/auth/logout", nil)
 					req.Header.Set("Origin", "http://example.test")
 					if token != "" {
-						req.Header.Set("Authorization", "Bearer "+token)
+						req.AddCookie(&http.Cookie{Name: middleware.JWTTokenKey, Value: token})
 					}
 					recorder := httptest.NewRecorder()
 					handler.ServeHTTP(recorder, req)
@@ -750,7 +1028,9 @@ func TestLogoutExpiredCookiePolicyThroughRoute(t *testing.T) {
 			for _, token := range []string{"", expired, noExpiry} {
 				req := httptest.NewRequest(http.MethodPost, "http://example.test/user/refresh-token", nil)
 				req.Header.Set("Origin", "http://example.test")
-				req.Header.Set("Authorization", "Bearer "+token)
+				if token != "" {
+					req.AddCookie(&http.Cookie{Name: middleware.JWTTokenKey, Value: token})
+				}
 				recorder := httptest.NewRecorder()
 				middleware.AuthRequestMiddleware(true)(http.HandlerFunc(controller.RefreshToken)).ServeHTTP(recorder, req)
 				if recorder.Code != 403 || len(recorder.Result().Cookies()) != 0 || sessions.rotations != 0 {
@@ -771,13 +1051,27 @@ func TestLogoutExpiredCookiePolicyThroughRoute(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, handler := range []http.Handler{http.HandlerFunc(controller.Logout), mux} {
-				bearer := httptest.NewRequest(http.MethodPost, "http://example.test/auth/logout", nil)
-				bearer.Header.Set("Origin", "http://example.test")
-				bearer.Header.Set("Authorization", "Bearer "+valid)
+				// 合法 JWT Cookie、但没有 CSRF Cookie 和 CSRF 头：必须 403，不吊销、不清 Cookie。
+				missingCSRF := httptest.NewRequest(http.MethodPost, "http://example.test/auth/logout", nil)
+				missingCSRF.Header.Set("Origin", "http://example.test")
+				missingCSRF.AddCookie(&http.Cookie{Name: middleware.JWTTokenKey, Value: valid})
 				missingCookies := httptest.NewRecorder()
-				handler.ServeHTTP(missingCookies, bearer)
+				handler.ServeHTTP(missingCookies, missingCSRF)
 				if missingCookies.Code != 403 || len(missingCookies.Result().Cookies()) != 0 || sessions.revocations != 0 {
-					t.Fatal("valid Bearer logout bypassed missing CSRF cookies")
+					t.Fatal("valid JWT cookie logout bypassed missing CSRF cookies")
+				}
+				// 合法令牌只放在 Bearer / jwt_token 头里：它不是凭证，不能用来吊销会话；
+				// 按「无可认证令牌」处理 —— 只清 Cookie，不访问会话存储。
+				for name, set := range headerOnlyTokenCases(valid) {
+					headerOnly := httptest.NewRequest(http.MethodPost, "http://example.test/auth/logout", nil)
+					headerOnly.Header.Set("Origin", "http://example.test")
+					set(headerOnly)
+					recorder := httptest.NewRecorder()
+					handler.ServeHTTP(recorder, headerOnly)
+					if authPolicyCode(t, recorder) != 200 || sessions.revocations != 0 || sessions.validations != 0 {
+						t.Fatalf("%s: header-only token was treated as a logout credential", name)
+					}
+					assertJWTCookie(t, recorder, secure, true)
 				}
 				for _, csrf := range []string{"", "mismatched-csrf-marker"} {
 					req := authPolicyRequest("/auth/logout", nil, valid)
@@ -805,7 +1099,7 @@ func TestLogoutExpiredCookiePolicyThroughRoute(t *testing.T) {
 			for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodOptions} {
 				req := httptest.NewRequest(method, "http://example.test/auth/logout", nil)
 				req.Header.Set("Origin", "http://example.test")
-				req.Header.Set("Authorization", "Bearer "+expired)
+				req.AddCookie(&http.Cookie{Name: middleware.JWTTokenKey, Value: expired})
 				recorder := httptest.NewRecorder()
 				mux.ServeHTTP(recorder, req)
 				if recorder.Code != 405 || recorder.Header().Get("Allow") != "POST" || len(recorder.Result().Cookies()) != 0 {
@@ -815,7 +1109,7 @@ func TestLogoutExpiredCookiePolicyThroughRoute(t *testing.T) {
 			for _, origin := range []string{"", "null", "https://untrusted.test"} {
 				req := httptest.NewRequest(http.MethodPost, "http://example.test/auth/logout", nil)
 				req.Header.Set("Origin", origin)
-				req.Header.Set("Authorization", "Bearer "+expired)
+				req.AddCookie(&http.Cookie{Name: middleware.JWTTokenKey, Value: expired})
 				recorder := httptest.NewRecorder()
 				mux.ServeHTTP(recorder, req)
 				if recorder.Code != 403 || len(recorder.Result().Cookies()) != 0 {

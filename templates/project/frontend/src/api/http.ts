@@ -1,21 +1,23 @@
-// 统一的 axios 请求封装：自动携带 JWT + CSRF、统一解包 {code, message, data}。
+// 统一的 axios 请求封装：携带 Cookie（JWT 在 HttpOnly Cookie 里）+ CSRF 头、统一解包 {code, message, data}。
+// 前端不保存、不读取令牌，也不发 Authorization 头：后端只认 HttpOnly Cookie。
 // 约定：后端用 httpx.SendResponse 直接以 HTTP 状态码作为业务 code（成功=200），
 // 且对 4xx/5xx 错误恒返回 HTTP 200 + body.code=错误码，因此这里按 body.code 判定成败。
 import axios, { type AxiosInstance, type AxiosRequestConfig } from 'axios'
 import { ElMessage } from 'element-plus'
 import type { ApiResponse } from '../types'
 import { clearLocalAuth } from '../store/session'
+import { CSRF_COOKIE, readCookie } from '../utils/auth-hint'
+import { loginPath } from '../utils/login-reason'
 
 // API baseURL（导出供 frontError 等独立 axios 实例复用，避免重复 env 解析）
 export const baseURL = import.meta.env.VITE_API_BASE_URL ?? '/api'
 
-// CSRF token key（与后端 middleware.CSRFTokenKey 一致）
-const CSRF_KEY = 'x-csrf-token'
-
 const instance: AxiosInstance = axios.create({
   baseURL,
   timeout: 15000,
-  withCredentials: true, // 携带 cookie（JWT / CSRF 可走 cookie）
+  // 同源请求浏览器本来就会带 Cookie；显式打开是为了 VITE_API_BASE_URL 指向其他源时
+  // 也能带上 HttpOnly 的 JWT Cookie（跨源时后端还需要相应的 CORS 允许凭证）。
+  withCredentials: true,
 })
 
 /**
@@ -53,8 +55,12 @@ function showError(message: string) {
 /**
  * 返回 401 时不代表会话失效的接口：登录的 401 是凭证被拒（用户名或密码错误、账号状态非法等），
  * 登出的 401 由调用方自己处理。这两个接口按普通错误显示服务端提示，不清登录态、不跳转。
+ *
+ * 按 URL 字面值精确匹配：这里的字符串必须与 api/auth.ts 里 apiLogin / apiLogout 的 url
+ * 完全一致（不含 baseURL）。改了其中一边必须同步另一边 —— tests/http.test.ts 有一条用例
+ * 直接调用 api/auth.ts 校验这一点。
  */
-const SESSION_EXEMPT_URLS = new Set(['/auth/login', '/auth/logout'])
+export const SESSION_EXEMPT_URLS: ReadonlySet<string> = new Set(['/auth/login', '/auth/logout'])
 
 /** 是否按「会话失效」处理：401 且不是登录 / 登出接口。 */
 function isSessionExpired(code: number | undefined, url: string | undefined): boolean {
@@ -62,35 +68,26 @@ function isSessionExpired(code: number | undefined, url: string | undefined): bo
 }
 
 /**
- * 会话失效（HTTP 401 或业务 code 401，登录 / 登出接口除外）后的统一收尾：提示一次并跳转登录页。
+ * 会话失效（HTTP 401 或业务 code 401，登录 / 登出接口除外）后的统一收尾：提示一次并整页跳转登录页。
  * 本地登录态由调用方先调用 clearLocalAuth 清掉。提示文本固定并开启 grouping，
  * 并发请求一起撞上 401 时只合并成一条提示，也不会再和 showError 叠一条。
+ * 整页跳转后这条提示就没了，所以地址带上 reason=expired，由登录页再显示一次原因。
  */
 function redirectToLogin() {
-  localStorage.removeItem('token')
   ElMessage({ message: '登录已过期，请重新登录', type: 'error', grouping: true })
   if (window.location.pathname !== '/login') {
-    window.location.href = '/login'
+    window.location.href = loginPath('expired')
   }
 }
 
-/** 从 cookie 读取指定 key（CSRF token 存于 cookie，HttpOnly=false）。 */
-function getCookie(name: string): string {
-  const m = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'))
-  return m ? decodeURIComponent(m[1]) : ''
-}
-
-// 请求拦截器：附加 Bearer Token + CSRF header（非 GET）
+// 请求拦截器：非 GET 请求附加 CSRF header（双提交：值取自非 HttpOnly 的 CSRF Cookie）。
+// 不附加 Authorization：令牌在 HttpOnly Cookie 里，由浏览器自动携带。
 instance.interceptors.request.use((config) => {
-  const token = localStorage.getItem('token')
-  if (token) {
-    config.headers.Authorization = `Bearer ${token}`
-  }
   const method = (config.method ?? 'get').toUpperCase()
   if (method !== 'GET') {
-    const csrf = getCookie(CSRF_KEY)
+    const csrf = readCookie(CSRF_COOKIE)
     if (csrf) {
-      config.headers[CSRF_KEY] = csrf
+      config.headers[CSRF_COOKIE] = csrf
     }
   }
   return config

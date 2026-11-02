@@ -8,9 +8,11 @@ type LoginRequest struct {
 	Password string `json:"password" form:"password"`
 }
 
-// LoginResponse 登录响应（对齐前端 LoginResponse：token/user/expires_at）
+// LoginResponse 登录 / 刷新响应（对齐前端 LoginResponse：user/expires_at）。
+//
+// 刻意没有 token 字段：令牌只通过 HttpOnly Cookie 下发，响应体里出现令牌，
+// 前端 JS（以及注入的 XSS 脚本）就能读到它。刷新接口的 user 为 null。
 type LoginResponse struct {
-	Token     string    `json:"token"`
 	User      *UserInfo `json:"user"`
 	ExpiresAt time.Time `json:"expires_at"`
 }

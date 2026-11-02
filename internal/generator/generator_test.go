@@ -104,6 +104,7 @@ func TestGenerate_Combinations(t *testing.T) {
 			assertToolchainAndDeps(t, outDir, result.Components)
 			assertGoFilesFormatted(t, outDir)
 			assertPasswordChangeRelogin(t, outDir)
+			assertCookieOnlyAuthAndLogQueue(t, outDir)
 
 			backend := filepath.Join(outDir, "backend")
 			runGo(t, backend, "build", "./...")
@@ -111,6 +112,32 @@ func TestGenerate_Combinations(t *testing.T) {
 			runGo(t, backend, "test", "./...")
 		})
 	}
+}
+
+// TestGenerate_GofmtWithGitHubModule 用 github.com/... 形式的 module 再生成一次全选项目，
+// 确认 gofmt 干净：import 分组与排序会随 module 路径变化（example.com 与 github.com
+// 相对第三方依赖的排序位置不同），只测一种路径会漏掉这类问题。
+//
+// 只做全选组合（覆盖面最大）以控制耗时。tidy / wire 照常跑：wire 会重写 wire_gen.go 等文件，
+// 检查的必须是用户实际拿到的产物；构建与测试已由 TestGenerate_Combinations 覆盖，这里不再重复。
+func TestGenerate_GofmtWithGitHubModule(t *testing.T) {
+	outDir := filepath.Join(tmpRoot, "taurusx-test-all-github-module")
+	if err := os.RemoveAll(outDir); err != nil {
+		t.Fatalf("清理输出目录失败: %v", err)
+	}
+	var log bytes.Buffer
+	if _, err := Generate(Options{
+		ProjectName: "demo-admin",
+		Module:      "github.com/acme/demo-admin",
+		OutputDir:   outDir,
+		Components:  components.OptionalNames(),
+		RunTidy:     true,
+		RunWire:     true,
+		Stdout:      &log,
+	}); err != nil {
+		t.Fatalf("生成失败: %v\n%s", err, log.String())
+	}
+	assertGoFilesFormatted(t, outDir)
 }
 
 // golangImageTag 匹配任意 golang 镜像引用 golang:<标签>，包括 alpine、latest 这类不含版本号的标签，
@@ -183,20 +210,65 @@ func assertToolchainAndDeps(t *testing.T, outDir string, selected []string) {
 // imageRefLine 会出现镜像引用的行：Dockerfile 的 FROM、compose 的 image:、docker pull/run/tag/create。
 var imageRefLine = regexp.MustCompile(`^\s*(FROM\s|image:|-?\s*image:|.*\bdocker\s+(pull|run|tag|create)\s)`)
 
-// untaggedGolangImages 找出镜像引用行里不带标签的 golang 镜像（golang、library/golang、
-// <镜像源>/library/golang、golang@sha256:...），例如 `FROM golang AS x`。
-// 只看镜像引用行，正文里提到 golang 这个词（如「golang、node 等官方镜像」）不算。
+// argDefaultLine Dockerfile 的 ARG 默认值（ARG GO_IMAGE=golang），默认值可能被 FROM ${GO_IMAGE} 引用。
+var argDefaultLine = regexp.MustCompile(`^\s*ARG\s+[A-Za-z_][A-Za-z0-9_]*=(\S+)`)
+
+// composeArgsKey compose 的 build.args 块开头（args: 独占一行）。
+var composeArgsKey = regexp.MustCompile(`^(\s*)args:\s*$`)
+
+// composeArgEntry build.args 里的一项：列表写法 `- KEY=VALUE` 或映射写法 `KEY: VALUE`。
+var composeArgEntry = regexp.MustCompile(`^\s*(?:-\s*)?[A-Za-z_][A-Za-z0-9_]*\s*[=:]\s*(\S+)\s*$`)
+
+// isUntaggedGolang 判断一个镜像引用是否为不带标签的 golang（golang、library/golang、
+// <镜像源>/library/golang、golang@sha256:...）。
+func isUntaggedGolang(ref string) bool {
+	ref = strings.Trim(ref, "\"'`")
+	name := ref[strings.LastIndex(ref, "/")+1:]
+	return name == "golang" || strings.HasPrefix(name, "golang@")
+}
+
+// untaggedGolangImages 找出不带标签的 golang 镜像引用，例如 `FROM golang AS x`。
+// 扫描三类位置：镜像引用行（FROM / image: / docker pull 等）、Dockerfile 的 ARG 默认值、
+// compose 的 build.args。正文里提到 golang 这个词（如「golang、node 等官方镜像」）不算。
+//
+// 注释行（# 开头）有意忽略：注释里的示例不会被构建使用，强行扫描只会逼着文档绕开这个词。
+// 带标签的引用（golang:xxx）不在这里管，由 golangImageTag 对全文（含注释）统一核对版本。
 func untaggedGolangImages(src string) []string {
 	var found []string
+	argsIndent := -1
 	for _, line := range strings.Split(src, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if argsIndent >= 0 {
+			indent := len(line) - len(strings.TrimLeft(line, " \t"))
+			if trimmed != "" && indent > argsIndent {
+				if m := composeArgEntry.FindStringSubmatch(line); m != nil && isUntaggedGolang(m[1]) {
+					found = append(found, strings.Trim(m[1], "\"'`"))
+				}
+				continue
+			}
+			if trimmed != "" {
+				argsIndent = -1
+			}
+		}
+		if m := composeArgsKey.FindStringSubmatch(line); m != nil {
+			argsIndent = len(m[1])
+			continue
+		}
+		if m := argDefaultLine.FindStringSubmatch(line); m != nil {
+			if isUntaggedGolang(m[1]) {
+				found = append(found, strings.Trim(m[1], "\"'`"))
+			}
+			continue
+		}
 		if !imageRefLine.MatchString(line) {
 			continue
 		}
 		for _, field := range strings.Fields(strings.ReplaceAll(line, "image:", "image: ")) {
-			field = strings.Trim(field, "\"'`")
-			name := field[strings.LastIndex(field, "/")+1:]
-			if name == "golang" || strings.HasPrefix(name, "golang@") {
-				found = append(found, field)
+			if isUntaggedGolang(field) {
+				found = append(found, strings.Trim(field, "\"'`"))
 			}
 		}
 	}
@@ -207,14 +279,19 @@ func untaggedGolangImages(src string) []string {
 // 带标签的引用、正文里提到的 golang 一词、golang.org 之类的路径都不算。
 func TestUntaggedGolangImages(t *testing.T) {
 	flagged := map[string]string{
-		"FROM golang":                                "golang",
-		"FROM golang AS builder":                     "golang",
-		"FROM --platform=$BUILDPLATFORM golang AS x": "golang",
-		"  image: golang":                            "golang",
-		"    image: \"library/golang\"":              "library/golang",
-		"docker pull mirror.example/library/golang":  "mirror.example/library/golang",
-		"\tdocker run --rm golang go version":        "golang",
-		"FROM golang@sha256:0123456789abcdef AS b":   "golang@sha256:0123456789abcdef",
+		"FROM golang":                                                                "golang",
+		"FROM golang AS builder":                                                     "golang",
+		"FROM --platform=$BUILDPLATFORM golang AS x":                                 "golang",
+		"  image: golang":                                                            "golang",
+		"    image: \"library/golang\"":                                              "library/golang",
+		"docker pull mirror.example/library/golang":                                  "mirror.example/library/golang",
+		"\tdocker run --rm golang go version":                                        "golang",
+		"FROM golang@sha256:0123456789abcdef AS b":                                   "golang@sha256:0123456789abcdef",
+		"ARG GO_IMAGE=golang":                                                        "golang",
+		"ARG BUILDER_IMAGE=\"library/golang\"":                                       "library/golang",
+		"ARG GO_IMAGE=golang@sha256:0123456789abcdef":                                "golang@sha256:0123456789abcdef",
+		"    build:\n      args:\n        - GO_IMAGE=golang\n    image: app:1":       "golang",
+		"    build:\n      args:\n        GO_IMAGE: mirror.example/library/golang\n": "mirror.example/library/golang",
 	}
 	for line, want := range flagged {
 		got := untaggedGolangImages(line)
@@ -228,6 +305,14 @@ func TestUntaggedGolangImages(t *testing.T) {
 		"若官方基础镜像（`golang`、`node`、`alpine` 等）拉取超时",
 		"go env -w GOPROXY=https://proxy.golang.org,direct",
 		"# FROM golang AS commented",
+		// 注释行有意忽略（见 untaggedGolangImages 的说明）
+		"# ARG GO_IMAGE=golang",
+		"    build:\n      args:\n        # - GO_IMAGE=golang\n",
+		"ARG GO_IMAGE=golang:1.27.3-alpine",
+		"ARG GOPROXY=https://goproxy.cn,direct",
+		"    build:\n      args:\n        GOPROXY: https://proxy.golang.org,direct\n        - GO_IMAGE=golang:1.27.3-alpine\n",
+		// args 块结束后的同名键不是构建参数
+		"    build:\n      args:\n        A: b\n    environment:\n      GO_IMAGE: golang\n",
 	} {
 		if got := untaggedGolangImages(line); len(got) != 0 {
 			t.Errorf("%q 不应被当成不带标签的镜像引用，实际 %v", line, got)
@@ -271,20 +356,100 @@ func assertGoFilesFormatted(t *testing.T, outDir string) {
 
 // assertPasswordChangeRelogin 改密成功后后端已吊销该用户全部会话，个人中心必须立即
 // 清本地登录态并回登录页，而不是停在原页面等下一次请求报「会话已失效」。
+//
+// 收尾逻辑抽在 utils/relogin.ts 的 reloginAfterPasswordChange（有前端单测覆盖顺序），
+// 这里钉住两头的结构：profile 只在改密接口成功之后调用它，并把 clearLocalAuth 和路由跳转交给它；
+// 它先清本地登录态、再带 reason=password_changed 跳登录页，「请重新登录」的提示由登录页按 reason 显示。
 func assertPasswordChangeRelogin(t *testing.T, outDir string) {
 	t.Helper()
-	profile := readFile(t, filepath.Join(outDir, "frontend", "src", "views", "profile", "index.vue"))
+	frontend := filepath.Join(outDir, "frontend", "src")
+	profile := readFile(t, filepath.Join(frontend, "views", "profile", "index.vue"))
 	body := funcBody(profile, "async function onChangePassword(")
 	if body == "" {
 		t.Fatal("profile/index.vue 找不到 onChangePassword")
 	}
-	for _, must := range []string{"await apiChangePassword(", "请重新登录", "clearLocalAuth()", "router.replace('/login')"} {
+	call := "await reloginAfterPasswordChange({ clear: clearLocalAuth, navigate: (path) => router.replace(path) })"
+	for _, must := range []string{"await apiChangePassword(", call} {
 		if !strings.Contains(body, must) {
-			t.Errorf("改密成功后必须提示重新登录、清本地登录态并跳转登录页，缺少 %q", must)
+			t.Errorf("改密成功后必须清本地登录态并跳转登录页，缺少 %q", must)
 		}
 	}
-	if strings.Index(body, "clearLocalAuth()") < strings.Index(body, "await apiChangePassword(") {
+	if strings.Index(body, call) < strings.Index(body, "await apiChangePassword(") {
 		t.Error("只能在改密接口成功之后清理本地登录态")
+	}
+	// 参数类型里有花括号，funcBody 按括号配对取不到函数体，这里直接取函数声明之后的全部内容
+	reloginSrc := readFile(t, filepath.Join(frontend, "utils", "relogin.ts"))
+	relogin := reloginSrc[max(strings.Index(reloginSrc, "export async function reloginAfterPasswordChange("), 0):]
+	clear, navigate := strings.Index(relogin, "deps.clear()"), strings.Index(relogin, "await deps.navigate(loginPath('password_changed'))")
+	if clear < 0 || navigate < 0 || clear > navigate {
+		t.Errorf("reloginAfterPasswordChange 必须先清本地登录态、再带原因跳转登录页:\n%s", relogin)
+	}
+	reasons := readFile(t, filepath.Join(frontend, "utils", "login-reason.ts"))
+	if !strings.Contains(reasons, "password_changed: '密码已修改，请重新登录'") {
+		t.Error("登录页必须能按 reason=password_changed 提示「请重新登录」")
+	}
+}
+
+// assertCookieOnlyAuthAndLogQueue T9 的结构性兜底（行为由生成项目里的单测覆盖）：
+//   - 浏览器端只用 HttpOnly Cookie：GetJWTToken 不读请求头，setJWTCookie 不写响应头，
+//     登录响应没有 token 字段，前端不读写 localStorage 里的令牌、不发 Authorization；
+//   - HostMiddleware 与 http.host_white_list 已删除；
+//   - 访问日志 / 操作日志走有界队列（不再每请求一个 go func），且退出时接入 cleanups。
+func assertCookieOnlyAuthAndLogQueue(t *testing.T, outDir string) {
+	t.Helper()
+	app := filepath.Join(outDir, "backend", "app")
+	jwt := readFile(t, filepath.Join(app, "middleware", "jwt.go"))
+	if get := funcBody(jwt, "func GetJWTToken(r *http.Request) string {"); get == "" || strings.Contains(get, "Header") {
+		t.Errorf("GetJWTToken 只能读 Cookie:\n%s", get)
+	}
+	if set := funcBody(jwt, "func setJWTCookie("); set == "" || strings.Contains(set, "Header()") {
+		t.Errorf("setJWTCookie 不得把令牌写进响应头:\n%s", set)
+	}
+	if strings.Contains(readFile(t, filepath.Join(app, "dto", "auth_dto.go")), "`json:\"token\"`") {
+		t.Error("登录 / 刷新响应不得再有 token 字段")
+	}
+	frontend := filepath.Join(outDir, "frontend", "src")
+	for _, rel := range []string{"api/http.ts", "store/auth.ts", "router/index.ts", "main.ts", "types/auth.ts"} {
+		src := readFile(t, filepath.Join(frontend, rel))
+		for _, banned := range []string{"localStorage.getItem(", "localStorage.setItem(", "Authorization =", "Bearer "} {
+			if strings.Contains(src, banned) {
+				t.Errorf("frontend/src/%s 仍包含 %q：浏览器端只用 HttpOnly Cookie", rel, banned)
+			}
+		}
+	}
+	if !strings.Contains(readFile(t, filepath.Join(frontend, "main.ts")), "purgeLegacyToken()") {
+		t.Error("main.ts 启动时必须删除旧版本留在 localStorage 的令牌")
+	}
+	if _, err := os.Stat(filepath.Join(app, "middleware", "host.go")); !os.IsNotExist(err) {
+		t.Error("middleware/host.go 应已删除")
+	}
+	// 只查后端代码与配置；部署文档里有「已删除」的说明
+	assertNoMatch(t, filepath.Join(outDir, "backend"), "host_white_list")
+	assertNoMatch(t, filepath.Join(outDir, "backend"), "HostMiddleware")
+	for _, rel := range []string{"access_log.go", "operation_log.go"} {
+		src := readFile(t, filepath.Join(app, "middleware", rel))
+		if strings.Contains(src, "go func()") || !strings.Contains(src, "enqueueRequestLog(") {
+			t.Errorf("%s 必须走有界日志队列，不能每个请求起一个 go func", rel)
+		}
+	}
+	if !strings.Contains(funcBody(readFile(t, filepath.Join(app, "middleware", "operation_log.go")), "func OperationLogMiddleware("), "operationResult(rec.status, rec.buf.Bytes())") {
+		t.Error("操作日志成败必须按业务 code 判断（operationResult）")
+	}
+	// 退出分阶段、各自计时：日志排空是 HTTP 与资源关闭之间的独立阶段（运行层面的顺序与预算由
+	// 生成项目里 app/helper/lifecycle 与 middleware 的 shutdown 测试覆盖，这里只钉接线）。
+	bootstrap := readFile(t, filepath.Join(app, "bootstrap.go"))
+	start := funcBody(bootstrap, "func startRequestLogQueue(")
+	if !strings.Contains(start, "stopRequestLogs = middleware.StartRequestLogQueue(cfg)") || strings.Contains(start, "cleanups") {
+		t.Errorf("日志队列的停止函数应作为独立的排空阶段，不能混进 cleanups:\n%s", start)
+	}
+	shutdown := funcBody(bootstrap, "func gracefulShutdown(")
+	for _, must := range []string{"lifecycle.Plan{", "StopHTTP:       taurus.Container.Http.Shutdown", "ForceCloseHTTP: taurus.Container.Http.Close", "DrainLogs:      stopRequestLogs", "Cleanups:       cleanups"} {
+		if !strings.Contains(shutdown, must) {
+			t.Errorf("gracefulShutdown 缺少 %q:\n%s", must, shutdown)
+		}
+	}
+	if strings.Contains(funcBody(bootstrap, "func Run("), "context.WithTimeout") {
+		t.Error("Run 不应再让 HTTP 关闭与清理共用一个 ctx")
 	}
 }
 
@@ -1817,9 +1982,14 @@ func assertLogRetentionWiring(t *testing.T, outDir string) {
 	if strings.Contains(start, "cleanups = append(cleanups, stop)") {
 		t.Error("清理任务的停止函数不能尾插：cleanups 的顺序就是关闭顺序")
 	}
-	gcleanup := funcBody(bootstrap, "func gracefulCleanup(")
-	if !strings.Contains(gcleanup, "for _, cleanup := range cleanups {") {
-		t.Error("gracefulCleanup 应顺序遍历 cleanups：头插的前提是它按切片顺序执行")
+	// 退出编排挪到了 app/helper/lifecycle：gracefulShutdown 把 cleanups 原样交给 Plan，
+	// Plan.Run 按切片顺序执行 —— 头插的前提仍然成立。
+	if !strings.Contains(funcBody(bootstrap, "func gracefulShutdown("), "Cleanups:       cleanups") {
+		t.Error("gracefulShutdown 应把 cleanups 原样交给 lifecycle.Plan")
+	}
+	plan := funcBody(readFile(t, filepath.Join(backend, "app", "helper", "lifecycle", "shutdown.go")), "func (p Plan) Run() error {")
+	if !strings.Contains(plan, "for _, cleanup := range p.Cleanups {") {
+		t.Error("lifecycle.Plan.Run 应顺序遍历 cleanups：头插的前提是它按切片顺序执行")
 	}
 	// 配置非法时拒绝启动：这个值控制不可逆的删除，不能按一个猜出来的保留期去删
 	if !strings.Contains(start, "log.Fatalf") {

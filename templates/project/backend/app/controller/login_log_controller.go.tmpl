@@ -26,7 +26,7 @@ func (c *LoginLogController) GetLoginLogList(w http.ResponseWriter, r *http.Requ
 	req.Normalize()
 	resp, err := c.LoginLogService.GetLoginLogList(r.Context(), req.PageNo, req.PageSize, req.LoginStatus)
 	if err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, resp)

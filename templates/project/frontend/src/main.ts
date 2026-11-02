@@ -9,6 +9,10 @@ import App from './App.vue'
 import router from './router'
 import { permission } from './directives/permission'
 import { setupFrontErrorReporting } from './utils/frontError'
+import { purgeLegacyToken } from './utils/auth-hint'
+
+// 旧版本把令牌存在 localStorage：现在只用 HttpOnly Cookie，启动时把残留的旧令牌删掉
+purgeLegacyToken()
 
 // 安装前端全局错误捕获上报
 setupFrontErrorReporting()

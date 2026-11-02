@@ -29,8 +29,16 @@ func getAccessLogRepo() *repo.AccessLogRepository {
 // accessLogFile 全局访问日志文件（按天分割，logs/access-YYYY-MM-DD.log）
 var accessLogFile = helper.NewDailyLogFile("logs", "access")
 
+// persistAccessLog 落库 + 落文件，由请求日志队列的 worker 调用；返回落库错误。
+// 声明成变量是为了测试能替换掉真实数据库。
+var persistAccessLog = func(ctx context.Context, entry *model.AccessLog) error {
+	err := getAccessLogRepo().Create(ctx, entry)
+	accessLogFile.Write(formatAccessLine(entry))
+	return err
+}
+
 // AccessLogMiddleware 访问日志中间件：记录每个 API 请求（method/path/状态码/IP/耗时/请求体/响应体）
-// 异步写入，不阻塞请求；应在 JWT 之后（以便拿到用户 ID）。
+// 交给有界队列异步写入（见 request_log_queue.go），不阻塞请求；应在 JWT 之后（以便拿到用户 ID）。
 func AccessLogMiddleware() func(next http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -63,23 +71,22 @@ func AccessLogMiddleware() func(next http.Handler) http.Handler {
 			requestBody := redactBody(contentType, string(reqBody))
 			responseBody := redactBody(rec.Header().Get("Content-Type"), rec.body())
 
-			// 异步落库 + 落文件，使用独立 context 避免请求结束后被取消
-			go func() {
-				entry := &model.AccessLog{
-					UserID:       userID,
-					Method:       method,
-					Path:         r.URL.Path,
-					StatusCode:   rec.status,
-					IP:           ip,
-					UserAgent:    r.UserAgent(),
-					DurationMs:   duration,
-					Query:        truncate(query, 500),
-					RequestBody:  truncate(requestBody, 4096),
-					ResponseBody: truncate(responseBody, maxBodyLogSize),
-				}
-				_ = getAccessLogRepo().Create(context.Background(), entry)
-				accessLogFile.Write(formatAccessLine(entry))
-			}()
+			// 交给有界队列异步落库 + 落文件；worker 用独立 context，不受请求结束取消影响
+			entry := &model.AccessLog{
+				UserID:       userID,
+				Method:       method,
+				Path:         r.URL.Path,
+				StatusCode:   rec.status,
+				IP:           ip,
+				UserAgent:    r.UserAgent(),
+				DurationMs:   duration,
+				Query:        truncate(query, 500),
+				RequestBody:  truncate(requestBody, 4096),
+				ResponseBody: truncate(responseBody, maxBodyLogSize),
+			}
+			enqueueRequestLog(requestLogJob{kind: "访问日志", write: func(ctx context.Context) error {
+				return persistAccessLog(ctx, entry)
+			}})
 		})
 	}
 }

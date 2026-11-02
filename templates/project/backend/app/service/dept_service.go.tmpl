@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
 	"sort"
 	"strings"
 
@@ -87,7 +86,7 @@ func (s *AdminDeptService) GetEditDeptInfo(ctx context.Context, deptID uint64) (
 		return nil, err
 	}
 	if dept == nil {
-		return nil, errors.New("部门不存在")
+		return nil, helper.NewBizError("部门不存在")
 	}
 	return &dto.EditDeptInfoResponse{
 		DeptID:      dept.DeptID,
@@ -104,7 +103,7 @@ func (s *AdminDeptService) GetEditDeptInfo(ctx context.Context, deptID uint64) (
 // AddDept 新增部门
 func (s *AdminDeptService) AddDept(ctx context.Context, req *dto.AddDeptRequest) error {
 	if req.DeptName == "" {
-		return errors.New("部门名称不能为空")
+		return helper.NewBizError("部门名称不能为空")
 	}
 	deptCode := normalizeDeptCode(req.DeptCode)
 	if deptCode != nil {
@@ -113,7 +112,7 @@ func (s *AdminDeptService) AddDept(ctx context.Context, req *dto.AddDeptRequest)
 			return err
 		}
 		if exist != nil {
-			return errors.New("部门编码已存在")
+			return helper.NewBizError("部门编码已存在")
 		}
 	}
 	if req.ParentID > 0 {
@@ -122,7 +121,7 @@ func (s *AdminDeptService) AddDept(ctx context.Context, req *dto.AddDeptRequest)
 			return err
 		}
 		if parent == nil {
-			return errors.New("父部门不存在")
+			return helper.NewBizError("父部门不存在")
 		}
 	}
 	deptSource := req.DeptSource
@@ -168,18 +167,18 @@ func (s *AdminDeptService) UpdateDept(ctx context.Context, req *dto.UpdateDeptRe
 		return err
 	}
 	if dept == nil {
-		return errors.New("部门不存在")
+		return helper.NewBizError("部门不存在")
 	}
 	if req.ParentID != 0 && req.ParentID != dept.ParentID {
 		if req.ParentID == req.DeptID {
-			return errors.New("不能将部门设置为自己的父部门")
+			return helper.NewBizError("不能将部门设置为自己的父部门")
 		}
 		parent, err := s.deptRepo.FindByDeptID(ctx, req.ParentID)
 		if err != nil {
 			return err
 		}
 		if parent == nil {
-			return errors.New("父部门不存在")
+			return helper.NewBizError("父部门不存在")
 		}
 	}
 	return s.deptRepo.UpdateByID(ctx, req.DeptID, map[string]interface{}{
@@ -197,7 +196,7 @@ func (s *AdminDeptService) UpdateDeptStatus(ctx context.Context, deptID uint64, 
 		return err
 	}
 	if dept == nil {
-		return errors.New("部门不存在")
+		return helper.NewBizError("部门不存在")
 	}
 	if status == 0 {
 		userCount, err := s.userDeptRepo.CountActiveByDeptID(ctx, deptID)
@@ -205,7 +204,7 @@ func (s *AdminDeptService) UpdateDeptStatus(ctx context.Context, deptID uint64, 
 			return err
 		}
 		if userCount > 0 {
-			return errors.New("部门内有员工，无法禁用部门")
+			return helper.NewBizError("部门内有员工，无法禁用部门")
 		}
 	}
 	return s.deptRepo.UpdateByID(ctx, deptID, map[string]interface{}{"status": status})
@@ -224,14 +223,14 @@ func (s *AdminDeptService) deleteDept(ctx context.Context, deptID uint64) error 
 		return err
 	}
 	if dept == nil {
-		return errors.New("部门不存在")
+		return helper.NewBizError("部门不存在")
 	}
 	userCount, err := s.userDeptRepo.CountActiveByDeptID(ctx, deptID)
 	if err != nil {
 		return err
 	}
 	if userCount > 0 {
-		return errors.New("部门内有员工，无法删除部门")
+		return helper.NewBizError("部门内有员工，无法删除部门")
 	}
 	children, err := s.deptRepo.FindByParentID(ctx, deptID)
 	if err != nil {
@@ -239,7 +238,7 @@ func (s *AdminDeptService) deleteDept(ctx context.Context, deptID uint64) error 
 	}
 	for _, c := range children {
 		if c.Status == 1 {
-			return errors.New("部门下有子部门，无法删除部门")
+			return helper.NewBizError("部门下有子部门，无法删除部门")
 		}
 	}
 	return s.deptRepo.UpdateByID(ctx, deptID, map[string]interface{}{"status": 0})
@@ -278,7 +277,7 @@ func (s *AdminDeptService) GetDeptUserList(ctx context.Context, deptID uint64, p
 		return nil, err
 	}
 	if dept == nil {
-		return nil, errors.New("部门不存在")
+		return nil, helper.NewBizError("部门不存在")
 	}
 	userDepts, total, err := s.userDeptRepo.ListByDeptID(ctx, deptID, page, pageSize)
 	if err != nil {
@@ -326,7 +325,7 @@ func (s *AdminDeptService) GetDeptUserOptions(ctx context.Context, deptID uint64
 		return nil, err
 	}
 	if dept == nil {
-		return nil, errors.New("部门不存在")
+		return nil, helper.NewBizError("部门不存在")
 	}
 	userDepts, total, err := s.userDeptRepo.ListByDeptID(ctx, deptID, page, pageSize)
 	if err != nil {
@@ -365,10 +364,10 @@ func (s *AdminDeptService) addDeptUser(ctx context.Context, req *dto.AddDeptUser
 		return err
 	}
 	if dept == nil {
-		return errors.New("部门不存在")
+		return helper.NewBizError("部门不存在")
 	}
 	if dept.Status == 0 {
-		return errors.New("部门已禁用，无法添加员工")
+		return helper.NewBizError("部门已禁用，无法添加员工")
 	}
 	if req.IsManager == 1 {
 		manager, err := s.userDeptRepo.FindManagerByDeptID(ctx, req.DeptID)
@@ -376,10 +375,10 @@ func (s *AdminDeptService) addDeptUser(ctx context.Context, req *dto.AddDeptUser
 			return err
 		}
 		if manager != nil {
-			return errors.New("该部门已有leader，一个部门只能有一个leader")
+			return helper.NewBizError("该部门已有leader，一个部门只能有一个leader")
 		}
 		if len(req.UserIDs) > 1 {
-			return errors.New("设置部门管理员时，只能选择一个用户")
+			return helper.NewBizError("设置部门管理员时，只能选择一个用户")
 		}
 	}
 	// 验证用户存在
@@ -389,7 +388,7 @@ func (s *AdminDeptService) addDeptUser(ctx context.Context, req *dto.AddDeptUser
 			return err
 		}
 		if u == nil {
-			return errors.New("用户不存在")
+			return helper.NewBizError("用户不存在")
 		}
 	}
 	// 批量创建（跳过已存在关联）
@@ -423,7 +422,7 @@ func (s *AdminDeptService) UpdateDeptUser(ctx context.Context, req *dto.UpdateDe
 		return err
 	}
 	if member == nil {
-		return errors.New("关联记录不存在")
+		return helper.NewBizError("关联记录不存在")
 	}
 	return s.withDeptMembersTx(ctx, member.DeptID, func(scoped *AdminDeptService) error {
 		return scoped.updateDeptUser(ctx, req)
@@ -436,10 +435,10 @@ func (s *AdminDeptService) updateDeptUser(ctx context.Context, req *dto.UpdateDe
 		return err
 	}
 	if userDept == nil {
-		return errors.New("关联记录不存在")
+		return helper.NewBizError("关联记录不存在")
 	}
 	if req.Status == 0 && userDept.IsManager == 1 {
-		return errors.New("不能禁用部门leader，请先取消leader身份")
+		return helper.NewBizError("不能禁用部门leader，请先取消leader身份")
 	}
 	if req.IsPrimary == 1 && userDept.IsPrimary == 0 {
 		primary, err := s.userDeptRepo.FindPrimaryByUserID(ctx, userDept.UserID)
@@ -447,7 +446,7 @@ func (s *AdminDeptService) updateDeptUser(ctx context.Context, req *dto.UpdateDe
 			return err
 		}
 		if primary != nil && primary.ID != req.ID {
-			return errors.New("该用户已有主要部门，一个用户只能有一个主要部门")
+			return helper.NewBizError("该用户已有主要部门，一个用户只能有一个主要部门")
 		}
 	}
 	if req.IsManager == 1 && userDept.IsManager == 0 {
@@ -456,7 +455,7 @@ func (s *AdminDeptService) updateDeptUser(ctx context.Context, req *dto.UpdateDe
 			return err
 		}
 		if manager != nil && manager.ID != req.ID {
-			return errors.New("该部门已有leader，一个部门只能有一个leader")
+			return helper.NewBizError("该部门已有leader，一个部门只能有一个leader")
 		}
 	}
 	return s.userDeptRepo.UpdateByID(ctx, req.ID, map[string]interface{}{
@@ -473,7 +472,7 @@ func (s *AdminDeptService) RemoveDeptUser(ctx context.Context, req *dto.RemoveDe
 		return err
 	}
 	if member == nil {
-		return errors.New("关联记录不存在")
+		return helper.NewBizError("关联记录不存在")
 	}
 	return s.withDeptMembersTx(ctx, member.DeptID, func(scoped *AdminDeptService) error {
 		return scoped.removeDeptUser(ctx, req)
@@ -486,7 +485,7 @@ func (s *AdminDeptService) removeDeptUser(ctx context.Context, req *dto.RemoveDe
 		return err
 	}
 	if userDept == nil {
-		return errors.New("关联记录不存在")
+		return helper.NewBizError("关联记录不存在")
 	}
 	return s.userDeptRepo.Delete(ctx, userDept)
 }
@@ -505,7 +504,7 @@ func (s *AdminDeptService) withDeptMembersTx(ctx context.Context, deptID uint64,
 			return err
 		}
 		if dept == nil {
-			return errors.New("部门不存在")
+			return helper.NewBizError("部门不存在")
 		}
 		scoped := *s
 		scoped.deptRepo = tx.Dept()
@@ -521,7 +520,7 @@ func (s *AdminDeptService) batchUpdateDeptUser(ctx context.Context, req *dto.Bat
 		return err
 	}
 	if dept == nil {
-		return errors.New("部门不存在")
+		return helper.NewBizError("部门不存在")
 	}
 	existing, err := s.userDeptRepo.FindByDeptID(ctx, req.DeptID)
 	if err != nil {
@@ -546,7 +545,7 @@ func (s *AdminDeptService) batchUpdateDeptUser(ctx context.Context, req *dto.Bat
 			return err
 		}
 		if user == nil {
-			return errors.New("用户不存在")
+			return helper.NewBizError("用户不存在")
 		}
 	}
 	// 删除：已存在但不在提交列表

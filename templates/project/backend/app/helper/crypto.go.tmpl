@@ -15,7 +15,6 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
-	"errors"
 	"strings"
 
 	"golang.org/x/crypto/bcrypt"
@@ -39,7 +38,7 @@ const MaxPasswordBytes = 72
 
 // ErrPasswordTooLong 密码超过 bcrypt 的 72 字节上限。
 // 注意是**字节**：一个中文字符在 UTF-8 下占 3 字节，24 个汉字就到顶了。
-var ErrPasswordTooLong = errors.New("密码长度不能超过 72 字节（一个汉字算 3 字节）")
+var ErrPasswordTooLong = NewBizError("密码长度不能超过 72 字节（一个汉字算 3 字节）")
 
 // HashPassword 生成密码的 bcrypt 散列。返回值可直接写入 login_credential，
 // 对应的 salt 列写空串。

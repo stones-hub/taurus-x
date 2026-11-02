@@ -1,0 +1,357 @@
+package middleware
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// 访问日志与操作日志的异步写入队列。
+//
+// 以前每个请求起一个 go func 写库：数据库一慢，协程和它们攥着的请求/响应体就无上限地堆积，
+// 写失败也没有任何输出，进程退出时还没写完的日志直接丢掉。现在改成：
+//   - 一个容量有限的队列 + 固定数量的写入 worker，协程数和内存占用都有上限；
+//   - 队列满（或已关闭）时直接丢弃并计数，请求绝不等日志；丢弃与写库失败都限频打日志
+//     （每分钟最多一条汇总），不会因为日志出问题把服务日志刷爆；
+//   - 优雅退出时在超时时间内把队列写完；超时后取消在写的写入、不再开始新写入
+//     （见 logQueue.shutdown 与 app/helper/lifecycle 的分阶段退出）。
+//
+// 配置（config/autoload/http/http.yaml 的 http.request_log）：
+//   - queue_capacity：队列容量，默认 1000。每条最多带约 84KB 请求/响应体，
+//     最坏情况的内存占用约为 容量 × 84KB（默认约 84MB）；
+//   - workers：写入 worker 数，默认 2；
+//   - drain_timeout_seconds：退出时「日志排空」阶段的预算，默认 5 秒，上限 8 秒。这个阶段独立计时，
+//     不会被前面 HTTP 关闭阶段占用；它的真实上限是预算 + 0.5 秒（等 worker 响应取消）。
+const (
+	requestLogCapacityKey = "http.request_log.queue_capacity"
+	requestLogWorkersKey  = "http.request_log.workers"
+	requestLogDrainKey    = "http.request_log.drain_timeout_seconds"
+
+	defaultRequestLogCapacity     = 1000
+	defaultRequestLogWorkers      = 2
+	defaultRequestLogDrainSeconds = 5
+
+	maxRequestLogCapacity     = 100000
+	maxRequestLogWorkers      = 32
+	maxRequestLogDrainSeconds = 8
+
+	// requestLogWriteTimeout 单条日志写库的超时：库卡住时 worker 不会被一条日志永久占住。
+	requestLogWriteTimeout = 3 * time.Second
+	// requestLogWarnInterval 丢弃 / 写失败告警的最小间隔。
+	requestLogWarnInterval = time.Minute
+)
+
+// RequestLogQueueConfig 请求日志队列配置。
+type RequestLogQueueConfig struct {
+	Capacity     int
+	Workers      int
+	DrainTimeout time.Duration
+}
+
+// ResolveRequestLogQueueConfig 解析队列配置：未配置取默认值；非整数、<=0 或超过上限返回 error，
+// 由启动流程让服务启动失败（与后台限流配置的处理一致，配错了要在启动时就发现）。
+func ResolveRequestLogQueueConfig(getString func(string) string) (RequestLogQueueConfig, error) {
+	capacity, err := parseBoundedConfigInt(getString, requestLogCapacityKey, defaultRequestLogCapacity, maxRequestLogCapacity)
+	if err != nil {
+		return RequestLogQueueConfig{}, err
+	}
+	workers, err := parseBoundedConfigInt(getString, requestLogWorkersKey, defaultRequestLogWorkers, maxRequestLogWorkers)
+	if err != nil {
+		return RequestLogQueueConfig{}, err
+	}
+	drain, err := parseBoundedConfigInt(getString, requestLogDrainKey, defaultRequestLogDrainSeconds, maxRequestLogDrainSeconds)
+	if err != nil {
+		return RequestLogQueueConfig{}, err
+	}
+	return RequestLogQueueConfig{Capacity: capacity, Workers: workers, DrainTimeout: time.Duration(drain) * time.Second}, nil
+}
+
+// parseBoundedConfigInt 解析 [1, max] 范围内的整数配置项；空值取 def。
+func parseBoundedConfigInt(getString func(string) string, key string, def, max int) (int, error) {
+	raw := strings.TrimSpace(getString(key))
+	if raw == "" {
+		return def, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("配置 %s 不是整数: %q", key, raw)
+	}
+	if v < 1 || v > max {
+		return 0, fmt.Errorf("配置 %s=%d 超出范围（1~%d）", key, v, max)
+	}
+	return v, nil
+}
+
+// requestLogJob 一条待写入的日志：kind 只用于告警文案，write 负责落库与落文件。
+type requestLogJob struct {
+	kind  string
+	write func(ctx context.Context) error
+}
+
+// throttle 限频计数：事件照常累计，距上次输出不足 interval 时不输出。
+type throttle struct {
+	mu       sync.Mutex
+	interval time.Duration
+	last     time.Time
+	pending  uint64
+}
+
+// hit 记一次事件。距上次输出已满 interval（或从未输出）时返回本窗口累计次数与 true，并清零。
+func (t *throttle) hit(now time.Time) (uint64, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.pending++
+	if !t.last.IsZero() && now.Sub(t.last) < t.interval {
+		return 0, false
+	}
+	n := t.pending
+	t.pending, t.last = 0, now
+	return n, true
+}
+
+// flush 取出还没输出过的累计次数并清零（退出时补一条汇总）。
+func (t *throttle) flush() uint64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	n := t.pending
+	t.pending = 0
+	return n
+}
+
+// logQueue 有界队列 + 固定 worker。
+type logQueue struct {
+	jobs         chan requestLogJob
+	writeTimeout time.Duration
+	// stopGrace 排空超时、取消在写的写入后，再等 worker 退出的最长时间。
+	stopGrace time.Duration
+	logf      func(format string, args ...any)
+
+	// ctx 是所有写入的父 context：排空超时时 cancel，在写的写入收到取消，
+	// worker 也不再开始新的写入（剩下的直接计为放弃）。
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	// mu 保护 closed 与 close(jobs)：入队持读锁，关闭持写锁，避免向已关闭的 channel 发送。
+	mu     sync.RWMutex
+	closed bool
+	// done 在全部 worker 退出后关闭（构造时由一个固定的等待协程负责，shutdown 多次调用都复用它）。
+	done    chan struct{}
+	running atomic.Int32
+
+	dropped   atomic.Uint64
+	failed    atomic.Uint64
+	abandoned atomic.Uint64
+	dropWarn  throttle
+	failWarn  throttle
+}
+
+// requestLogStopGrace 见 logQueue.stopGrace。退出阶段的真实上限是 drain 预算 + 这段时间。
+const requestLogStopGrace = 500 * time.Millisecond
+
+// liveRequestLogWorkers 进程内仍在运行的日志 worker 数（所有队列合计），用于发现 worker 泄漏。
+var liveRequestLogWorkers atomic.Int64
+
+// newLogQueue 创建队列并启动 workers 个写入 worker。
+func newLogQueue(capacity, workers int, logf func(format string, args ...any)) *logQueue {
+	if logf == nil {
+		logf = log.Printf
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	q := &logQueue{
+		jobs:         make(chan requestLogJob, capacity),
+		writeTimeout: requestLogWriteTimeout,
+		stopGrace:    requestLogStopGrace,
+		logf:         logf,
+		ctx:          ctx,
+		cancel:       cancel,
+		done:         make(chan struct{}),
+		dropWarn:     throttle{interval: requestLogWarnInterval},
+		failWarn:     throttle{interval: requestLogWarnInterval},
+	}
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	q.running.Add(int32(workers))
+	liveRequestLogWorkers.Add(int64(workers))
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			defer liveRequestLogWorkers.Add(-1)
+			defer q.running.Add(-1)
+			q.run()
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(q.done)
+	}()
+	return q
+}
+
+// enqueue 非阻塞入队；队列满或已关闭时丢弃、计数并（限频）告警，返回 false。
+func (q *logQueue) enqueue(job requestLogJob) bool {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	if !q.closed {
+		select {
+		case q.jobs <- job:
+			return true
+		default:
+		}
+	}
+	total := q.dropped.Add(1)
+	if n, ok := q.dropWarn.hit(time.Now()); ok {
+		q.logf("请求日志队列已满或已关闭，丢弃 %d 条（本条为%s，累计丢弃 %d 条）；如持续出现请检查数据库写入或调大 %s\n",
+			n, job.kind, total, requestLogCapacityKey)
+	}
+	return false
+}
+
+// run worker 主循环。队列已被取消（排空超时）后不再开始任何写入，剩下的只计数不写。
+func (q *logQueue) run() {
+	for job := range q.jobs {
+		if q.ctx.Err() != nil {
+			q.abandoned.Add(1)
+			continue
+		}
+		q.runJob(job)
+	}
+}
+
+// runJob 写一条日志。panic 也按写失败处理，不能让 worker 少一个。
+func (q *logQueue) runJob(job requestLogJob) {
+	ctx, cancel := context.WithTimeout(q.ctx, q.writeTimeout)
+	defer cancel()
+	var err error
+	func() {
+		defer func() {
+			if p := recover(); p != nil {
+				err = fmt.Errorf("panic: %v", p)
+			}
+		}()
+		err = job.write(ctx)
+	}()
+	if err == nil {
+		return
+	}
+	total := q.failed.Add(1)
+	if n, ok := q.failWarn.hit(time.Now()); ok {
+		q.logf("%s写入失败 %d 条（累计 %d 条），最近一次错误: %v\n", job.kind, n, total, err)
+	}
+}
+
+// shutdown 停止接收新日志（之后的入队一律丢弃计数），并在 ctx 到期前等 worker 把队列写完。多次调用安全。
+//
+// ctx 到期仍没写完时：
+//  1. 取消队列级 context —— 正在写的写入收到取消，worker 不再开始新的写入，剩余日志计为放弃；
+//  2. 再最多等 stopGrace 让 worker 退出。写入回调如果不理会 ctx（Go 无法强行终止协程），
+//     worker 会在这之后继续运行，可能在数据库关闭后才结束并报一次写失败。这种情况返回的
+//     error 会写明仍在运行的 worker 数，不会无限等待。
+//
+// 返回 nil 表示全部 worker 已退出、队列里的日志都处理完了。
+func (q *logQueue) shutdown(ctx context.Context) error {
+	q.mu.Lock()
+	if !q.closed {
+		q.closed = true
+		close(q.jobs)
+	}
+	q.mu.Unlock()
+
+	var err error
+	select {
+	case <-q.done:
+		// 已经写完（含重复调用）：先非阻塞判断，不让一个已过期的 ctx 在 select 里随机胜出、误报超时
+	default:
+		select {
+		case <-q.done:
+		case <-ctx.Done():
+			err = q.cancelAndWait()
+		}
+	}
+	q.cancel()
+	if n := q.dropWarn.flush(); n > 0 {
+		q.logf("请求日志队列：上次告警后又丢弃 %d 条（累计 %d 条）\n", n, q.dropped.Load())
+	}
+	if n := q.failWarn.flush(); n > 0 {
+		q.logf("请求日志：上次告警后又有 %d 条写入失败（累计 %d 条）\n", n, q.failed.Load())
+	}
+	return err
+}
+
+// cancelAndWait 排空期限已到：取消队列 ctx，再最多等 stopGrace 让 worker 退出。
+//
+// 期限到达和写完可能同时发生：取消之前已经写完、或者取消时没有丢下任何日志
+// （没有放弃的、也没有被取消打断的写入）时，按「已写完」返回 nil，不误报超时。
+func (q *logQueue) cancelAndWait() error {
+	select {
+	case <-q.done:
+		return nil
+	default:
+	}
+	failedBefore := q.failed.Load()
+	q.cancel()
+	select {
+	case <-q.done:
+		if q.abandoned.Load() == 0 && q.failed.Load() == failedBefore {
+			return nil
+		}
+		return fmt.Errorf("请求日志队列未在超时前写完：已取消在写的写入，放弃 %d 条未写入的日志", q.abandoned.Load())
+	case <-time.After(q.stopGrace):
+		return fmt.Errorf("请求日志队列未在超时前写完：已取消写入，但仍有 %d 个 worker 的写入没有响应取消（其后的日志不再写入）；"+
+			"这些写入会在后台继续，可能在资源关闭后才结束", q.running.Load())
+	}
+}
+
+// requestLogs 进程级的请求日志队列，由 StartRequestLogQueue 在启动时建好。
+// requestLogsMu 让「懒启动」和「StartRequestLogQueue」互斥：任何时刻只会创建并登记一个队列，
+// 不会出现建好了却没人登记、worker 永远不退出的队列。
+var (
+	requestLogs   atomic.Pointer[logQueue]
+	requestLogsMu sync.Mutex
+)
+
+// StartRequestLogQueue 按配置建好请求日志队列并启动 worker，返回退出时调用的停止函数：
+// 停止函数用调用方给的 ctx 作为排空期限（见 logQueue.shutdown），可重复调用。
+//
+// 此前若已经懒启动过一个队列（Start 之前就有请求进来），先把它关掉并在 cfg.DrainTimeout 内
+// 写完它已收下的日志，它的 worker 随之退出，不会泄漏。
+func StartRequestLogQueue(cfg RequestLogQueueConfig) (stop func(ctx context.Context) error) {
+	requestLogsMu.Lock()
+	q := newLogQueue(cfg.Capacity, cfg.Workers, nil)
+	old := requestLogs.Swap(q)
+	requestLogsMu.Unlock()
+	if old != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.DrainTimeout)
+		if err := old.shutdown(ctx); err != nil {
+			log.Printf("关闭懒启动的请求日志队列: %v\n", err)
+		}
+		cancel()
+	}
+	return q.shutdown
+}
+
+// currentRequestLogQueue 返回当前队列；启动流程没建队列（没调用 StartRequestLogQueue）时
+// 按默认配置懒建一个并告警：日志照常写，但这个队列不会在退出时被写完 —— 「没接上」必须能被看见。
+func currentRequestLogQueue() *logQueue {
+	if q := requestLogs.Load(); q != nil {
+		return q
+	}
+	requestLogsMu.Lock()
+	defer requestLogsMu.Unlock()
+	if q := requestLogs.Load(); q != nil {
+		return q
+	}
+	log.Printf("请求日志队列未初始化（没有调用 StartRequestLogQueue），按默认配置启动；退出时不会等待队列写完\n")
+	q := newLogQueue(defaultRequestLogCapacity, defaultRequestLogWorkers, nil)
+	requestLogs.Store(q)
+	return q
+}
+
+// enqueueRequestLog 把一条日志交给队列，从不阻塞请求。
+func enqueueRequestLog(job requestLogJob) bool {
+	return currentRequestLogQueue().enqueue(job)
+}

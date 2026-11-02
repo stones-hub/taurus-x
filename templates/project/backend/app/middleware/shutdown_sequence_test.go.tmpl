@@ -1,0 +1,154 @@
+package middleware
+
+import (
+	"context"
+	"net"
+	"net/http"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stones-hub/taurus-pro-http/pkg/httpx"
+
+	"{{ .Module }}/app/helper/lifecycle"
+	"{{ .Module }}/app/model"
+)
+
+// TestGracefulShutdown_SlowHTTPStillDrainsLogsBeforeClosingResources 运行层面验证退出顺序与预算：
+// 真实 http.Server + 访问日志中间件 + 真实日志队列 + 模拟的「数据库」。
+//
+//   - 一个慢请求让 HTTP 优雅关闭超时（HTTP 阶段用光自己的预算）；
+//   - 此前已入队的日志在独立的排空预算内全部写完，而且都写在「数据库关闭」之前；
+//   - 资源关闭（模拟关 DB）照常执行，排在排空之后；
+//   - 慢请求在 HTTP 超时后才结束，它产生的日志因为队列已关闭被丢弃计数，不会在 DB 关闭后写入。
+func TestGracefulShutdown_SlowHTTPStillDrainsLogsBeforeClosingResources(t *testing.T) {
+	var (
+		dbClosed       atomic.Bool
+		written        atomic.Int64
+		writesAfterDB  atomic.Int64
+		order          []string
+		orderMu        sync.Mutex
+		slowStarted    = make(chan struct{})
+		releaseSlow    = make(chan struct{})
+		slowFinished   = make(chan struct{})
+		previousAccess = persistAccessLog
+	)
+	mark := func(e string) {
+		orderMu.Lock()
+		defer orderMu.Unlock()
+		order = append(order, e)
+	}
+	persistAccessLog = func(ctx context.Context, _ *model.AccessLog) error {
+		select {
+		case <-time.After(10 * time.Millisecond): // 每条写库 10ms，制造积压
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if dbClosed.Load() {
+			writesAfterDB.Add(1)
+		}
+		written.Add(1)
+		return nil
+	}
+	t.Cleanup(func() { persistAccessLog = previousAccess })
+	q := newLogQueue(100, 1, (&recordingLogf{}).logf)
+	useRequestLogQueue(t, q)
+
+	mux := http.NewServeMux()
+	mux.Handle("/admin/fast", AccessLogMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		httpx.SendResponse(w, http.StatusOK, "ok", nil)
+	})))
+	mux.Handle("/admin/slow", AccessLogMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(slowStarted)
+		<-releaseSlow
+		httpx.SendResponse(w, http.StatusOK, "slow", nil)
+	})))
+	// 慢 handler 在 Serve 的连接协程里跑完后才会写日志，用一层包装感知它何时真正结束
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mux.ServeHTTP(w, r)
+		if r.URL.Path == "/admin/slow" {
+			close(slowFinished)
+		}
+	})}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Serve(listener) }()
+	base := "http://" + listener.Addr().String()
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	const fast = 30
+	for i := 0; i < fast; i++ {
+		resp, err := client.Get(base + "/admin/fast")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+	}
+	go func() {
+		if resp, err := client.Get(base + "/admin/slow"); err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	<-slowStarted
+
+	budget := lifecycle.Budget{HTTP: 200 * time.Millisecond, DrainLogs: 3 * time.Second, Cleanup: time.Second}
+	start := time.Now()
+	err = lifecycle.Plan{
+		Budget: budget,
+		StopHTTP: func(ctx context.Context) error {
+			mark("http")
+			return srv.Shutdown(ctx)
+		},
+		ForceCloseHTTP: func() error { mark("force-close"); return srv.Close() },
+		DrainLogs: func(ctx context.Context) error {
+			mark("drain")
+			return q.shutdown(ctx)
+		},
+		Cleanups: []func(){func() { mark("close-db"); dbClosed.Store(true) }},
+		Logf:     func(string, ...any) {},
+	}.Run()
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("慢请求应让 HTTP 阶段超时并在返回值里体现")
+	}
+	orderMu.Lock()
+	got := append([]string(nil), order...)
+	orderMu.Unlock()
+	want := []string{"http", "force-close", "drain", "close-db"}
+	if len(got) != len(want) {
+		t.Fatalf("退出顺序 %v，期望 %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("退出顺序 %v，期望 %v", got, want)
+		}
+	}
+	if written.Load() != fast {
+		t.Fatalf("退出前收下的 %d 条日志应全部写完，实际 %d", fast, written.Load())
+	}
+	if elapsed > budget.Total() {
+		t.Fatalf("退出耗时 %v 超过预算之和 %v", elapsed, budget.Total())
+	}
+
+	// HTTP 超时之后慢请求才结束：它的日志只能被丢弃，不能在 DB 关闭后写入
+	close(releaseSlow)
+	select {
+	case <-slowFinished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("慢请求没有结束")
+	}
+	deadline := time.Now().Add(time.Second)
+	for q.dropped.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if q.dropped.Load() != 1 {
+		t.Fatalf("HTTP 超时后才结束的请求，其日志应被丢弃计数 1 条，实际 %d", q.dropped.Load())
+	}
+	time.Sleep(50 * time.Millisecond)
+	if writesAfterDB.Load() != 0 || written.Load() != fast {
+		t.Fatalf("DB 关闭后仍有写入: after=%d written=%d", writesAfterDB.Load(), written.Load())
+	}
+}

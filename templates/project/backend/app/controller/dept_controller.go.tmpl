@@ -27,7 +27,7 @@ func (c *DeptController) GetDeptList(w http.ResponseWriter, r *http.Request) {
 	req.Normalize()
 	resp, err := c.DeptService.GetDeptList(r.Context(), req.PageNo, req.PageSize, req.DeptName, req.Status)
 	if err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, resp)
@@ -45,7 +45,7 @@ func (c *DeptController) GetEditDeptInfo(w http.ResponseWriter, r *http.Request)
 	}
 	resp, err := c.DeptService.GetEditDeptInfo(r.Context(), req.DeptID)
 	if err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, resp)
@@ -57,7 +57,7 @@ func (c *DeptController) GetAllDepts(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	resp, err := c.DeptService.GetAllDepts(r.Context(), req.ExcludeDeptID)
 	if err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, resp)
@@ -70,7 +70,7 @@ func (c *DeptController) AddDept(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := c.DeptService.AddDept(r.Context(), &req); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -87,7 +87,7 @@ func (c *DeptController) UpdateDept(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := c.DeptService.UpdateDept(r.Context(), &req); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -100,7 +100,7 @@ func (c *DeptController) UpdateDeptStatus(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if err := c.DeptService.UpdateDeptStatus(r.Context(), req.DeptID, req.Status); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -117,7 +117,7 @@ func (c *DeptController) DeleteDept(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := c.DeptService.DeleteDept(r.Context(), req.DeptID); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -132,7 +132,7 @@ func (c *DeptController) GetDeptUserOptions(w http.ResponseWriter, r *http.Reque
 	req.Normalize()
 	resp, err := c.DeptService.GetDeptUserOptions(r.Context(), req.DeptID, req.PageNo, req.PageSize)
 	if err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, resp)
@@ -147,7 +147,7 @@ func (c *DeptController) GetDeptUserList(w http.ResponseWriter, r *http.Request)
 	req.Normalize()
 	resp, err := c.DeptService.GetDeptUserList(r.Context(), req.DeptID, req.PageNo, req.PageSize)
 	if err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, resp)
@@ -160,7 +160,7 @@ func (c *DeptController) AddDeptUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := c.DeptService.AddDeptUser(r.Context(), &req); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -173,7 +173,7 @@ func (c *DeptController) UpdateDeptUser(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err := c.DeptService.UpdateDeptUser(r.Context(), &req); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -186,7 +186,7 @@ func (c *DeptController) RemoveDeptUser(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err := c.DeptService.RemoveDeptUser(r.Context(), &req); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -199,7 +199,7 @@ func (c *DeptController) BatchUpdateDeptUser(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if err := c.DeptService.BatchUpdateDeptUser(r.Context(), &req); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})

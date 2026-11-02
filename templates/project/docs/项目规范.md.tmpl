@@ -50,6 +50,9 @@
   - `BindJSON(w, r, &req) bool`：解码 JSON body，失败自动回 `400 请求参数格式错误` 并返回 false（调用方 `if !BindJSON(w, r, &req) { return }`）。
   - `OK(w, data)`：成功响应（`body.code = 200`）。
   - `Fail(w, code, message)`：错误响应（`body.code = code`，`data = {"message": message}`；code 沿用 HTTP 状态码语义 400 参数错误 / 401 未授权 / 404 不存在 / 500 业务错误）。
+  - `FailByError(w, err)`：service 返回的错误统一走它。越权 `service.ErrForbidden` → 403；`helper.NewBizError` 构造的业务错误 → 500 + 原文案；
+    其余（数据库、Redis、文件系统等基础设施错误）→ 500 +「服务内部错误，请稍后重试」，原文只进服务端日志。
+    **禁止** `Fail(w, 500, err.Error())` 回显底层错误。
 - **响应契约完全不变**：`{code, message, data}`，错误时 `data={"message":"..."}`；前端 `http.ts` 按 `body.code` 是否在 2xx 判成功；`extractError` 取提示的优先级是 `data` 为非空字符串 → `data.message` → `message`。
 - **合法保留例外**（不套用 BindJSON/OK/Fail）：
   - `Content-Type` 分叉（JSON vs multipart/form）的分支里，JSON 分支可保留 `json.NewDecoder`（如 auth 登录/注册）。
@@ -251,8 +254,12 @@
 - 例外：429（限流）、413（请求体过大）等返回**真实 HTTP 状态码**，走 axios 的错误分支；此时 `message` 是公共库固定的英文（如 `Too Many Requests`），中文提示放在 `data` 里，所以响应拦截器同样要用 `extractError` 取提示。
 - `extractError` 需兼容 `string` 与 `object.message` 两种错误形态。
 
-### 12. CSRF
-- 双提交 cookie：`x-csrf-token`；非 GET 请求回传 header。
+### 12. 认证 Cookie 与 CSRF
+- 浏览器端只用 HttpOnly Cookie（`jwt_token`）承载 JWT：登录 / 刷新响应体和响应头都不含令牌，后端只从 Cookie 读令牌，
+  **不接受** `Authorization: Bearer` 或 `jwt_token` 请求头；前端不保存、不读取令牌，请求不发 `Authorization`。
+- 双提交 cookie：`x-csrf-token`（非 HttpOnly，与 JWT 同时下发、同样的有效期）；非 GET 请求回传同名 header。
+- 前端路由守卫用「CSRF Cookie 是否存在」作为不敏感的登录提示（`utils/auth-hint.ts`），最终以服务端 401 为准。
+- 脚本 / curl 调用接口同样走 Cookie：用 cookie jar 保存登录下发的 Cookie，写请求带 `x-csrf-token` 头，示例见 `docs/商用加固一期说明.md`。
 
 ---
 

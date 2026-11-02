@@ -12,6 +12,7 @@ import {
   apiUpdateProfile,
 } from '../../api/user'
 import { clearLocalAuth } from '../../store/session'
+import { reloginAfterPasswordChange } from '../../utils/relogin'
 import type { UserInfo } from '../../types'
 
 const router = useRouter()
@@ -91,11 +92,9 @@ async function onChangePassword() {
     passwordForm.old_password = ''
     passwordForm.new_password = ''
     passwordForm.confirm_password = ''
-    // 后端改密会让该用户的全部会话失效：当前令牌已不可用，直接清本地登录态回登录页，
+    // 后端改密会让该用户的全部会话失效：清本地登录态并带原因回登录页（提示「请重新登录」由登录页显示），
     // 不要等下一次请求才弹「会话已失效」。
-    ElMessage.success('密码已修改，请重新登录')
-    clearLocalAuth()
-    await router.replace('/login')
+    await reloginAfterPasswordChange({ clear: clearLocalAuth, navigate: (path) => router.replace(path) })
   } finally {
     passwordLoading.value = false
   }

@@ -10,13 +10,13 @@ import (
 	"{{ .Module }}/app/helper/store"
 )
 
-// TestGetJWTToken_Priority 提取顺序必须是 Cookie -> jwt_token 头 -> Bearer，
-// 且三者同时存在且值不同时结果唯一确定。
+// TestGetJWTToken_CookieOnly 令牌只从 HttpOnly Cookie 读取：jwt_token 请求头、
+// Authorization: Bearer 一律不认（项目的浏览器端认证约定是 Cookie-only）。
+// 三者同时存在且值不同时结果唯一确定为 Cookie 的值。
 //
-// 这条顺序是全局唯一的真源：登出要吊销的必须是「请求真正通过认证的那个 Token」，
-// 所以 controller 不能自己再写一套反向优先级的提取逻辑（旧实现 Authorization
-// 优先，导致同时带 Cookie 和 Bearer 时，认证用 Cookie、登出却吊销 Bearer）。
-func TestGetJWTToken_Priority(t *testing.T) {
+// 这是全局唯一的提取入口：登出要吊销的必须是「请求真正通过认证的那个 Token」，
+// 所以 controller 不能自己再写一套提取逻辑。
+func TestGetJWTToken_CookieOnly(t *testing.T) {
 	cases := []struct {
 		name   string
 		cookie string
@@ -25,11 +25,11 @@ func TestGetJWTToken_Priority(t *testing.T) {
 		want   string
 	}{
 		{"只有 Cookie", "cookie-token", "", "", "cookie-token"},
-		{"只有 jwt_token 头", "", "header-token", "", "header-token"},
-		{"只有 Bearer", "", "", "bearer-token", "bearer-token"},
+		{"只有 jwt_token 头", "", "header-token", "", ""},
+		{"只有 Bearer", "", "", "bearer-token", ""},
+		{"jwt_token 头与 Bearer 都有、没有 Cookie", "", "header-token", "bearer-token", ""},
 		{"Cookie 与 Bearer 不同时以 Cookie 为准", "cookie-token", "", "bearer-token", "cookie-token"},
 		{"Cookie 与头都有时以 Cookie 为准", "cookie-token", "header-token", "bearer-token", "cookie-token"},
-		{"无 Cookie 时头优先于 Bearer", "", "header-token", "bearer-token", "header-token"},
 		{"什么都没有", "", "", "", ""},
 	}
 	for _, tc := range cases {

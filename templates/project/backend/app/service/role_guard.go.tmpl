@@ -8,6 +8,7 @@ import (
 	"errors"
 
 	"{{ .Module }}/app/constants"
+	"{{ .Module }}/app/helper"
 	"{{ .Module }}/app/model"
 )
 
@@ -52,7 +53,7 @@ func IsProtectedRole(f RoleFact) bool {
 // 而权限判定是按 role_code 认超管的。
 func CheckNewRoleCode(roleCode string) error {
 	if reservedRoleCodes[roleCode] {
-		return errors.New("角色编码为系统保留值，不可使用")
+		return helper.NewBizError("角色编码为系统保留值，不可使用")
 	}
 	return nil
 }
@@ -61,10 +62,10 @@ func CheckNewRoleCode(roleCode string) error {
 // 系统角色一律拒绝：禁用 super_admin 等于把系统锁死。
 func CheckRoleMutable(role *model.AdminRole, action string) error {
 	if role == nil {
-		return errors.New("角色不存在")
+		return helper.NewBizError("角色不存在")
 	}
 	if IsProtectedRole(RoleFactOf(role)) {
-		return errors.New("系统角色不能" + action)
+		return helper.NewBizError("系统角色不能" + action)
 	}
 	return nil
 }
@@ -126,7 +127,7 @@ func CheckRoleStatusAssignable(current, next []RoleFact) error {
 	}
 	for _, f := range next {
 		if f.Status != constants.RoleStatusEnabled && !currentIDs[f.RoleID] {
-			return errors.New("角色已禁用，不能新增该角色")
+			return helper.NewBizError("角色已禁用，不能新增该角色")
 		}
 	}
 	return nil

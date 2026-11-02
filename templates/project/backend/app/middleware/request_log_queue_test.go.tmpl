@@ -1,0 +1,559 @@
+package middleware
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stones-hub/taurus-pro-http/pkg/httpx"
+
+	"{{ .Module }}/app/model"
+)
+
+// recordingLogf 收集队列打出的告警，供断言限频。
+type recordingLogf struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *recordingLogf) logf(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+}
+
+func (l *recordingLogf) count(substr string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, line := range l.lines {
+		if strings.Contains(line, substr) {
+			n++
+		}
+	}
+	return n
+}
+
+// useRequestLogQueue 把进程级队列换成 q，测试结束时关掉 q 并还原。
+func useRequestLogQueue(t *testing.T, q *logQueue) {
+	t.Helper()
+	trustedProxiesOnce.Do(func() { trustedProxiesList = nil })
+	previous := requestLogs.Swap(q)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = q.shutdown(ctx)
+		requestLogs.Store(previous)
+	})
+}
+
+// captureOperationLogs 把操作日志的落库换成收集到 channel。
+// 要在 useRequestLogQueue 之前调用：Cleanup 后进先出，先关队列（worker 全部退出）再还原变量。
+func captureOperationLogs(t *testing.T) chan *model.OperationLog {
+	t.Helper()
+	got := make(chan *model.OperationLog, 16)
+	previous := persistOperationLog
+	persistOperationLog = func(_ context.Context, entry *model.OperationLog) error {
+		got <- entry
+		return nil
+	}
+	t.Cleanup(func() { persistOperationLog = previous })
+	return got
+}
+
+func waitOperationLog(t *testing.T, got chan *model.OperationLog) *model.OperationLog {
+	t.Helper()
+	select {
+	case entry := <-got:
+		return entry
+	case <-time.After(2 * time.Second):
+		t.Fatal("操作日志没有被写入")
+		return nil
+	}
+}
+
+// TestOperationLog_ResultFollowsBusinessCode 操作日志的成败按 body.code 判断：
+// httpx 的业务失败是 HTTP 200 + code≠200，只看 HTTP 状态会把它们全记成「成功」。
+func TestOperationLog_ResultFollowsBusinessCode(t *testing.T) {
+	got := captureOperationLogs(t)
+	useRequestLogQueue(t, newLogQueue(8, 1, nil))
+	cases := []struct {
+		name    string
+		handler http.HandlerFunc
+		status  int
+		result  string
+	}{
+		{"业务成功", func(w http.ResponseWriter, _ *http.Request) {
+			httpx.SendResponse(w, http.StatusOK, map[string]string{"ok": "1"}, nil)
+		}, http.StatusOK, "成功"},
+		{"业务失败（HTTP 200 + code=500）", func(w http.ResponseWriter, _ *http.Request) {
+			httpx.SendResponse(w, http.StatusInternalServerError, map[string]string{"message": "名称重复"}, nil)
+		}, http.StatusOK, "失败"},
+		{"越权（HTTP 200 + code=403）", func(w http.ResponseWriter, _ *http.Request) {
+			httpx.SendResponse(w, http.StatusForbidden, map[string]string{"message": "无权限"}, nil)
+		}, http.StatusOK, "失败"},
+		{"真实 HTTP 错误状态（429）", func(w http.ResponseWriter, _ *http.Request) {
+			httpx.SendResponse(w, http.StatusTooManyRequests, "请求过于频繁", nil)
+		}, http.StatusTooManyRequests, "失败"},
+		{"非 JSON 响应回退到 HTTP 状态：200", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte("plain ok"))
+		}, http.StatusOK, "成功"},
+		{"非 JSON 响应回退到 HTTP 状态：500", func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}, http.StatusInternalServerError, "失败"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/admin/role/add", strings.NewReader(`{"name":"x"}`))
+			recorder := httptest.NewRecorder()
+			OperationLogMiddleware()(tc.handler).ServeHTTP(recorder, req)
+			entry := waitOperationLog(t, got)
+			if entry.Result != tc.result || entry.StatusCode != tc.status {
+				t.Fatalf("result=%s status=%d，期望 result=%s status=%d", entry.Result, entry.StatusCode, tc.result, tc.status)
+			}
+		})
+	}
+}
+
+// TestBusinessCode_PrefixOnly 业务 code 只从响应体前缀里流式取：code 在前、后面的大 data
+// 被截断成不完整 JSON 也能取到；前缀里没有 code 或不是 JSON 对象时返回 false。
+func TestBusinessCode_PrefixOnly(t *testing.T) {
+	big := `{"code":500,"message":"x","data":"` + strings.Repeat("a", 1<<20) + `"}`
+	if code, ok := businessCode([]byte(big)); !ok || code != 500 {
+		t.Fatalf("大响应应取到 code=500，实际 %d %v", code, ok)
+	}
+	late := `{"data":"` + strings.Repeat("a", businessCodePrefixBytes) + `","code":500}`
+	if _, ok := businessCode([]byte(late)); ok {
+		t.Fatal("code 不在前缀内时不应解析出来（只能读前缀）")
+	}
+	for _, body := range []string{"", "plain", "[1,2]", `{"message":"x"}`, `{"code":"abc"}`, `{"code":1.5}`} {
+		if code, ok := businessCode([]byte(body)); ok {
+			t.Fatalf("%q 不应解析出业务 code，实际 %d", body, code)
+		}
+	}
+	if code, ok := businessCode([]byte(`{"message":"m","code":401,"data":null}`)); !ok || code != 401 {
+		t.Fatalf("code 不在第一个字段时也应取到，实际 %d %v", code, ok)
+	}
+}
+
+// TestStatusRecorder_DoesNotBufferWholeLargeResponse 大响应只缓存前 maxBodyLogSize 字节，
+// 客户端照常收到完整响应，业务 code 照常判定。
+func TestStatusRecorder_DoesNotBufferWholeLargeResponse(t *testing.T) {
+	got := captureOperationLogs(t)
+	useRequestLogQueue(t, newLogQueue(8, 1, nil))
+	payload := strings.Repeat("b", 2<<20)
+	var buffered int
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		httpx.SendResponse(w, http.StatusInternalServerError, payload, nil)
+		buffered = w.(*statusRecorder).buf.Len()
+	})
+	recorder := httptest.NewRecorder()
+	OperationLogMiddleware()(handler).ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/admin/user/add", nil))
+	if buffered > maxBodyLogSize {
+		t.Fatalf("日志缓存了 %d 字节，超过上限 %d", buffered, maxBodyLogSize)
+	}
+	if recorder.Body.Len() <= 2<<20 {
+		t.Fatalf("客户端应收到完整响应，实际 %d 字节", recorder.Body.Len())
+	}
+	entry := waitOperationLog(t, got)
+	if entry.Result != "失败" || len(entry.ResponseBody) > maxBodyLogSize {
+		t.Fatalf("result=%s responseBody=%d 字节", entry.Result, len(entry.ResponseBody))
+	}
+}
+
+// TestLogQueue_DropsWhenFullWithoutBlocking 队列满时入队立即返回 false、丢弃计数增加，
+// 告警限频：一分钟内只打一条，其余累计到退出时的汇总里。
+func TestLogQueue_DropsWhenFullWithoutBlocking(t *testing.T) {
+	logs := &recordingLogf{}
+	release := make(chan struct{})
+	q := newLogQueue(1, 1, logs.logf)
+	blocking := requestLogJob{kind: "测试日志", write: func(context.Context) error { <-release; return nil }}
+	if !q.enqueue(blocking) {
+		t.Fatal("第一条应入队")
+	}
+	// 等 worker 取走第一条并卡住，第二条占满容量为 1 的队列
+	deadline := time.Now().Add(2 * time.Second)
+	for len(q.jobs) != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !q.enqueue(blocking) {
+		t.Fatal("第二条应占满队列")
+	}
+	start := time.Now()
+	for i := 0; i < 5; i++ {
+		if q.enqueue(blocking) {
+			t.Fatal("队列已满时不应入队")
+		}
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("队列满时入队阻塞了 %v", elapsed)
+	}
+	if q.dropped.Load() != 5 {
+		t.Fatalf("丢弃计数应为 5，实际 %d", q.dropped.Load())
+	}
+	if n := logs.count("请求日志队列已满"); n != 1 {
+		t.Fatalf("一分钟内只应告警一次，实际 %d 次", n)
+	}
+	close(release)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := q.shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if logs.count("又丢弃 4 条") != 1 {
+		t.Fatalf("退出时应补一条剩余丢弃的汇总，实际日志: %v", logs.lines)
+	}
+}
+
+// TestAccessLog_FullQueueDoesNotBlockRequest 队列满时请求照常完成，日志被丢弃计数。
+func TestAccessLog_FullQueueDoesNotBlockRequest(t *testing.T) {
+	release := make(chan struct{})
+	previous := persistAccessLog
+	persistAccessLog = func(context.Context, *model.AccessLog) error { <-release; return nil }
+	t.Cleanup(func() { persistAccessLog = previous })
+	q := newLogQueue(1, 1, (&recordingLogf{}).logf)
+	useRequestLogQueue(t, q)
+	// Cleanup 后进先出：先放行卡住的写入，再关队列，最后还原 persistAccessLog。
+	t.Cleanup(func() { close(release) })
+	handler := AccessLogMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		httpx.SendResponse(w, http.StatusOK, "ok", nil)
+	}))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 10; i++ {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/admin/user/list", nil))
+			if recorder.Code != http.StatusOK {
+				t.Errorf("请求应照常完成，实际 HTTP %d", recorder.Code)
+			}
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("日志队列满时请求被阻塞")
+	}
+	// 1 条被 worker 取走卡住、1 条在队列里，其余全部丢弃
+	if dropped := q.dropped.Load(); dropped < 8 {
+		t.Fatalf("丢弃计数应至少为 8，实际 %d", dropped)
+	}
+}
+
+// TestLogQueue_ShutdownDrainsQueue 退出时在超时内把队列里的日志全部写完。
+func TestLogQueue_ShutdownDrainsQueue(t *testing.T) {
+	var written atomic.Int64
+	q := newLogQueue(100, 2, (&recordingLogf{}).logf)
+	for i := 0; i < 50; i++ {
+		if !q.enqueue(requestLogJob{kind: "测试日志", write: func(context.Context) error {
+			time.Sleep(time.Millisecond)
+			written.Add(1)
+			return nil
+		}}) {
+			t.Fatal("队列未满时应入队")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := q.shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if written.Load() != 50 {
+		t.Fatalf("退出时应写完 50 条，实际 %d", written.Load())
+	}
+	if q.enqueue(requestLogJob{kind: "测试日志", write: func(context.Context) error { return nil }}) || q.dropped.Load() != 1 {
+		t.Fatal("关闭后的入队应被丢弃并计数")
+	}
+	if err := q.shutdown(ctx); err != nil {
+		t.Fatalf("重复关闭应安全: %v", err)
+	}
+}
+
+// TestLogQueue_ShutdownTimesOut 写库卡住时退出不能无限等待：超时返回错误。
+func TestLogQueue_ShutdownTimesOut(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	q := newLogQueue(10, 1, (&recordingLogf{}).logf)
+	for i := 0; i < 3; i++ {
+		q.enqueue(requestLogJob{kind: "测试日志", write: func(context.Context) error { <-release; return nil }})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if err := q.shutdown(ctx); err == nil {
+		t.Fatal("超时未写完应返回错误")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("超时后仍等待了 %v", elapsed)
+	}
+}
+
+// TestLogQueue_WriteFailuresAreLoggedAndThrottled 写库失败要记错误日志（含错误原因），
+// 但限频；worker 遇到 panic 也不能退出。
+func TestLogQueue_WriteFailuresAreLoggedAndThrottled(t *testing.T) {
+	logs := &recordingLogf{}
+	q := newLogQueue(10, 1, logs.logf)
+	var ok atomic.Int64
+	for i := 0; i < 4; i++ {
+		q.enqueue(requestLogJob{kind: "操作日志", write: func(context.Context) error { return errors.New("simulated db down") }})
+	}
+	q.enqueue(requestLogJob{kind: "操作日志", write: func(context.Context) error { panic("simulated panic") }})
+	q.enqueue(requestLogJob{kind: "操作日志", write: func(context.Context) error { ok.Add(1); return nil }})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := q.shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if q.failed.Load() != 5 || ok.Load() != 1 {
+		t.Fatalf("failed=%d ok=%d，期望 5 / 1", q.failed.Load(), ok.Load())
+	}
+	if logs.count("操作日志写入失败 1 条") != 1 || logs.count("simulated db down") != 1 {
+		t.Fatalf("第一次失败应立即记错误日志（含原因），其余限频，实际日志: %v", logs.lines)
+	}
+	if logs.count("又有 4 条写入失败") != 1 {
+		t.Fatalf("退出时应补一条剩余失败的汇总，实际日志: %v", logs.lines)
+	}
+}
+
+func TestResolveRequestLogQueueConfig(t *testing.T) {
+	values := map[string]string{}
+	get := func(key string) string { return values[key] }
+	cfg, err := ResolveRequestLogQueueConfig(get)
+	if err != nil || cfg.Capacity != defaultRequestLogCapacity || cfg.Workers != defaultRequestLogWorkers || cfg.DrainTimeout != defaultRequestLogDrainSeconds*time.Second {
+		t.Fatalf("未配置时应取默认值，实际 %+v %v", cfg, err)
+	}
+	values[requestLogCapacityKey], values[requestLogWorkersKey], values[requestLogDrainKey] = "50", "4", "3"
+	cfg, err = ResolveRequestLogQueueConfig(get)
+	if err != nil || cfg.Capacity != 50 || cfg.Workers != 4 || cfg.DrainTimeout != 3*time.Second {
+		t.Fatalf("应按配置生效，实际 %+v %v", cfg, err)
+	}
+	for key, bad := range map[string][]string{
+		requestLogCapacityKey: {"0", "-1", "abc", "100001"},
+		requestLogWorkersKey:  {"0", "33"},
+		requestLogDrainKey:    {"0", "9"},
+	} {
+		for _, v := range bad {
+			values = map[string]string{key: v}
+			if _, err := ResolveRequestLogQueueConfig(get); err == nil {
+				t.Fatalf("%s=%s 应拒绝", key, v)
+			}
+		}
+	}
+}
+
+// waitUntil 轮询 cond 直到为真或超时。
+func waitUntil(t *testing.T, timeout time.Duration, cond func() bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	return true
+}
+
+// TestLogQueue_DrainTimeoutCancelsInflightAndSkipsRest 排空超时后：在写的写入收到取消，
+// 剩余日志一条都不再开始写（计为放弃），worker 在返回前全部退出 —— 这是关闭 DB 之前的停止边界。
+func TestLogQueue_DrainTimeoutCancelsInflightAndSkipsRest(t *testing.T) {
+	var started, canceled atomic.Int64
+	q := newLogQueue(10, 1, (&recordingLogf{}).logf)
+	for i := 0; i < 5; i++ {
+		q.enqueue(requestLogJob{kind: "测试日志", write: func(ctx context.Context) error {
+			started.Add(1)
+			<-ctx.Done() // 模拟卡住但遵守 ctx 的写库
+			canceled.Add(1)
+			return ctx.Err()
+		}})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := q.shutdown(ctx)
+	if err == nil || !strings.Contains(err.Error(), "放弃 4 条") {
+		t.Fatalf("超时应返回错误并报告放弃的条数，实际 %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond+q.stopGrace {
+		t.Fatalf("超时后等待了 %v，超过 ctx + stopGrace", elapsed)
+	}
+	if started.Load() != 1 || canceled.Load() != 1 {
+		t.Fatalf("只应有 1 条开始写且被取消，实际 started=%d canceled=%d", started.Load(), canceled.Load())
+	}
+	if q.abandoned.Load() != 4 || q.running.Load() != 0 {
+		t.Fatalf("剩余 4 条应放弃、worker 全部退出，实际 abandoned=%d running=%d", q.abandoned.Load(), q.running.Load())
+	}
+	select {
+	case <-q.done:
+	default:
+		t.Fatal("shutdown 返回 nil 以外的结果时，遵守取消的 worker 也必须已经退出")
+	}
+}
+
+// TestLogQueue_WriteIgnoringCancelIsBoundedAndReported 写入回调不理会 ctx（Go 无法强杀）时，
+// shutdown 只多等 stopGrace 就返回，并在错误里写明仍有 worker 在跑；不会无限等待。
+// 它之后的日志不再写入；回调最终结束后 worker 正常退出。
+func TestLogQueue_WriteIgnoringCancelIsBoundedAndReported(t *testing.T) {
+	release := make(chan struct{})
+	var second atomic.Bool
+	q := newLogQueue(10, 1, (&recordingLogf{}).logf)
+	q.enqueue(requestLogJob{kind: "测试日志", write: func(context.Context) error { <-release; return nil }})
+	q.enqueue(requestLogJob{kind: "测试日志", write: func(context.Context) error { second.Store(true); return nil }})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := q.shutdown(ctx)
+	if err == nil || !strings.Contains(err.Error(), "1 个 worker") {
+		t.Fatalf("应报告仍在运行的 worker，实际 %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 30*time.Millisecond+q.stopGrace+200*time.Millisecond {
+		t.Fatalf("不理会取消的写入让 shutdown 等了 %v", elapsed)
+	}
+	close(release)
+	if !waitUntil(t, 2*time.Second, func() bool { return q.running.Load() == 0 }) {
+		t.Fatal("回调结束后 worker 应退出")
+	}
+	if second.Load() || q.abandoned.Load() != 1 {
+		t.Fatalf("取消之后的日志不应再写入，second=%v abandoned=%d", second.Load(), q.abandoned.Load())
+	}
+}
+
+// TestLogQueue_ConcurrentEnqueueAndRepeatedShutdown 并发入队与并发、重复关闭：不 panic、
+// 不向已关闭的 channel 发送；每条日志要么写入、要么丢弃计数；重复关闭安全且结果一致。
+func TestLogQueue_ConcurrentEnqueueAndRepeatedShutdown(t *testing.T) {
+	var written atomic.Int64
+	q := newLogQueue(64, 2, (&recordingLogf{}).logf)
+	job := requestLogJob{kind: "测试日志", write: func(context.Context) error { written.Add(1); return nil }}
+	const producers, perProducer = 16, 200
+	var accepted atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < producers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perProducer; j++ {
+				if q.enqueue(job) {
+					accepted.Add(1)
+				}
+			}
+		}()
+	}
+	time.Sleep(time.Millisecond)
+	errs := make(chan error, 3)
+	for i := 0; i < 3; i++ {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			errs <- q.shutdown(ctx)
+		}()
+	}
+	wg.Wait()
+	for i := 0; i < 3; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("并发关闭应全部成功: %v", err)
+		}
+	}
+	if total := accepted.Load() + int64(q.dropped.Load()); total != producers*perProducer {
+		t.Fatalf("入队 %d + 丢弃 %d ≠ 总数 %d", accepted.Load(), q.dropped.Load(), producers*perProducer)
+	}
+	if written.Load() != accepted.Load() || q.abandoned.Load() != 0 {
+		t.Fatalf("收下的 %d 条应全部写完，实际 written=%d abandoned=%d", accepted.Load(), written.Load(), q.abandoned.Load())
+	}
+	if err := q.shutdown(context.Background()); err != nil {
+		t.Fatalf("排空后再次关闭应返回 nil: %v", err)
+	}
+}
+
+// TestStartRequestLogQueue_StopIsRepeatable 启动流程拿到的停止函数可以重复调用。
+func TestStartRequestLogQueue_StopIsRepeatable(t *testing.T) {
+	previous := requestLogs.Load()
+	t.Cleanup(func() { requestLogs.Store(previous) })
+	requestLogs.Store(nil)
+	stop := StartRequestLogQueue(RequestLogQueueConfig{Capacity: 4, Workers: 1, DrainTimeout: time.Second})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := stop(ctx); err != nil {
+		t.Fatalf("重复 stop 应安全: %v", err)
+	}
+	if enqueueRequestLog(requestLogJob{kind: "测试日志", write: func(context.Context) error { return nil }}) {
+		t.Fatal("停止后入队应被丢弃")
+	}
+}
+
+// TestStartRequestLogQueue_ReplacesLazyQueueWithoutLeakingWorkers Start 之前已有请求触发懒启动、
+// 以及懒启动与 Start 并发时：只会有一个当前队列；被替换的懒启动队列先把收下的日志写完，
+// worker 全部退出，不泄漏。
+func TestStartRequestLogQueue_ReplacesLazyQueueWithoutLeakingWorkers(t *testing.T) {
+	previous := requestLogs.Load()
+	t.Cleanup(func() { requestLogs.Store(previous) })
+	for round := 0; round < 20; round++ {
+		requestLogs.Store(nil)
+		baseline := liveRequestLogWorkers.Load()
+		var written atomic.Int64
+		job := requestLogJob{kind: "测试日志", write: func(context.Context) error { written.Add(1); return nil }}
+		var accepted atomic.Int64
+		var wg sync.WaitGroup
+		for i := 0; i < 8; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := 0; j < 20; j++ {
+					if enqueueRequestLog(job) {
+						accepted.Add(1)
+					}
+				}
+			}()
+		}
+		stop := StartRequestLogQueue(RequestLogQueueConfig{Capacity: 1000, Workers: 2, DrainTimeout: 2 * time.Second})
+		wg.Wait()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := stop(ctx); err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		cancel()
+		if written.Load() != accepted.Load() {
+			t.Fatalf("round %d: 收下 %d 条，写入 %d 条（懒启动队列的日志丢了）", round, accepted.Load(), written.Load())
+		}
+		if !waitUntil(t, time.Second, func() bool { return liveRequestLogWorkers.Load() <= baseline }) {
+			t.Fatalf("round %d: worker 泄漏，仍有 %d 个在运行（基线 %d）", round, liveRequestLogWorkers.Load(), baseline)
+		}
+	}
+}
+
+// TestLogQueue_RepeatedStopWithExpiredCtxAfterDrainIsNotTimeout 已经写完的队列，用已过期的 ctx
+// 反复调用 shutdown（以及期限与完成同时到达的 cancelAndWait）都必须返回 nil，不能误报超时，
+// 也不能改动放弃 / 失败计数。
+func TestLogQueue_RepeatedStopWithExpiredCtxAfterDrainIsNotTimeout(t *testing.T) {
+	var written atomic.Int64
+	q := newLogQueue(8, 2, (&recordingLogf{}).logf)
+	for i := 0; i < 4; i++ {
+		q.enqueue(requestLogJob{kind: "测试日志", write: func(context.Context) error { written.Add(1); return nil }})
+	}
+	if err := q.shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+	for i := 0; i < 500; i++ {
+		if err := q.shutdown(expired); err != nil {
+			t.Fatalf("第 %d 次：已写完的队列用过期 ctx 停止被误报为超时: %v", i, err)
+		}
+	}
+	if err := q.cancelAndWait(); err != nil {
+		t.Fatalf("已写完时 cancelAndWait 不应报超时: %v", err)
+	}
+	if written.Load() != 4 || q.abandoned.Load() != 0 || q.failed.Load() != 0 {
+		t.Fatalf("written=%d abandoned=%d failed=%d，期望 4/0/0", written.Load(), q.abandoned.Load(), q.failed.Load())
+	}
+}

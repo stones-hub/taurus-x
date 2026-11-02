@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -135,7 +134,7 @@ func (s *LogService) GetOperationLogList(ctx context.Context, req dto.OperationL
 // 返回 error 供调用方兜底处理，避免「错误上报链路静默失败」。
 func (s *LogService) ReportFrontError(ctx context.Context, req *dto.FrontErrorReportRequest, userID uint64, ip, userAgent string) error {
 	if req == nil {
-		return errors.New("请求参数不能为空")
+		return helper.NewBizError("请求参数不能为空")
 	}
 	entry := &model.FrontErrorLog{
 		UserID:    userID,

@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/google/wire"
@@ -92,7 +91,7 @@ func (s *AdminUserService) GetUserInfo(ctx context.Context, userID uint64) (*dto
 		return nil, err
 	}
 	if user == nil {
-		return nil, errors.New("用户不存在")
+		return nil, helper.NewBizError("用户不存在")
 	}
 	return dto.ToUserInfo(user), nil
 }
@@ -100,7 +99,7 @@ func (s *AdminUserService) GetUserInfo(ctx context.Context, userID uint64) (*dto
 // AddUser 新增用户（账号密码），返回新用户 ID
 func (s *AdminUserService) AddUser(ctx context.Context, operatorID uint64, req *dto.AddUserRequest) (uint64, error) {
 	if req.Username == "" || req.Password == "" || req.Mobile == "" {
-		return 0, errors.New("用户名、密码、手机号不能为空")
+		return 0, helper.NewBizError("用户名、密码、手机号不能为空")
 	}
 	if err := helper.ValidatePasswordStrength(req.Password); err != nil {
 		return 0, err
@@ -110,21 +109,21 @@ func (s *AdminUserService) AddUser(ctx context.Context, operatorID uint64, req *
 		return 0, err
 	}
 	if !helper.ValidateMobile(req.Mobile) {
-		return 0, errors.New("手机号格式不正确")
+		return 0, helper.NewBizError("手机号格式不正确")
 	}
 	existing, err := s.userRepo.FindByUsername(ctx, req.Username)
 	if err != nil {
 		return 0, err
 	}
 	if existing != nil {
-		return 0, errors.New("用户名已存在")
+		return 0, helper.NewBizError("用户名已存在")
 	}
 	existing, err = s.userRepo.FindByMobile(ctx, req.Mobile)
 	if err != nil {
 		return 0, err
 	}
 	if existing != nil {
-		return 0, errors.New("手机号已被使用")
+		return 0, helper.NewBizError("手机号已被使用")
 	}
 
 	var birthday *time.Time
@@ -220,10 +219,10 @@ func (s *AdminUserService) AddUser(ctx context.Context, operatorID uint64, req *
 // guardUserWrite 加锁后当前读返回（g.Target）。
 func (s *AdminUserService) UpdateUser(ctx context.Context, operatorID uint64, req *dto.UpdateUserRequest) error {
 	if req == nil {
-		return errors.New("请求参数不能为空")
+		return helper.NewBizError("请求参数不能为空")
 	}
 	if req.UserID == 0 {
-		return errors.New("用户ID不能为空")
+		return helper.NewBizError("用户ID不能为空")
 	}
 	// 密码强度是纯校验，先挡掉，不占着事务
 	if req.Password != "" {
@@ -321,7 +320,7 @@ func userProfileUpdates(req *dto.UpdateUserRequest) map[string]interface{} {
 // 「库里已禁用、旧 Token 仍可用」的状态。
 func (s *AdminUserService) UpdateUserStatus(ctx context.Context, operatorID, userID uint64, status int) error {
 	if status != int(constants.UserStatusEnabled) && status != int(constants.UserStatusDisabled) && status != -1 {
-		return errors.New("状态值必须为0(禁用)、1(启用)或-1(删除)")
+		return helper.NewBizError("状态值必须为0(禁用)、1(启用)或-1(删除)")
 	}
 	return s.store.RunInTx(ctx, func(tx *repo.Tx) error {
 		// 不在这之前单独查一次用户：那条普通读会先钉死事务快照，

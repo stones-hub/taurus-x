@@ -1,0 +1,128 @@
+// Package lifecycle 进程优雅退出的分阶段编排。
+//
+// 退出分三个阶段，**各自独立计时**，前一阶段超时不会吃掉后一阶段的预算：
+//  1. HTTP：停止接收新请求并等在途请求结束（预算 http.shutdown_timeout）。超时后强制关闭
+//     监听与连接。注意 Go 不能终止正在跑的 handler 协程：超时只代表「不再等」，
+//     不代表所有请求都停了；这些 handler 之后写的日志会因为日志队列已关闭而被丢弃计数。
+//  2. 日志排空：把访问日志 / 操作日志队列里已收下的日志写完（预算 http.request_log.drain_timeout_seconds），
+//     超时则取消在写的写入、不再开始新写入（见 middleware 的 logQueue.shutdown）。
+//  3. 资源关闭：按注册顺序执行 cleanups（停后台任务、关 DB / Redis / 日志等，预算 CleanupTimeout）。
+//
+// 总退出上限 = 三个预算之和 + 日志 worker 响应取消的等待（0.5 秒）。部署时守护进程的停止等待
+// （Docker stop_grace_period、supervisor stopwaitsecs、launchd ExitTimeOut）必须大于这个值，
+// 否则进程会在清理途中被 SIGKILL。
+package lifecycle
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	// HTTPShutdownKey HTTP 阶段预算（秒）。
+	HTTPShutdownKey = "http.shutdown_timeout"
+	// DefaultHTTPShutdownSeconds / MaxHTTPShutdownSeconds HTTP 阶段默认与上限。
+	DefaultHTTPShutdownSeconds = 5
+	MaxHTTPShutdownSeconds     = 10
+	// CleanupTimeout 资源关闭阶段预算。
+	CleanupTimeout = 5 * time.Second
+)
+
+// Budget 各阶段预算。
+type Budget struct {
+	HTTP      time.Duration
+	DrainLogs time.Duration
+	Cleanup   time.Duration
+}
+
+// Total 三个阶段预算之和（不含日志 worker 响应取消的等待）。
+func (b Budget) Total() time.Duration { return b.HTTP + b.DrainLogs + b.Cleanup }
+
+// ResolveHTTPShutdown 解析 HTTP 阶段预算：未配置取默认值；非整数或不在 [1, 上限] 内返回 error（启动失败）。
+func ResolveHTTPShutdown(getString func(string) string) (time.Duration, error) {
+	raw := strings.TrimSpace(getString(HTTPShutdownKey))
+	if raw == "" {
+		return DefaultHTTPShutdownSeconds * time.Second, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("配置 %s 不是整数: %q", HTTPShutdownKey, raw)
+	}
+	if v < 1 || v > MaxHTTPShutdownSeconds {
+		return 0, fmt.Errorf("配置 %s=%d 超出范围（1~%d 秒）", HTTPShutdownKey, v, MaxHTTPShutdownSeconds)
+	}
+	return time.Duration(v) * time.Second, nil
+}
+
+// Plan 一次退出要做的事。StopHTTP / ForceCloseHTTP / DrainLogs 可以为 nil（跳过该阶段）。
+type Plan struct {
+	Budget Budget
+	// StopHTTP 优雅关闭 HTTP（http.Server.Shutdown）：ctx 到期前返回。
+	StopHTTP func(ctx context.Context) error
+	// ForceCloseHTTP StopHTTP 超时后调用（http.Server.Close），断开剩余连接。
+	ForceCloseHTTP func() error
+	// DrainLogs 排空日志队列；关闭队列后，任何还在跑的 handler 再写日志都会被丢弃计数。
+	DrainLogs func(ctx context.Context) error
+	// Cleanups 资源关闭，按顺序执行。
+	Cleanups []func()
+	// Logf 输出阶段日志，nil 时用 log.Printf。
+	Logf func(format string, args ...any)
+}
+
+// Run 按 HTTP → 日志排空 → 资源关闭的顺序执行，每个阶段用自己的预算；返回各阶段错误的合并。
+//
+// 资源关闭阶段超时只是不再等待（cleanup 函数无法被打断），剩余 cleanup 会在后台继续，
+// 进程随后退出。
+func (p Plan) Run() error {
+	logf := p.Logf
+	if logf == nil {
+		logf = log.Printf
+	}
+	var errs []error
+
+	if p.StopHTTP != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), p.Budget.HTTP)
+		err := p.StopHTTP(ctx)
+		cancel()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("HTTP 未在 %s 内优雅关闭（仍在执行的请求不会被终止，其后的日志将被丢弃）: %w", p.Budget.HTTP, err))
+			logf("%v\n", errs[len(errs)-1])
+			if p.ForceCloseHTTP != nil {
+				if cerr := p.ForceCloseHTTP(); cerr != nil {
+					logf("强制关闭 HTTP 连接失败: %v\n", cerr)
+				}
+			}
+		}
+	}
+
+	if p.DrainLogs != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), p.Budget.DrainLogs)
+		err := p.DrainLogs(ctx)
+		cancel()
+		if err != nil {
+			errs = append(errs, err)
+			logf("%v\n", err)
+		}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for _, cleanup := range p.Cleanups {
+			cleanup()
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(p.Budget.Cleanup):
+		err := fmt.Errorf("资源关闭未在 %s 内完成，不再等待", p.Budget.Cleanup)
+		errs = append(errs, err)
+		logf("%v\n", err)
+	}
+	return errors.Join(errs...)
+}

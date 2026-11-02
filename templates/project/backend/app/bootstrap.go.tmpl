@@ -25,6 +25,7 @@ import (
 	"{{ .Module }}/app/command"
 	"{{ .Module }}/app/crontab"
 	"{{ .Module }}/app/helper"
+	"{{ .Module }}/app/helper/lifecycle"
 	"{{ .Module }}/app/hooks"
 	"{{ .Module }}/app/middleware"
 	"{{ .Module }}/app/repo"
@@ -46,6 +47,10 @@ var (
 	configPath = "./config"
 	Core       *Injector
 	cleanups   []func()
+	// stopRequestLogs 排空访问日志 / 操作日志队列，由 startRequestLogQueue 设置。
+	stopRequestLogs func(ctx context.Context) error
+	// shutdownBudget 退出各阶段的预算（见 app/helper/lifecycle），启动时按配置解析。
+	shutdownBudget lifecycle.Budget
 )
 
 // Run 启动 HTTP 服务并阻塞，等待信号后优雅关闭
@@ -84,7 +89,7 @@ func Run() {
 
 	// gRPC 服务（grpc.enable=false 时 Container.GRPC 为 nil，跳过）。
 	// Start() 同样会阻塞在 Serve 上，所以放协程里跑，启动失败走 errChan 触发整体关闭。
-	// 关闭由 ProvideGRPCComponent 注册的 cleanup 负责（gracefulCleanup 里统一调用）。
+	// 关闭由 ProvideGRPCComponent 注册的 cleanup 负责（gracefulShutdown 的资源关闭阶段里统一调用）。
 	if taurus.Container.GRPC != nil {
 		go func() {
 			if err := taurus.Container.GRPC.Start(); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
@@ -103,15 +108,7 @@ func Run() {
 		log.Fatalf("%sServer startup failed: %v %s\n", Red, err, Reset)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	if err := taurus.Container.Http.Shutdown(ctx); err != nil {
-		log.Printf("%sServer forced to shutdown: %v %s\n", Red, err, Reset)
-	}
-
-	log.Printf("%s🔗 -> Server shutdown successfully. %s\n", Green, Reset)
-	gracefulCleanup(ctx)
+	gracefulShutdown()
 }
 
 // signalWaiter 等待信号或错误
@@ -137,32 +134,32 @@ func signalWaiter(errCh chan error) error {
 	}
 }
 
-// gracefulCleanup 清理回调。
+// gracefulShutdown 分阶段优雅退出（详见 app/helper/lifecycle）：
+//  1. HTTP：停止接收新请求，等在途请求结束（http.shutdown_timeout）；超时后强制断开连接。
+//     仍在执行的 handler 不会被终止，它们之后产生的日志会因为队列已关闭而被丢弃计数；
+//  2. 日志排空：在 http.request_log.drain_timeout_seconds 内写完队列，超时取消剩余写入；
+//  3. 资源关闭：按顺序执行 cleanups（lifecycle.CleanupTimeout）。
 //
-// cleanups 的顺序**就是**关闭顺序（下面是顺序遍历）：后台任务必须排在资源关闭
-// 之前。BuildComponents 注册的 cleanup 关的是 DB / Redis / 日志，它一旦先跑，
-// 还在运行的后台任务就会拿着已关闭的连接池继续发语句，退出日志里全是
-// `sql: database is closed`。所以注册后台任务的停止函数时要**头插**
-// （见 startLogCleanup），不能直接 append。
-func gracefulCleanup(ctx context.Context) {
-	log.Printf("%s🔗 -> Waiting for all requests to be processed... %s\n", Yellow, Reset)
-	done := make(chan struct{})
-
-	go func() {
-		log.Printf("%s🔗 -> Running cleanup functions... %s\n", Yellow, Reset)
-		for _, cleanup := range cleanups {
-			cleanup()
-		}
-		log.Printf("%s🔗 -> All cleanup functions completed %s\n", Green, Reset)
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		log.Printf("%s🔗 -> Cleanup completed successfully. %s\n", Green, Reset)
-	case <-ctx.Done():
-		log.Printf("%s🔗 -> Cleanup timeout reached, forcing stop. %s\n", Red, Reset)
+// 三个阶段各自计时，HTTP 关得慢不会吃掉日志排空与资源关闭的预算。
+// cleanups 的顺序**就是**关闭顺序：后台任务必须排在资源关闭之前。BuildComponents 注册的
+// cleanup 关的是 DB / Redis / 日志，它一旦先跑，还在运行的后台任务就会拿着已关闭的连接池
+// 继续发语句，退出日志里全是 `sql: database is closed`。所以注册后台任务的停止函数时要
+// **头插**（见 startLogCleanup），不能直接 append。
+func gracefulShutdown() {
+	log.Printf("%s🔗 -> Graceful shutdown: http=%s, drain logs=%s, cleanup=%s %s\n",
+		Yellow, shutdownBudget.HTTP, shutdownBudget.DrainLogs, shutdownBudget.Cleanup, Reset)
+	err := lifecycle.Plan{
+		Budget:         shutdownBudget,
+		StopHTTP:       taurus.Container.Http.Shutdown,
+		ForceCloseHTTP: taurus.Container.Http.Close,
+		DrainLogs:      stopRequestLogs,
+		Cleanups:       cleanups,
+	}.Run()
+	if err != nil {
+		log.Printf("%s🔗 -> Shutdown finished with errors. %s\n", Red, Reset)
+		return
 	}
+	log.Printf("%s🔗 -> Shutdown completed successfully. %s\n", Green, Reset)
 }
 
 // init 自动在 main 之前执行
@@ -197,6 +194,9 @@ func init() {
 
 	// 后台接口按 IP 限流（配置非法时在这里就让启动失败）
 	initAdminRateLimit()
+
+	// 访问日志 / 操作日志的有界写入队列（配置非法时在这里就让启动失败）
+	startRequestLogQueue()
 
 	// 设置 Go 相关配置
 	setGoConfig()
@@ -250,6 +250,24 @@ func startLogCleanup() {
 	if stop := service.NewLogCleaner(repo.NewStore(), days).Start(); stop != nil {
 		cleanups = append([]func(){stop}, cleanups...)
 	}
+}
+
+// startRequestLogQueue 建好访问日志 / 操作日志的有界写入队列并启动固定数量的 worker，
+// 同时确定退出各阶段的预算（配置非法时启动失败）。
+//
+// 停止函数不进 cleanups，而是作为 gracefulShutdown 的独立阶段：排在 HTTP 关闭之后、
+// 资源关闭之前，用自己的预算，不会被 HTTP 阶段占用。
+func startRequestLogQueue() {
+	cfg, err := middleware.ResolveRequestLogQueueConfig(taurus.Container.Config.GetString)
+	if err != nil {
+		log.Fatalf("%s启动自检失败: %v%s\n", Red, err, Reset)
+	}
+	httpBudget, err := lifecycle.ResolveHTTPShutdown(taurus.Container.Config.GetString)
+	if err != nil {
+		log.Fatalf("%s启动自检失败: %v%s\n", Red, err, Reset)
+	}
+	shutdownBudget = lifecycle.Budget{HTTP: httpBudget, DrainLogs: cfg.DrainTimeout, Cleanup: lifecycle.CleanupTimeout}
+	stopRequestLogs = middleware.StartRequestLogQueue(cfg)
 }
 
 // initAdminRateLimit 初始化后台接口（/admin/**）的按 IP 限流器。

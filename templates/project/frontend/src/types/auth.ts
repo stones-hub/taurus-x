@@ -6,9 +6,11 @@ export interface LoginRequest {
     password: string
 }
 
-/** 登录返回（对应后端 dto.LoginResponse） */
+/**
+ * 登录 / 刷新返回（对应后端 dto.LoginResponse）。
+ * 不含令牌：令牌只在 HttpOnly Cookie 里。刷新接口的 user 为 null。
+ */
 export interface LoginResponse {
-    token: string
     user: import('./user').UserInfo | null
     expires_at: string
 }

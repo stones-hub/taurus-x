@@ -211,8 +211,11 @@ mysql -uroot -p {{ .DBName }} -e "UPDATE admin_user_logins SET login_credential=
    这两条要一起移的话，同时删掉 `init.sql` 里 209/210 两行并改 `routes.go` 的中间件链。
 3. **限流是单机内存实现，后台接口没有全站总额度**。多实例部署时每个实例各算各的，总额度会按实例数放大；
    后台接口只按 IP 限（登录、验证码、错误上报除按 IP 外另有各自的全站额度），要卡全站总量请在入口层（Nginx / WAF）做。
-4. **访问日志、操作日志是每个请求单独起协程异步写库的**（`app/middleware/access_log.go`、
-   `operation_log.go`），程序退出时不等待它们写完，退出瞬间的少量日志可能丢失。
+4. **访问日志、操作日志走容量有限的队列异步写库**（`app/middleware/request_log_queue.go`）：
+   队列满时新日志直接丢弃（计数并每分钟最多告警一条），退出时在独立的「日志排空」阶段最多等
+   `http.request_log.drain_timeout_seconds` 秒写完（不受 HTTP 关闭阶段影响），超时、HTTP 超时后仍在跑的请求、
+   或进程被强杀时，未写完的日志仍会丢失。退出总上限默认 15.5 秒，守护进程停止等待需更长（部署文档用 30 秒）。容量 / worker 数见 `config/autoload/http/http.yaml` 的 `http.request_log`。
+5. **应用内不做来源 IP 白名单**：需要按 IP 限制后台访问时，在 Nginx（`allow` / `deny`）或防火墙上配置，见 `docs/部署文档.md` 7.5。
 
 ### 行为约定（不是缺陷，容易被当成 bug）
 
@@ -368,8 +371,14 @@ mysql -uroot -p {{ .DBName }} -e "UPDATE admin_user_logins SET login_credential=
   - 吊销标记不放 Redis，是因为 Redis 可淘汰、可重启丢失：计数一丢，已吊销的会话会复活。
     现在丢的只可能是 jti 键，而 jti 键丢失的后果是**拒绝**，方向是安全的；
   - 会话校验依赖的 Redis 或版本来源出错时**拒绝放行**（fail closed），而不是放过去。
+- **浏览器端只用 HttpOnly Cookie**：登录 / 刷新的响应体和响应头都不含令牌，后端只从 `jwt_token` Cookie 读令牌，
+  不接受 `Authorization: Bearer` / `jwt_token` 请求头；前端不保存令牌（localStorage 里旧版本残留的令牌启动时删除），
+  路由守卫只看非 HttpOnly 的 CSRF Cookie 是否存在，最终以服务端 401 为准。脚本调用用 cookie jar + `x-csrf-token` 头，
+  示例见 `docs/商用加固一期说明.md`。
 - 登出吊销的是**请求真正通过认证的那个 Token**：controller 与中间件统一用
-  `middleware.GetJWTToken`（Cookie → `jwt_token` 头 → `Bearer`），不再各写一套优先级。
+  `middleware.GetJWTToken`（只读 Cookie），不再各写一套提取逻辑。
+- service 错误统一走 `controller.FailByError`：只回显 `helper.NewBizError` 标记的业务错误，
+  数据库 / Redis 等内部错误回通用提示并记服务端日志。
 - `RefreshToken` 不再从 URL query 取 Token。
 - 登录、验证码发送/校验、前端错误上报、全部后台接口都挂了**限流**，并限制请求体大小；
   客户端自带的 `X-Real-IP` 不再被信任（`app/middleware/client_ip.go`）。

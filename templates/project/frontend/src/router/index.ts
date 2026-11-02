@@ -1,5 +1,6 @@
 // 路由表（页面路径与 admin_permissions.path 对齐）。
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
+import { hasSessionHint } from '../utils/auth-hint'
 
 // 扩展路由 meta 类型：activeMenu 指明当前页面应聚焦的导航菜单 link（绝对路径，如 /page/department/dept.html）。
 // 子页面（新增/编辑/详情/操作页）用它显式归属到所属列表页，替代原先脆弱的「路径后缀归一化」反推。
@@ -128,10 +129,10 @@ const router = createRouter({
   routes,
 })
 
-// 登录守卫
+// 登录守卫：只看不敏感的登录提示（CSRF Cookie 是否存在，见 utils/auth-hint.ts），
+// 不读令牌。提示过时（会话已被吊销）时进入页面后第一个请求会拿到 401，由 http.ts 统一跳回登录页。
 router.beforeEach((to) => {
-  const token = localStorage.getItem('token')
-  if (!to.meta.public && !token) {
+  if (!to.meta.public && !hasSessionHint()) {
     return { name: 'login' }
   }
   return true

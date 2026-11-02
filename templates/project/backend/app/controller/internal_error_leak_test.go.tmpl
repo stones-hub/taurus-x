@@ -1,0 +1,383 @@
+package controller
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
+
+	"{{ .Module }}/app/helper"
+	"{{ .Module }}/app/middleware"
+	"{{ .Module }}/app/repo"
+	"{{ .Module }}/app/service"
+)
+
+// leakDetail 模拟数据库驱动返回的错误原文：带内网地址、库表名，任何一段都不该回到客户端。
+const leakDetail = "Error 1146 (42S02): Table 'internal_db.admin_secret_table' doesn't exist; dial tcp 10.0.0.9:3306: internal-detail-marker"
+
+// captureLog 把标准库 logger 的输出临时接到缓冲区，测试结束时恢复。
+// 本包测试不使用 t.Parallel，不会有两个测试同时改全局 logger。
+func captureLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	return &buf
+}
+
+// assertGenericInternalError 响应必须是 500 + 通用提示，且不含错误原文的任何片段。
+func assertGenericInternalError(t *testing.T, recorder *httptest.ResponseRecorder) {
+	t.Helper()
+	if code := authPolicyCode(t, recorder); code != http.StatusInternalServerError {
+		t.Fatalf("基础设施错误应返回 500，实际 %d", code)
+	}
+	if got := policyMessage(t, recorder); got != internalErrorMessage {
+		t.Fatalf("基础设施错误应返回通用提示 %q，实际 %q", internalErrorMessage, got)
+	}
+	for _, fragment := range []string{"internal-detail-marker", "10.0.0.9", "admin_secret_table", "Error 1146"} {
+		if bytes.Contains(recorder.Body.Bytes(), []byte(fragment)) {
+			t.Fatalf("响应泄漏了内部错误片段 %q: %s", fragment, recorder.Body.String())
+		}
+	}
+}
+
+// TestAdminEndpointsDoNotLeakInfrastructureErrors 用户、角色、部门、日志（访问日志 / 登录日志）
+// 各取一个有代表性的接口：数据库出错时只回通用提示，错误原文只进服务端日志。
+func TestAdminEndpointsDoNotLeakInfrastructureErrors(t *testing.T) {
+	cases := []struct {
+		name    string
+		handler func(store *repo.Store) http.HandlerFunc
+		path    string
+		body    string
+	}{
+		{"用户列表", func(s *repo.Store) http.HandlerFunc {
+			return (&UserController{UserService: service.NewAdminUserService(s)}).GetUserList
+		}, "/admin/user/list", `{"page_no":1,"page_size":10}`},
+		{"角色列表", func(s *repo.Store) http.HandlerFunc {
+			return (&RoleController{RoleService: service.NewAdminRoleService(s)}).GetRoleList
+		}, "/admin/role/list", `{"page_no":1,"page_size":10}`},
+		{"新增角色", func(s *repo.Store) http.HandlerFunc {
+			return (&RoleController{RoleService: service.NewAdminRoleService(s)}).AddRole
+		}, "/admin/role/add", `{"role_name":"运维","role_code":"ops"}`},
+		{"部门列表", func(s *repo.Store) http.HandlerFunc {
+			return (&DeptController{DeptService: service.NewAdminDeptService(s)}).GetDeptList
+		}, "/admin/dept/list", `{"page_no":1,"page_size":10}`},
+		{"访问日志列表", func(s *repo.Store) http.HandlerFunc {
+			return (&LogController{LogService: service.NewLogService(s)}).GetAccessLogList
+		}, "/admin/log/access/list", `{"page_no":1,"page_size":10}`},
+		{"登录日志列表", func(s *repo.Store) http.HandlerFunc {
+			return (&LoginLogController{LoginLogService: service.NewAdminLoginLogService(s)}).GetLoginLogList
+		}, "/admin/login-log/list", `{"page_no":1,"page_size":10}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			database, mock := newMockDB(t)
+			mock.MatchExpectationsInOrder(false)
+			// 接口第一条语句就失败；后面再有语句也同样失败（不应该再发，但不让这一点影响泄漏断言）
+			for i := 0; i < 4; i++ {
+				mock.ExpectQuery(".").WillReturnError(errors.New(leakDetail))
+			}
+			recorder := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			logs := captureLog(t)
+			tc.handler(repo.NewStoreWithDB(database))(recorder, req)
+			assertGenericInternalError(t, recorder)
+			assertInternalErrorLogged(t, logs)
+		})
+	}
+}
+
+// assertInternalErrorLogged 被隐藏的内部错误原文必须进服务端日志（客户端拿不到，排查只能靠它）。
+func assertInternalErrorLogged(t *testing.T, logs *bytes.Buffer) {
+	t.Helper()
+	if !strings.Contains(logs.String(), "接口内部错误") || !strings.Contains(logs.String(), "internal-detail-marker") {
+		t.Fatalf("内部错误原文应写进服务端日志，实际日志: %q", logs.String())
+	}
+}
+
+// TestBusinessErrorsKeepTheirMessage 业务校验错误（名称重复等）照常把原文案回给用户。
+func TestBusinessErrorsKeepTheirMessage(t *testing.T) {
+	database, mock := newMockDB(t)
+	mock.ExpectQuery("SELECT .* FROM `admin_roles`").
+		WillReturnRows(sqlmock.NewRows([]string{"role_id", "role_name", "role_code", "status"}).AddRow(3, "运维", "ops", 1))
+	controller := &RoleController{RoleService: service.NewAdminRoleService(repo.NewStoreWithDB(database))}
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/role/add", strings.NewReader(`{"role_name":"运维","role_code":"ops"}`))
+	req.Header.Set("Content-Type", "application/json")
+	controller.AddRole(recorder, req)
+	if code := authPolicyCode(t, recorder); code != http.StatusInternalServerError {
+		t.Fatalf("业务错误沿用 500，实际 %d", code)
+	}
+	if got := policyMessage(t, recorder); got != "角色编码已存在" {
+		t.Fatalf("业务错误应原样返回，实际 %q", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestFailByErrorClassification 白名单分类：越权 403、业务错误回原文（包装过也只回业务文案本身）、
+// 其余一律通用提示。
+func TestFailByErrorClassification(t *testing.T) {
+	cases := []struct {
+		name    string
+		err     error
+		code    int
+		message string
+	}{
+		{"越权", service.ErrForbidden, http.StatusForbidden, service.ErrForbidden.Error()},
+		{"包装过的越权", fmt.Errorf("guard: %w", service.ErrForbidden), http.StatusForbidden, service.ErrForbidden.Error()},
+		{"业务错误", helper.NewBizError("部门名称不能为空"), http.StatusInternalServerError, "部门名称不能为空"},
+		{"包装过的业务错误", fmt.Errorf("tx %s: %w", leakDetail, helper.NewBizError("用户不存在")), http.StatusInternalServerError, "用户不存在"},
+		{"密码过长", helper.ErrPasswordTooLong, http.StatusInternalServerError, helper.ErrPasswordTooLong.Error()},
+		{"数据库错误", errors.New(leakDetail), http.StatusInternalServerError, internalErrorMessage},
+		{"包装过的数据库错误", fmt.Errorf("查询失败: %w", errors.New(leakDetail)), http.StatusInternalServerError, internalErrorMessage},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			FailByError(recorder, tc.err)
+			if code := authPolicyCode(t, recorder); code != tc.code {
+				t.Fatalf("code=%d，期望 %d", code, tc.code)
+			}
+			if got := policyMessage(t, recorder); got != tc.message {
+				t.Fatalf("message=%q，期望 %q", got, tc.message)
+			}
+			if bytes.Contains(recorder.Body.Bytes(), []byte("internal-detail-marker")) {
+				t.Fatalf("响应泄漏了内部错误: %s", recorder.Body.String())
+			}
+		})
+	}
+}
+
+// fakeCodeStore 验证码存储替身：按 key 前缀注入 Get / Set 的结果，模拟 Redis 故障；
+// 记录每次调用（"get:<key>" / "set:<key>"），用来证明确实走到了目标 Redis 路径。
+type fakeCodeStore struct {
+	get    func(key string) (string, error)
+	setErr func(key string) error
+	calls  []string
+}
+
+func (f *fakeCodeStore) Get(_ context.Context, key string) (string, error) {
+	f.calls = append(f.calls, "get:"+key)
+	return f.get(key)
+}
+func (f *fakeCodeStore) Set(_ context.Context, key string, _ interface{}, _ time.Duration) error {
+	f.calls = append(f.calls, "set:"+key)
+	if f.setErr != nil {
+		return f.setErr(key)
+	}
+	return nil
+}
+func (f *fakeCodeStore) Del(context.Context, ...string) error { return nil }
+
+// contains 判断 list 里是否有 want。
+func contains(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+// withSelf 给请求挂上 JWT 中间件注入的本人身份（user_id=7）。
+func withSelf(req *http.Request) *http.Request {
+	return req.WithContext(context.WithValue(req.Context(), middleware.JWTTokenClaimsKey, middleware.JWTClaims{UID: "7", Username: "policy-user", JTI: "self-session"}))
+}
+
+// TestWriteEndpointsHideInfrastructureErrors 代表性写路径：改密（数据库）、绑定手机号与发验证码（Redis）、
+// 部门写、权限写。底层故障只回通用提示、不含错误原文；业务拒绝照常回原文案。
+// sqlmock 按顺序严格匹配，每个用例结束都核对期望全部满足。
+func TestWriteEndpointsHideInfrastructureErrors(t *testing.T) {
+	hash, err := helper.HashPassword("Right1pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	leak := errors.New(leakDetail)
+	type setup func(mock sqlmock.Sqlmock) helper.VerificationCodeStore
+	cases := []struct {
+		name    string
+		handler func(s *repo.Store) http.HandlerFunc
+		path    string
+		body    string
+		self    bool
+		setup   setup
+		message string // 空 = 期望通用提示
+	}{
+		{"改密：锁用户行时数据库出错", func(s *repo.Store) http.HandlerFunc {
+			return (&UserController{AuthService: service.NewAuthService(s)}).ChangePassword
+		}, "/admin/user/change-password", `{"old_password":"Right1pass","new_password":"Newpass123"}`, true,
+			func(mock sqlmock.Sqlmock) helper.VerificationCodeStore {
+				mock.ExpectBegin()
+				mock.ExpectQuery(lockSel("admin_users")).WithArgs(firstArgs(7)...).WillReturnError(leak)
+				mock.ExpectRollback()
+				return nil
+			}, ""},
+		{"改密：原密码错误（业务拒绝）", func(s *repo.Store) http.HandlerFunc {
+			return (&UserController{AuthService: service.NewAuthService(s)}).ChangePassword
+		}, "/admin/user/change-password", `{"old_password":"Wrong1pass","new_password":"Newpass123"}`, true,
+			func(mock sqlmock.Sqlmock) helper.VerificationCodeStore {
+				mock.ExpectBegin()
+				mock.ExpectQuery(lockSel("admin_users")).WithArgs(firstArgs(7)...).WillReturnRows(userRows().AddRow(7, "policy-user", 1, 1))
+				mock.ExpectQuery(sel("admin_user_logins")).
+					WillReturnRows(sqlmock.NewRows([]string{"login_id", "user_id", "login_credential", "salt", "status"}).AddRow(70, 7, hash, "", 1))
+				mock.ExpectRollback()
+				return nil
+			}, "原密码错误"},
+		{"绑定手机号：读验证码时 Redis 出错", func(s *repo.Store) http.HandlerFunc {
+			return (&UserController{AuthService: service.NewAuthService(s)}).BindMobile
+		}, "/admin/user/bind-mobile", `{"mobile":"13800138000","code":"123456"}`, true,
+			func(sqlmock.Sqlmock) helper.VerificationCodeStore {
+				return &fakeCodeStore{get: func(string) (string, error) { return "", leak }}
+			}, ""},
+		{"绑定手机号：验证码不存在（业务拒绝）", func(s *repo.Store) http.HandlerFunc {
+			return (&UserController{AuthService: service.NewAuthService(s)}).BindMobile
+		}, "/admin/user/bind-mobile", `{"mobile":"13800138000","code":"123456"}`, true,
+			func(sqlmock.Sqlmock) helper.VerificationCodeStore {
+				return &fakeCodeStore{get: func(string) (string, error) { return "", nil }}
+			}, "验证码不存在或已过期"},
+		{"发验证码：写验证码时 Redis 出错", func(s *repo.Store) http.HandlerFunc {
+			return (&UserController{AuthService: service.NewAuthService(s)}).SendCode
+		}, "/admin/user/send-code", `{"login_type":"mobile","login_value":"13800138000"}`, false,
+			func(sqlmock.Sqlmock) helper.VerificationCodeStore {
+				return &fakeCodeStore{
+					get: func(string) (string, error) { return "", nil },
+					setErr: func(key string) error {
+						if strings.HasPrefix(key, "verification_code:") {
+							return leak
+						}
+						return nil
+					},
+				}
+			}, ""},
+		{"发验证码：发送过于频繁（业务拒绝）", func(s *repo.Store) http.HandlerFunc {
+			return (&UserController{AuthService: service.NewAuthService(s)}).SendCode
+		}, "/admin/user/send-code", `{"login_type":"mobile","login_value":"13800138000"}`, false,
+			func(sqlmock.Sqlmock) helper.VerificationCodeStore {
+				return &fakeCodeStore{get: func(key string) (string, error) {
+					if strings.HasPrefix(key, "sms:rate:") {
+						return "1", nil
+					}
+					return "", nil
+				}}
+			}, "发送过于频繁，请稍后再试"},
+		{"新增部门：查编码时数据库出错", func(s *repo.Store) http.HandlerFunc {
+			return (&DeptController{DeptService: service.NewAdminDeptService(s)}).AddDept
+		}, "/admin/dept/add", `{"dept_name":"运维部","dept_code":"ops"}`, false,
+			func(mock sqlmock.Sqlmock) helper.VerificationCodeStore {
+				mock.ExpectQuery(sel("admin_depts")).WillReturnError(leak)
+				return nil
+			}, ""},
+		{"新增部门：编码重复（业务拒绝）", func(s *repo.Store) http.HandlerFunc {
+			return (&DeptController{DeptService: service.NewAdminDeptService(s)}).AddDept
+		}, "/admin/dept/add", `{"dept_name":"运维部","dept_code":"ops"}`, false,
+			func(mock sqlmock.Sqlmock) helper.VerificationCodeStore {
+				mock.ExpectQuery(sel("admin_depts")).WillReturnRows(sqlmock.NewRows([]string{"dept_id", "dept_code", "status"}).AddRow(3, "ops", 1))
+				return nil
+			}, "部门编码已存在"},
+		{"新增权限：查编码时数据库出错", func(s *repo.Store) http.HandlerFunc {
+			return (&PermissionController{PermissionService: service.NewAdminPermissionsService(s)}).AddPermission
+		}, "/admin/permission/add", `{"permission_name":"导出","permission_code":"report:export","permission_type":2}`, false,
+			func(mock sqlmock.Sqlmock) helper.VerificationCodeStore {
+				mock.ExpectQuery(sel("admin_permissions")).WillReturnError(leak)
+				return nil
+			}, ""},
+		{"新增权限：编码重复（业务拒绝）", func(s *repo.Store) http.HandlerFunc {
+			return (&PermissionController{PermissionService: service.NewAdminPermissionsService(s)}).AddPermission
+		}, "/admin/permission/add", `{"permission_name":"导出","permission_code":"report:export","permission_type":2}`, false,
+			func(mock sqlmock.Sqlmock) helper.VerificationCodeStore {
+				mock.ExpectQuery(sel("admin_permissions")).WillReturnRows(sqlmock.NewRows([]string{"permission_id", "permission_code", "status"}).AddRow(9, "report:export", 1))
+				return nil
+			}, "权限编码已存在"},
+	}
+	// Redis 用例必须真的访问到目标键：证明测到的是验证码读写那一步，而不是被更早的分支截住
+	redisCalls := map[string]string{
+		"绑定手机号：读验证码时 Redis 出错": "get:verification_code:mobile:13800138000",
+		"绑定手机号：验证码不存在（业务拒绝）":   "get:verification_code:mobile:13800138000",
+		"发验证码：写验证码时 Redis 出错":  "set:verification_code:mobile:13800138000",
+		"发验证码：发送过于频繁（业务拒绝）":    "get:sms:rate:1m:13800138000",
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			authPolicyConfig(t, false)
+			database, mock := newMockDB(t)
+			var fake *fakeCodeStore
+			if kv := tc.setup(mock); kv != nil {
+				fake = kv.(*fakeCodeStore)
+				t.Cleanup(helper.SetVerificationCodeStore(kv))
+			}
+			wantCall, redisCase := redisCalls[tc.name]
+			if redisCase != (fake != nil) {
+				t.Fatalf("用例 %q 的 Redis 替身与期望调用登记不一致", tc.name)
+			}
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			if tc.self {
+				req = withSelf(req)
+			}
+			recorder := httptest.NewRecorder()
+			logs := captureLog(t)
+			tc.handler(repo.NewStoreWithDB(database))(recorder, req)
+			if fake != nil && !contains(fake.calls, wantCall) {
+				t.Fatalf("没有访问到目标 Redis 键 %q，实际调用 %v", wantCall, fake.calls)
+			}
+			if tc.message == "" {
+				assertGenericInternalError(t, recorder)
+				assertInternalErrorLogged(t, logs)
+			} else {
+				if code := authPolicyCode(t, recorder); code != http.StatusInternalServerError {
+					t.Fatalf("业务拒绝沿用 500，实际 %d", code)
+				}
+				if got := policyMessage(t, recorder); got != tc.message {
+					t.Fatalf("业务拒绝应原样返回 %q，实际 %q", tc.message, got)
+				}
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// TestReportFrontErrorFailureIsLoggedNotEchoed 前端错误上报入库失败：响应保持原来的降级提示
+// 「前端错误上报失败」，不回显内部错误；原因写进服务端日志，不再静默吞掉。
+func TestReportFrontErrorFailureIsLoggedNotEchoed(t *testing.T) {
+	authPolicyConfig(t, false)
+	database, mock := newMockDB(t)
+	mock.ExpectExec(ins("admin_front_error_logs")).WillReturnError(errors.New(leakDetail))
+	var logs bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/report-front-error", strings.NewReader(`{"message":"boom","kind":"error"}`))
+	req.Header.Set("Content-Type", "application/json")
+	(&LogController{LogService: service.NewLogService(repo.NewStoreWithDB(database))}).ReportFrontError(recorder, req)
+	log.SetOutput(previous)
+	if code := authPolicyCode(t, recorder); code != http.StatusInternalServerError {
+		t.Fatalf("入库失败应返回 500，实际 %d", code)
+	}
+	if got := policyMessage(t, recorder); got != "前端错误上报失败" {
+		t.Fatalf("降级提示应保持不变，实际 %q", got)
+	}
+	if bytes.Contains(recorder.Body.Bytes(), []byte("internal-detail-marker")) {
+		t.Fatalf("响应泄漏了内部错误: %s", recorder.Body.String())
+	}
+	if !strings.Contains(logs.String(), "前端错误上报入库失败") || !strings.Contains(logs.String(), "internal-detail-marker") {
+		t.Fatalf("入库失败的原因必须写进服务端日志，实际日志: %q", logs.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}

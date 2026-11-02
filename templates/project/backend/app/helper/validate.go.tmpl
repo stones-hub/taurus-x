@@ -2,7 +2,6 @@
 package helper
 
 import (
-	"fmt"
 	"regexp"
 
 	"github.com/stones-hub/taurus-pro-common/pkg/util/tvalid"
@@ -18,14 +17,14 @@ import (
 // 这里的提示了。注意单位是字节：一个汉字在 UTF-8 下算 3 字节。
 func ValidatePasswordStrength(password string) error {
 	if len(password) < 6 {
-		return fmt.Errorf("密码长度不能少于6位")
+		return NewBizError("密码长度不能少于6位")
 	}
 	if len(password) > 20 {
-		return fmt.Errorf("密码长度不能超过20位")
+		return NewBizError("密码长度不能超过20位")
 	}
 	if !regexp.MustCompile(`[0-9]`).MatchString(password) ||
 		!regexp.MustCompile(`[a-zA-Z]`).MatchString(password) {
-		return fmt.Errorf("密码必须包含字母和数字")
+		return NewBizError("密码必须包含字母和数字")
 	}
 	return nil
 }

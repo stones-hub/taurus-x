@@ -3,10 +3,12 @@ package controller
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 
 	"github.com/stones-hub/taurus-pro-http/pkg/httpx"
 
+	"{{ .Module }}/app/helper"
 	"{{ .Module }}/app/service"
 )
 
@@ -40,13 +42,24 @@ func Fail(w http.ResponseWriter, code int, message string) {
 	httpx.SendResponse(w, code, map[string]string{"message": message}, nil)
 }
 
-// FailByError 按 error 类型选择响应码：
-// 越权（service.ErrForbidden）必须回 403，不能和普通业务错误一样混在 500 里 ——
-// 前端要能区分「操作被拒绝」和「服务出错」，审计也要能把越权尝试挑出来。
+// internalErrorMessage 基础设施错误（数据库、Redis、文件系统等）回给客户端的通用提示。
+const internalErrorMessage = "服务内部错误，请稍后重试"
+
+// FailByError 按 error 类型选择响应码与提示：
+//   - 越权（service.ErrForbidden）必须回 403，不能和普通业务错误一样混在 500 里 ——
+//     前端要能区分「操作被拒绝」和「服务出错」，审计也要能把越权尝试挑出来；
+//   - 业务错误（helper.BizError：参数非法、名称重复、状态冲突等）回 500 + 原文案，前端直接展示；
+//   - 其余一律当基础设施错误：原文（可能含 SQL、库表名、连接地址）只进服务端日志，
+//     客户端只拿到通用提示。白名单判定，没标成业务错误的新错误默认不回显。
 func FailByError(w http.ResponseWriter, err error) {
 	if errors.Is(err, service.ErrForbidden) {
-		Fail(w, http.StatusForbidden, err.Error())
+		Fail(w, http.StatusForbidden, service.ErrForbidden.Error())
 		return
 	}
-	Fail(w, http.StatusInternalServerError, err.Error())
+	if msg, ok := helper.PublicMessage(err); ok {
+		Fail(w, http.StatusInternalServerError, msg)
+		return
+	}
+	log.Printf("接口内部错误: %v\n", err)
+	Fail(w, http.StatusInternalServerError, internalErrorMessage)
 }

@@ -29,7 +29,7 @@ func (c *RoleController) MenusButtons(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := c.RoleService.GetUserMenusAndButtons(r.Context(), userID)
 	if err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, resp)
@@ -46,7 +46,7 @@ func (c *RoleController) GetRoleList(w http.ResponseWriter, r *http.Request) {
 	req.Normalize()
 	resp, err := c.RoleService.GetRoleList(r.Context(), req.PageNo, req.PageSize, req.RoleName, req.Status)
 	if err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, resp)
@@ -63,7 +63,7 @@ func (c *RoleController) AddRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := c.RoleService.AddRole(r.Context(), &req); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -80,7 +80,7 @@ func (c *RoleController) UpdateRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := c.RoleService.UpdateRole(r.Context(), &req); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -97,7 +97,7 @@ func (c *RoleController) DeleteRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := c.RoleService.DeleteRole(r.Context(), req.RoleID); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -110,7 +110,7 @@ func (c *RoleController) UpdateRoleStatus(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if err := c.RoleService.UpdateRoleStatus(r.Context(), req.RoleID, req.Status); err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, map[string]string{"status": "success"})
@@ -128,7 +128,7 @@ func (c *RoleController) GetEditRoleInfo(w http.ResponseWriter, r *http.Request)
 	}
 	resp, err := c.RoleService.GetEditRoleInfo(r.Context(), req.RoleID)
 	if err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, resp)
@@ -144,7 +144,7 @@ func (c *RoleController) GetUserRolesAndPermissions(w http.ResponseWriter, r *ht
 	}
 	resp, err := c.RoleService.GetUserRolesAndPermissions(r.Context(), req.UserID)
 	if err != nil {
-		Fail(w, http.StatusInternalServerError, err.Error())
+		FailByError(w, err)
 		return
 	}
 	OK(w, resp)

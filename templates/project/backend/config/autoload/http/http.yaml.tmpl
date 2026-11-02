@@ -1,7 +1,12 @@
 http:
   address: "${SERVER_ADDRESS:0.0.0.0}"
   port: ${SERVER_PORT:9080}
-  shutdown_timeout: 5
+  # 优雅退出分三个阶段、各自计时（见 app/helper/lifecycle）：
+  #   HTTP 关闭 shutdown_timeout（1~10 秒）→ 日志排空 request_log.drain_timeout_seconds（1~8 秒）
+  #   → 资源关闭 5 秒。总退出上限 = 三者之和 + 0.5 秒，默认 15.5 秒、最大 23.5 秒；
+  # 守护进程的停止等待（Docker stop_grace_period、supervisor stopwaitsecs、launchd ExitTimeOut）
+  # 必须大于它，部署文档里给的是 30 秒。HTTP 超时只代表不再等待，仍在执行的请求不会被终止。
+  shutdown_timeout: ${HTTP_SHUTDOWN_TIMEOUT_SECONDS:5}
   read_timeout: 30
   write_timeout: 30
   idle_timeout: 120
@@ -9,8 +14,8 @@ http:
   # 外面再套一层引号的话，用户在 .env 里写 AUTHORIZATION="x" 就会变成 ""x""。
   authorization: Bearer ${AUTHORIZATION:123456}
 
-  # 主机 IP 白名单（留空 = 不启用 host 中间件拦截；配 CIDR 或精确 IP）
-  host_white_list: []
+  # 按来源 IP 限制后台访问不在应用里做：请在 Nginx（allow/deny）或防火墙/安全组上配置，
+  # 见 docs/部署文档.md「按 IP 限制后台访问」。
 
   # 可信反向代理（逗号分隔的 IP 或 CIDR）。
   # 只有直连对端命中这里时，后端才采信 X-Forwarded-For / X-Real-IP；
@@ -20,6 +25,17 @@ http:
   trusted_proxies: ${TRUSTED_PROXIES:none}
 
   auth_trusted_origins: ${AUTH_TRUSTED_ORIGINS:none}
+
+  # 访问日志 / 操作日志的异步写入队列（见 app/middleware/request_log_queue.go）。
+  # 队列满时新日志直接丢弃并计数（请求不等日志），丢弃与写库失败每分钟最多告警一条汇总；
+  # 优雅退出的「日志排空」阶段最多等 drain_timeout_seconds 秒（独立计时，不受 HTTP 关闭阶段影响），
+  # 超时后取消在写的写入、剩余日志不再写入。
+  # 每条日志最多带约 84KB 请求/响应体，最坏内存占用约 queue_capacity × 84KB。
+  # 取值必须是正整数：queue_capacity ≤ 100000、workers ≤ 32、drain_timeout_seconds ≤ 8，否则拒绝启动。
+  request_log:
+    queue_capacity: ${REQUEST_LOG_QUEUE_CAPACITY:1000}
+    workers: ${REQUEST_LOG_WORKERS:2}
+    drain_timeout_seconds: ${REQUEST_LOG_DRAIN_TIMEOUT_SECONDS:5}
 
   # 请求体大小上限（字节）。底座没有文件上传接口，默认 1MiB；0 表示不限制。
   max_body_bytes: ${MAX_BODY_BYTES:1048576}

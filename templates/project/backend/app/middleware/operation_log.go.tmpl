@@ -30,8 +30,17 @@ func getOperationLogRepo() *repo.OperationLogRepository {
 // operationLogFile 全局操作日志文件（按天分割，logs/operation-YYYY-MM-DD.log）
 var operationLogFile = helper.NewDailyLogFile("logs", "operation")
 
+// persistOperationLog 落库 + 落文件，由请求日志队列的 worker 调用；返回落库错误。
+// 声明成变量是为了测试能替换掉真实数据库。
+var persistOperationLog = func(ctx context.Context, entry *model.OperationLog) error {
+	err := getOperationLogRepo().Create(ctx, entry)
+	operationLogFile.Write(formatOperationLine(entry))
+	return err
+}
+
 // OperationLogMiddleware 操作日志中间件：记录写操作（POST/PUT/PATCH/DELETE）
-// 记录用户/方法/路径/动作/资源/IP/状态码/请求体/结果，异步写入。
+// 记录用户/方法/路径/动作/资源/IP/状态码/请求体/结果，交给有界队列异步写入（见 request_log_queue.go）。
+// 成败按响应体里的业务 code 判断（httpx 的错误响应多数是 HTTP 200 + body.code），见 operationResult。
 // 应在 JWT + Permission 之后（以便拿到用户 ID 与判定结果）。
 func OperationLogMiddleware() func(next http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
@@ -61,34 +70,30 @@ func OperationLogMiddleware() func(next http.Handler) http.Handler {
 			next.ServeHTTP(rec, r)
 
 			userID, _ := CurrentUserIDFromJWT(r)
-			result := "成功"
-			if rec.status >= 400 {
-				result = "失败"
-			}
+			result := operationResult(rec.status, rec.buf.Bytes())
 
 			// 先脱敏再截断：改密、设密码、绑定手机号都走操作日志，body 里有明文口令与验证码
 			ip := ClientIP(r)
 			requestBody := redactBody(r.Header.Get("Content-Type"), string(body))
 			responseBody := redactBody(rec.Header().Get("Content-Type"), rec.body())
 
-			go func() {
-				entry := &model.OperationLog{
-					UserID:       userID,
-					Method:       method,
-					Path:         r.URL.Path,
-					Action:       inferAction(method, r.URL.Path),
-					Resource:     inferResource(r.URL.Path),
-					IP:           ip,
-					StatusCode:   rec.status,
-					RequestBody:  truncate(requestBody, 4096),
-					ResponseBody: truncate(responseBody, maxBodyLogSize),
-					Result:       result,
-					ErrorMsg:     "",
-					CreatedAt:    time.Now(),
-				}
-				_ = getOperationLogRepo().Create(context.Background(), entry)
-				operationLogFile.Write(formatOperationLine(entry))
-			}()
+			entry := &model.OperationLog{
+				UserID:       userID,
+				Method:       method,
+				Path:         r.URL.Path,
+				Action:       inferAction(method, r.URL.Path),
+				Resource:     inferResource(r.URL.Path),
+				IP:           ip,
+				StatusCode:   rec.status,
+				RequestBody:  truncate(requestBody, 4096),
+				ResponseBody: truncate(responseBody, maxBodyLogSize),
+				Result:       result,
+				ErrorMsg:     "",
+				CreatedAt:    time.Now(),
+			}
+			enqueueRequestLog(requestLogJob{kind: "操作日志", write: func(ctx context.Context) error {
+				return persistOperationLog(ctx, entry)
+			}})
 		})
 	}
 }

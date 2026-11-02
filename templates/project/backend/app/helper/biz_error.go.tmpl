@@ -1,0 +1,32 @@
+package helper
+
+import "errors"
+
+// BizError 可以原样展示给用户的业务错误：参数非法、名称重复、状态冲突、验证码错误等。
+//
+// 接口层只回显 BizError 的文案（见 controller.FailByError）；其余错误一律视为基础设施错误
+// （数据库、Redis、文件系统……），原文只进服务端日志，客户端拿到的是通用提示。
+// 判断方式是白名单：新增的错误默认不回显，要给用户看就显式用 NewBizError，
+// 不会因为忘了标记就把 SQL、连接地址之类的内部信息带给客户端。
+type BizError struct {
+	msg string
+}
+
+// NewBizError 构造一个可以展示给用户的业务错误。
+func NewBizError(msg string) error {
+	return &BizError{msg: msg}
+}
+
+func (e *BizError) Error() string {
+	return e.msg
+}
+
+// PublicMessage 取出错误链上第一个 BizError 的文案；不是业务错误时返回 "", false。
+// 只取 BizError 自己的文案，不带外层 fmt.Errorf 包装上去的内容。
+func PublicMessage(err error) (string, bool) {
+	var biz *BizError
+	if errors.As(err, &biz) {
+		return biz.msg, true
+	}
+	return "", false
+}
