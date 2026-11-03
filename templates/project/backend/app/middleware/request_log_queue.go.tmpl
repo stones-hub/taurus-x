@@ -46,6 +46,9 @@ const (
 	requestLogWarnInterval = time.Minute
 )
 
+// MaxRequestLogDrain 日志排空阶段预算允许配置的最大值，启动时用它校验退出最坏耗时（见 app 的 Run）。
+const MaxRequestLogDrain = maxRequestLogDrainSeconds * time.Second
+
 // RequestLogQueueConfig 请求日志队列配置。
 type RequestLogQueueConfig struct {
 	Capacity     int

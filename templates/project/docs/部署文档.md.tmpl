@@ -17,6 +17,8 @@
 > **验证状态**：脚手架维护方实测过：Docker 方式（基础组件，arm64）；Ubuntu 裸机方式 A、B（Ubuntu 22.04 arm64 容器，含 supervisor 非 root 运行、更新与回滚）；nginx + `TRUSTED_PROXIES`；macOS 原生编译运行与 MySQL 8.4。以上均完成真实登录。
 > **未实测**：带 systemd 的真实 Ubuntu 服务器（容器内用 `service` 代替了 `systemctl`）、amd64 机器上实际运行（只核对过交叉编译产物格式）、macOS 的 Homebrew 安装与 launchd 开机自启。
 > 上线前请在你的目标机器上完整走一遍。
+>
+> 上线后的数据库备份 / 恢复、压测、SBOM 与漏洞扫描见 [`运维手册.md`](运维手册.md)。**Docker 方式**的 mysql 服务默认不映射端口，备份脚本只支持宿主机上的 MySQL 8.x 客户端，具体做法见运维手册 1.2 节。
 
 ---
 
@@ -394,7 +396,7 @@ autorestart=true
 startsecs=3
 stopasgroup=true
 killasgroup=true
-stopwaitsecs=30
+stopwaitsecs=45
 redirect_stderr=true
 stdout_logfile=/data/app/backend/logs/supervisor.log
 ```
@@ -406,7 +408,7 @@ sudo supervisorctl status     # {{ .ProjectName }} RUNNING
 
 > - `directory` 必须指向 `backend/`（相对路径依赖）。
 > - `user=app`：以非 root 身份运行；不要改成 `root`。
-> - `stopwaitsecs=30`：supervisor 默认只等 10 秒就强杀。程序优雅退出分三段各自计时（HTTP 关闭 `HTTP_SHUTDOWN_TIMEOUT_SECONDS`、日志排空 `REQUEST_LOG_DRAIN_TIMEOUT_SECONDS`、资源关闭 5 秒），总上限 = 三者之和 + 0.5 秒（默认 15.5 秒），停止等待必须比它长。Docker（`stop_grace_period: 30s`）与 launchd（`ExitTimeOut`）同理。
+> - `stopwaitsecs=45`：supervisor 默认只等 10 秒就强杀。程序优雅退出分四段各自计时：Consul 注销（选了 Consul 时，2 秒）→ 入口关闭（HTTP / gRPC / TCP 同时停止接新连接，共用 `HTTP_SHUTDOWN_TIMEOUT_SECONDS`，到期强制断开）→ 日志排空（`REQUEST_LOG_DRAIN_TIMEOUT_SECONDS`）→ 资源关闭（逐个组件、每步单独限时）。所有步骤都卡满时，全选组件、两项取最大值约 37.7 秒（默认约 29.7 秒）；停止等待统一为 45 秒（代码里的 `lifecycle.DeployStopWait`，启动时会校验至少留 5 秒余量；这个校验只比对代码常量，读不到这里实际填的值，改小部署文件不会被发现，请自行对照）。Docker（`stop_grace_period: 45s`）与 launchd（`ExitTimeOut`）同理，三处要一起改。
 
 ### 4.10 验证
 
@@ -597,9 +599,9 @@ cd /opt/{{ .ProjectName }}/backend
     <key>ThrottleInterval</key>
     <integer>10</integer>
 
-    <!-- 停止时最多等 30 秒再强杀：要大于程序的优雅退出总上限（默认 15.5 秒） -->
+    <!-- 停止时最多等 45 秒再强杀：要大于程序优雅退出的最坏总耗时（全选组件、退出预算取最大值约 37.7 秒） -->
     <key>ExitTimeOut</key>
-    <integer>30</integer>
+    <integer>45</integer>
 
     <key>StandardOutPath</key>
     <string>/opt/{{ .ProjectName }}/backend/logs/launchd.log</string>

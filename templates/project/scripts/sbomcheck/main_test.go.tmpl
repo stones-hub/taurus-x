@@ -1,0 +1,76 @@
+package main
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+const validBOM = `{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "metadata": {"component": {"name": "demo"}},
+  "components": [
+    {"name": "github.com/a/b", "version": "v1.2.3"},
+    {"name": "vue", "version": "3.5.43"}
+  ],
+  "dependencies": [
+    {"ref": "pkg:golang/github.com/a/b@v1.2.3", "dependsOn": []}
+  ]
+}`
+
+func runCheck(t *testing.T, content string, args ...string) (int, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "bom.json")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := run(append(args, path), &stdout, &stderr)
+	return code, stdout.String() + stderr.String()
+}
+
+func TestValidBOM(t *testing.T) {
+	code, out := runCheck(t, validBOM)
+	if code != 0 || !strings.Contains(out, "2 个组件，1 条依赖关系") {
+		t.Fatalf("合法 SBOM 应通过: %d %s", code, out)
+	}
+}
+
+func TestRejects(t *testing.T) {
+	cases := []struct {
+		name, content, want string
+		args                []string
+	}{
+		{name: "不是 JSON", content: "{", want: "不是合法 JSON"},
+		{name: "空对象", content: "{}", want: "bomFormat"},
+		{name: "格式不对", content: strings.Replace(validBOM, `"CycloneDX"`, `"SPDX"`, 1), want: "bomFormat"},
+		{name: "版本不对", content: validBOM, args: []string{"-spec", "1.5"}, want: "specVersion"},
+		{name: "缺 metadata.component", content: strings.Replace(validBOM, `"metadata": {"component": {"name": "demo"}},`, ``, 1), want: "metadata.component"},
+		{name: "components 为空", content: strings.Replace(validBOM, `{"name": "github.com/a/b", "version": "v1.2.3"},
+    {"name": "vue", "version": "3.5.43"}`, ``, 1), want: "components 为空"},
+		{name: "组件缺版本", content: strings.Replace(validBOM, `"version": "3.5.43"`, `"version": ""`, 1), want: "缺少 name 或 version"},
+		{name: "dependencies 为空", content: strings.Replace(validBOM, `{"ref": "pkg:golang/github.com/a/b@v1.2.3", "dependsOn": []}`, ``, 1), want: "dependencies 为空"},
+		{name: "依赖缺 ref", content: strings.Replace(validBOM, `"ref": "pkg:golang/github.com/a/b@v1.2.3"`, `"ref": ""`, 1), want: "缺少 ref"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, out := runCheck(t, tc.content, tc.args...)
+			if code != 1 || !strings.Contains(out, tc.want) {
+				t.Fatalf("应以「%s」拒绝，实际 %d: %s", tc.want, code, out)
+			}
+		})
+	}
+}
+
+func TestUsageAndMissingFile(t *testing.T) {
+	var out bytes.Buffer
+	if code := run(nil, &out, &out); code != 2 {
+		t.Fatalf("缺文件参数应返回 2，实际 %d", code)
+	}
+	if code := run([]string{filepath.Join(t.TempDir(), "missing.json")}, &out, &out); code != 1 {
+		t.Fatalf("文件不存在应返回 1，实际 %d", code)
+	}
+}

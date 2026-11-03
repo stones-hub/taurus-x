@@ -105,11 +105,20 @@ func TestGenerate_Combinations(t *testing.T) {
 			assertGoFilesFormatted(t, outDir)
 			assertPasswordChangeRelogin(t, outDir)
 			assertCookieOnlyAuthAndLogQueue(t, outDir)
+			assertShutdownOrchestration(t, outDir, result.Components)
+			assertOpsTooling(t, outDir)
 
 			backend := filepath.Join(outDir, "backend")
 			runGo(t, backend, "build", "./...")
 			runGo(t, backend, "vet", "./...")
 			runGo(t, backend, "test", "./...")
+
+			// 压测工具、SBOM 校验工具都是独立 module（只用标准库），单独 vet / test。
+			for _, tool := range []string{"loadtest", "sbomcheck"} {
+				dir := filepath.Join(outDir, "scripts", tool)
+				runGo(t, dir, "vet", "./...")
+				runGo(t, dir, "test", "./...")
+			}
 		})
 	}
 }
@@ -435,21 +444,181 @@ func assertCookieOnlyAuthAndLogQueue(t *testing.T, outDir string) {
 	if !strings.Contains(funcBody(readFile(t, filepath.Join(app, "middleware", "operation_log.go")), "func OperationLogMiddleware("), "operationResult(rec.status, rec.buf.Bytes())") {
 		t.Error("操作日志成败必须按业务 code 判断（operationResult）")
 	}
-	// 退出分阶段、各自计时：日志排空是 HTTP 与资源关闭之间的独立阶段（运行层面的顺序与预算由
+	// 退出分阶段、各自计时：日志排空是入口关闭与资源关闭之间的独立阶段（运行层面的顺序与预算由
 	// 生成项目里 app/helper/lifecycle 与 middleware 的 shutdown 测试覆盖，这里只钉接线）。
 	bootstrap := readFile(t, filepath.Join(app, "bootstrap.go"))
 	start := funcBody(bootstrap, "func startRequestLogQueue(")
-	if !strings.Contains(start, "stopRequestLogs = middleware.StartRequestLogQueue(cfg)") || strings.Contains(start, "cleanups") {
-		t.Errorf("日志队列的停止函数应作为独立的排空阶段，不能混进 cleanups:\n%s", start)
+	if !strings.Contains(start, "stopRequestLogs = middleware.StartRequestLogQueue(cfg)") || strings.Contains(start, "cleanup") {
+		t.Errorf("日志队列的停止函数应作为独立的排空阶段，不能混进资源关闭的步骤:\n%s", start)
+	}
+	if strings.Contains(funcBody(bootstrap, "func cleanupSteps("), "stopRequestLogs") {
+		t.Error("日志队列的停止函数不能混进资源关闭的步骤（cleanupSteps）")
 	}
 	shutdown := funcBody(bootstrap, "func gracefulShutdown(")
-	for _, must := range []string{"lifecycle.Plan{", "StopHTTP:       taurus.Container.Http.Shutdown", "ForceCloseHTTP: taurus.Container.Http.Close", "DrainLogs:      stopRequestLogs", "Cleanups:       cleanups"} {
-		if !strings.Contains(shutdown, must) {
-			t.Errorf("gracefulShutdown 缺少 %q:\n%s", must, shutdown)
+	if !strings.Contains(shutdown, "plan := shutdownPlan(shutdownBudget)") || !strings.Contains(shutdown, "plan.Run()") {
+		t.Errorf("gracefulShutdown 应按 shutdownPlan(shutdownBudget) 执行退出:\n%s", shutdown)
+	}
+	plan := funcBody(bootstrap, "func shutdownPlan(")
+	for _, must := range []string{"lifecycle.Plan{", "Ingress:   ingresses()", "DrainLogs: stopRequestLogs", "Cleanups:  cleanupSteps()"} {
+		if !strings.Contains(plan, must) {
+			t.Errorf("shutdownPlan 缺少 %q:\n%s", must, plan)
 		}
+	}
+	if ingress := funcBody(bootstrap, "func ingresses("); !strings.Contains(ingress, `{Name: "http", Shutdown: taurus.Container.Http.Shutdown, ForceClose: taurus.Container.Http.Close}`) {
+		t.Errorf("入口阶段必须包含 HTTP 的优雅关闭与到期强制关闭:\n%s", ingress)
 	}
 	if strings.Contains(funcBody(bootstrap, "func Run("), "context.WithTimeout") {
 		t.Error("Run 不应再让 HTTP 关闭与清理共用一个 ctx")
+	}
+}
+
+// assertShutdownOrchestration 统一退出编排的接线（T9 阶段 2）。运行层面的顺序、预算与「卡住一步不阻塞后续」
+// 由生成项目里 app/helper/lifecycle、internal/taurus 的单测覆盖，这里钉住各处接线不被改回去：
+//   - Consul 先注销、HTTP / gRPC / TCP 同时作为入口关闭，gRPC 用原始 Server 的 GracefulStop + Stop；
+//   - 启动失败走清理再非 0 退出，不能 log.Fatal 跳过清理；
+//   - 组件 cleanup 的限时做在 Provide* 里（wire 重新生成不会丢），cron 先于日志 / DB 关闭；
+//   - 部署文件的停止等待与 lifecycle.DeployStopWait 一致。
+func assertShutdownOrchestration(t *testing.T, outDir string, selected []string) {
+	t.Helper()
+	backend := filepath.Join(outDir, "backend")
+	bootstrap := readFile(t, filepath.Join(backend, "app", "bootstrap.go"))
+	componentsSrc := readFile(t, filepath.Join(backend, "internal", "taurus", "components.go"))
+	shutdownSrc := readFile(t, filepath.Join(backend, "internal", "taurus", "shutdown.go"))
+	lifecycleSrc := readFile(t, filepath.Join(backend, "app", "helper", "lifecycle", "shutdown.go"))
+
+	// 1. 启动失败：Run 里收到启动错误后经 lifecycle.AbortStartup 走完整退出再非 0 退出（运行时行为由
+	//    生成项目的 TestAbortStartup_* 覆盖）；init 里只有 BuildComponents 失败（已自行回滚）可以直接 log.Fatal，
+	//    其余启动自检失败都走 abortStartup。启动失败不能再借用 gracefulShutdown（它会打印「成功关闭」）。
+	run := funcBody(bootstrap, "func Run() {")
+	if !strings.Contains(run, `lifecycle.AbortStartup(fmt.Errorf("server startup failed: %w", err), shutdownPlan(shutdownBudget), os.Exit)`) ||
+		strings.Contains(run, "log.Fatal") || strings.Contains(run, "gracefulShutdown()\n\t\tos.Exit") {
+		t.Errorf("启动失败必须经 lifecycle.AbortStartup 清理（含入口）再非 0 退出，不能 log.Fatal 跳过清理:\n%s", run)
+	}
+	if !strings.Contains(run, `log.Printf("%s🔗 -> Shutdown capabilities: %s %s\n", Cyan, taurus.ShutdownCapabilities(), Reset)`) {
+		t.Error("Run 启动时应打印一次退出能力路径（Shutdown capabilities）")
+	}
+	abortFn := funcBody(lifecycleSrc, "func AbortStartup(")
+	if runIdx, exitIdx := strings.Index(abortFn, "plan.Run()"), strings.Index(abortFn, "exit(1)"); runIdx < 0 || exitIdx < runIdx || strings.Contains(abortFn, "successfully") {
+		t.Errorf("lifecycle.AbortStartup 必须先清理再 exit(1)，且不打印成功提示:\n%s", abortFn)
+	}
+	if !strings.Contains(run, "shutdownPlan(maxBudget).CheckDeployStopWait()") {
+		t.Error("Run 启动时应用真实的退出计划按最大预算校验部署停止等待")
+	}
+	if n := strings.Count(bootstrap, "log.Fatal"); n != 1 || !strings.Contains(funcBody(bootstrap, "func init() {"), "componentsCleanup, err = taurus.BuildComponents(configPath, env)\n\tif err != nil {\n\t\tlog.Fatal(err)") {
+		t.Errorf("bootstrap.go 只允许 BuildComponents 失败时 log.Fatal（它自己已回滚），实际出现 %d 次", n)
+	}
+	abort := funcBody(bootstrap, "func abortStartup(")
+	if !containsAll(abort, []string{"shutdownPlan(shutdownBudget)", "plan.Ingress = nil", "lifecycle.AbortStartup(fmt.Errorf(format, args...), plan, os.Exit)"}) {
+		t.Errorf("abortStartup 应先有界清理（入口还没启动）再非 0 退出:\n%s", abort)
+	}
+	if serve := funcBody(bootstrap, "func serveInBackground("); !containsAll(serve, []string{"defer close(done)", "if shuttingDown.Load() {", "errChan <-"}) {
+		t.Errorf("serveInBackground 应跟踪 Start 结束、退出开始后的返回不当作启动失败:\n%s", serve)
+	}
+	if !strings.Contains(funcBody(bootstrap, "func gracefulShutdown() {"), "shuttingDown.Store(true)") {
+		t.Error("gracefulShutdown 开始时应标记 shuttingDown")
+	}
+
+	// 2. 入口与摘除
+	plan := funcBody(bootstrap, "func shutdownPlan(")
+	ingress := funcBody(bootstrap, "func ingresses(")
+	if contains(selected, "consul") != strings.Contains(plan, `plan.Deregister = &lifecycle.Step{Name: "consul-deregister", Timeout: lifecycle.DeregisterTimeout, Run: taurus.DeregisterConsulService}`) {
+		t.Errorf("选了 Consul 时退出第一步必须先注销，没选不应出现:\n%s", plan)
+	}
+	if contains(selected, "grpc") != containsAll(ingress, []string{"taurus.ShutdownGRPC(ctx, srv)", "taurus.ForceStopGRPC(srv)"}) {
+		t.Errorf("选了 gRPC 时它必须作为入口与 HTTP 同时关闭（优雅 + 到期强制）:\n%s", ingress)
+	}
+	if contains(selected, "tcp") != strings.Contains(ingress, "taurus.ShutdownTCP(ctx, srv, served)") {
+		t.Errorf("选了 TCP 时它必须作为入口与 HTTP 同时关闭:\n%s", ingress)
+	}
+	if contains(selected, "tcp") && !strings.Contains(run, `tcpServed = serveInBackground("tcp", taurus.Container.TCP.Start, errChan)`) {
+		t.Error("TCP 的 Start 必须被跟踪（旧版组件靠它判断连接处理是否结束）")
+	}
+	if contains(selected, "grpc") {
+		if grpc := funcBody(shutdownSrc, "func ShutdownGRPC("); !strings.Contains(grpc, "srv.Server().GracefulStop()") || !strings.Contains(grpc, "case <-ctx.Done():") {
+			t.Errorf("ShutdownGRPC 必须用原始 Server 的 GracefulStop 并受 ctx 限时:\n%s", grpc)
+		}
+		if !strings.Contains(funcBody(shutdownSrc, "func ForceStopGRPC("), "srv.Server().Stop()") {
+			t.Error("ForceStopGRPC 必须调用原始 Server 的 Stop 强制断开长流")
+		}
+	}
+	if contains(selected, "tcp") && !strings.Contains(shutdownSrc, "StopContext(ctx context.Context) error") {
+		t.Error("ShutdownTCP 应探测新版 TCP 组件的 StopContext")
+	}
+	// 旧版 TCP 兜底拿不到 Start 的结束信号、重复 Stop 立刻返回：不能报成功
+	if contains(selected, "tcp") && (!strings.Contains(funcBody(shutdownSrc, "func ShutdownTCP("), "if served == nil {\n\t\treturn errStopUnconfirmed") ||
+		!strings.Contains(funcBody(shutdownSrc, "func boundedCleanup("), "errors.Is(err, errStopUnconfirmed)")) {
+		t.Error("旧版 TCP 的兜底关闭必须返回 errStopUnconfirmed，并按「无法确认」而不是成功记日志")
+	}
+	if !strings.Contains(funcBody(lifecycleSrc, "func (p Plan) Run() error {"), "go func() {\n\t\t\t\tdefer wg.Done()\n\t\t\t\tresults[i] = runIngress(in, p.Budget.HTTP, logf)") {
+		t.Error("lifecycle.Plan.Run 必须并行关闭所有入口、共用入口预算")
+	}
+
+	// 3. 组件 cleanup 限时做在 Provide* 里（make wire 会覆盖 wire_gen.go，做在那里会丢）
+	for _, name := range []string{"database", "redis", "cron", "log"} {
+		if !strings.Contains(componentsSrc, `boundedCleanup("`+name+`", `) {
+			t.Errorf("components.go 的 %s cleanup 必须有上限（boundedCleanup）", name)
+		}
+	}
+	for _, c := range []struct{ name, want string }{
+		{"consul", `boundedCleanup("consul", consulCleanupTimeout, func(ctx context.Context) error {` + "\n\t\tdefer client.Close()\n\t\treturn registration.deregister(ctx)"},
+		{"opentelemetry", `boundedCleanup("otel", otelCleanupTimeout, provider.Shutdown)`},
+		{"tcp", `boundedCleanup("tcp", tcpCleanupTimeout, func(ctx context.Context) error {` + "\n\t\treturn ShutdownTCP(ctx, srv, nil)"},
+		{"grpc", `boundedCleanup("grpc", grpcCleanupTimeout, func(ctx context.Context) error {`},
+		{"milvus", `boundedCleanup("milvus", milvusCleanupTimeout, func(context.Context) error {`},
+	} {
+		if contains(selected, c.name) && !strings.Contains(componentsSrc, c.want) {
+			t.Errorf("components.go 的 %s cleanup 应为 %q", c.name, c.want)
+		}
+	}
+	if !strings.Contains(componentsSrc, "return cm.GracefulStop(cronCleanupTimeout - 100*time.Millisecond)") {
+		t.Error("cron 的 GracefulStop 错误必须返回（超时不能照样打印成功）")
+	}
+	// 组件自带的 cleanup（不限时的 GracefulStop / Background ctx 的 Shutdown）不能再被调用
+	for _, banned := range []string{"provider, cleanup, err := otelemetry.NewOTelProvider(", "srv, cleanup, err := tcpserver.NewServer(", "srv, cleanup, err := grpcserver.NewServer(", "client.DeregisterService(serviceConfig.ID)"} {
+		if strings.Contains(componentsSrc, banned) {
+			t.Errorf("components.go 不应再使用组件自带的不限时关闭: %q", banned)
+		}
+	}
+	if contains(selected, "consul") && !containsAll(shutdownSrc, []string{"DeregisterServiceContext(ctx context.Context, serviceID string) error", "r.started.CompareAndSwap(false, true)", "不支持取消"}) {
+		t.Error("Consul 注销应探测可取消 API、只注销一次，旧版本的限时等待要如实说明取消不了")
+	}
+
+	// 4. 关闭顺序：wire 按 Components 字段顺序初始化、逆序关闭。Cron 必须最后初始化（最先停：定时任务
+	//    可能用到任何组件），Logger 紧跟 Config 初始化（最后关）。检查的是 wire 真正生成的 wire_gen.go
+	//    （RunWire），不是模板里的基线。
+	wireGen := readFile(t, filepath.Join(backend, "internal", "taurus", "wire_gen.go"))
+	provides := regexp.MustCompile(`Provide\w+Component\(`).FindAllString(wireGen, -1)
+	if len(provides) < 6 || provides[0] != "ProvideConfigComponent(" || provides[1] != "ProvideLoggerComponent(" || provides[len(provides)-1] != "ProvideCronComponent(" {
+		t.Errorf("wire_gen.go 初始化顺序应为 Config、Logger …… Cron（逆序关闭时 Cron 最先停、日志最后关），实际 %v", provides)
+	}
+	if !strings.Contains(componentsSrc, "\tConfig *config.Config\n\tLogger *logx.Manager\n") || !strings.Contains(componentsSrc, "\tCron   *cron.CronManager\n}") {
+		t.Error("Components 的 Logger 字段应紧跟 Config（最后关闭），Cron 应是最后一个字段（最先关闭）")
+	}
+
+	// 5. 部署停止等待与 lifecycle.DeployStopWait 一致
+	m := regexp.MustCompile(`DeployStopWait = (\d+) \* time\.Second`).FindStringSubmatch(lifecycleSrc)
+	if m == nil {
+		t.Fatal("lifecycle 缺少 DeployStopWait 常量")
+	}
+	wait := m[1]
+	compose := readFile(t, filepath.Join(outDir, "docker-compose.yml"))
+	deployDoc := readFile(t, filepath.Join(outDir, "docs", "部署文档.md"))
+	if !strings.Contains(compose, "stop_grace_period: "+wait+"s\n") {
+		t.Errorf("docker-compose.yml 的 stop_grace_period 应为 %ss", wait)
+	}
+	if !strings.Contains(deployDoc, "stopwaitsecs="+wait+"\n") || !strings.Contains(deployDoc, "<key>ExitTimeOut</key>\n    <integer>"+wait+"</integer>") {
+		t.Errorf("部署文档的 stopwaitsecs / ExitTimeOut 应为 %s", wait)
+	}
+	for _, stale := range []string{"stop_grace_period: 30s", "stopwaitsecs=30", "15.5 秒"} {
+		if strings.Contains(compose+deployDoc, stale) {
+			t.Errorf("部署文件仍有旧的退出预算 %q", stale)
+		}
+	}
+	if contains(selected, "tcp") {
+		tcpYAML := readFile(t, filepath.Join(backend, "config", "autoload", "tcp", "tcp.yaml"))
+		if !containsAll(tcpYAML, []string{"被 app 直接或间接导入的包（例如 app/hooks）", "只被 main 导入的包", "启动照常成功", "回退到组件自带的 default"}) || strings.Contains(tcpYAML, "启动会因为找不到 handler 失败") {
+			t.Error("tcp.yaml 应说明 handler 必须在被 app 导入的包初始化期间注册、太晚注册或未注册静默回退 default")
+		}
 	}
 }
 
@@ -1740,8 +1909,8 @@ func assertAdminRateLimit(t *testing.T, outDir string) {
 	if !strings.Contains(initBoot, "middleware.InitAdminRateLimiter(taurus.Container.Config.GetString)") {
 		t.Error("initAdminRateLimit 应用 GetString 解析配置：GetInt 会把 abc 静默当成 0，即「悄悄关掉限流」")
 	}
-	if !strings.Contains(initBoot, "log.Fatalf") {
-		t.Error("后台限流配置非法时应直接终止启动，而不是打条日志继续跑")
+	if !strings.Contains(initBoot, "abortStartup(") {
+		t.Error("后台限流配置非法时应直接终止启动（abortStartup：清理后非 0 退出），而不是打条日志继续跑")
 	}
 	// 解析必须走 GetString（见上），所以函数签名里不能出现 GetInt
 	if strings.Contains(initFn, "GetInt") {
@@ -1972,27 +2141,27 @@ func assertLogRetentionWiring(t *testing.T, outDir string) {
 	if !strings.Contains(start, "service.ResolveLogRetentionDays(") {
 		t.Error("startLogCleanup 应通过 service.ResolveLogRetentionDays 解析保留期")
 	}
-	// 停止函数必须注册进 cleanups，而且必须**头插**：cleanups 是顺序执行的，
-	// BuildComponents 的 cleanup（关 DB / Redis / 日志）已经在队首。
-	// 直接 append 的话会先关数据库，再去停这个还在发 DELETE 的后台任务，
-	// 退出日志里全是 `sql: database is closed`。
-	if !strings.Contains(start, "cleanups = append([]func(){stop}, cleanups...)") {
-		t.Error("清理任务的停止函数必须头插进 cleanups：append 会让数据库先于后台任务关闭")
+	// 停止函数必须注册成资源关闭阶段的一步，而且必须排在 components 之前：步骤是顺序执行的，
+	// components（BuildComponents 的 cleanup，关 DB / Redis / 日志）先跑的话会先关数据库，
+	// 再去停这个还在发 DELETE 的后台任务，退出日志里全是 `sql: database is closed`。
+	if !strings.Contains(start, "stopLogCleaner = service.NewLogCleaner(repo.NewStore(), days).Start()") {
+		t.Error("清理任务的停止函数必须注册为 stopLogCleaner（资源关闭阶段的 log-cleaner 步骤）")
 	}
-	if strings.Contains(start, "cleanups = append(cleanups, stop)") {
-		t.Error("清理任务的停止函数不能尾插：cleanups 的顺序就是关闭顺序")
+	steps := funcBody(bootstrap, "func cleanupSteps(")
+	if lc, comp := strings.Index(steps, `Name: "log-cleaner"`), strings.Index(steps, `Name: "components"`); lc < 0 || comp < 0 || lc > comp {
+		t.Errorf("log-cleaner 必须排在 components 之前：步骤的顺序就是关闭顺序\n%s", steps)
 	}
-	// 退出编排挪到了 app/helper/lifecycle：gracefulShutdown 把 cleanups 原样交给 Plan，
-	// Plan.Run 按切片顺序执行 —— 头插的前提仍然成立。
-	if !strings.Contains(funcBody(bootstrap, "func gracefulShutdown("), "Cleanups:       cleanups") {
-		t.Error("gracefulShutdown 应把 cleanups 原样交给 lifecycle.Plan")
+	// 退出编排在 app/helper/lifecycle：shutdownPlan 把 cleanupSteps 原样交给 Plan，
+	// Plan.Run 按切片顺序执行 —— 上面的顺序就是实际关闭顺序。
+	if !strings.Contains(funcBody(bootstrap, "func shutdownPlan("), "Cleanups:  cleanupSteps()") {
+		t.Error("shutdownPlan 应把 cleanupSteps() 原样交给 lifecycle.Plan")
 	}
 	plan := funcBody(readFile(t, filepath.Join(backend, "app", "helper", "lifecycle", "shutdown.go")), "func (p Plan) Run() error {")
-	if !strings.Contains(plan, "for _, cleanup := range p.Cleanups {") {
-		t.Error("lifecycle.Plan.Run 应顺序遍历 cleanups：头插的前提是它按切片顺序执行")
+	if !strings.Contains(plan, "for _, s := range p.Cleanups {") || strings.Contains(plan, "go func() {\n\t\tfor _, s := range p.Cleanups") {
+		t.Error("lifecycle.Plan.Run 应按切片顺序逐步执行 Cleanups：顺序的前提是它按切片顺序执行")
 	}
 	// 配置非法时拒绝启动：这个值控制不可逆的删除，不能按一个猜出来的保留期去删
-	if !strings.Contains(start, "log.Fatalf") {
+	if !strings.Contains(start, "abortStartup(") {
 		t.Error("保留期配置非法时必须让启动失败，不能回退到某个默认值继续删数据")
 	}
 	cleanupSrc := readFile(t, filepath.Join(backend, "app", "service", "log_cleanup.go"))

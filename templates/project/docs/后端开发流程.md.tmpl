@@ -318,6 +318,11 @@ cd backend && make wire && go build ./...
 - 富集字段（父名称、创建人名、状态名）是否齐全。
 - 状态机 / 业务门控的操作按钮后端是否暴露 `can_xxx`。
 
+**发版前**（命令说明与结果判读见 [`运维手册.md`](运维手册.md)）：
+- `make vuln`：依赖漏洞扫描，退出码非 0 不能发版（工具自身出错也不算通过）；
+- `make sbom`：需要交付 SBOM 时生成；
+- 新增了只读列表接口、又想压测它时，在 `scripts/loadtest/main.go` 的 `listEndpoints` 里按前端列表页的「不过滤」条件补一条，并跑 `cd scripts/loadtest && go test ./...`。
+
 ---
 
 ## 五、Checklist（提交前逐项自查）
@@ -427,10 +432,12 @@ wire:
 
 两个日志中间件不再每个请求起一个 `go func` 写库，而是把日志交给 `app/middleware/request_log_queue.go` 的有界队列，
 由固定数量的 worker 写库：队列满时直接丢弃并计数（请求不等日志），丢弃与写库失败每分钟最多告警一条汇总；
-进程优雅退出分三个阶段、各自计时（`app/helper/lifecycle`，由 `app/bootstrap.go` 的 `gracefulShutdown` 编排）：
-HTTP 关闭（`http.shutdown_timeout`，超时后强制断开连接，但仍在执行的 handler 不会被终止）→ 日志排空
-（`http.request_log.drain_timeout_seconds`，超时取消在写的写入、剩余日志不再写入）→ 资源关闭（cleanups，5 秒）。
-HTTP 关得慢不会占用后两个阶段的预算；总退出上限 = 三者之和 + 0.5 秒（默认 15.5 秒），守护进程的停止等待必须更长。
+进程优雅退出分四个阶段、各自计时（`app/helper/lifecycle`，由 `app/bootstrap.go` 的 `gracefulShutdown` 编排）：
+Consul 注销（选了 Consul 时）→ 入口关闭（HTTP / gRPC / TCP 同时停止接新连接，共用 `http.shutdown_timeout`，
+超时后强制断开连接，但仍在执行的 handler 不会被终止）→ 日志排空（`http.request_log.drain_timeout_seconds`，
+超时取消在写的写入、剩余日志不再写入）→ 资源关闭（`cleanupSteps` 的顺序逐步执行，每步单独限时）。
+前面的阶段慢不会占用后面阶段的预算；最坏总耗时与部署停止等待（45 秒）见项目 README 的「优雅退出」。
+新增会访问 DB / Redis 的后台任务时，把它的停止函数作为一步加进 `cleanupSteps`、排在 `components` 之前，并给出上限。
 日志队列关闭后，还在跑的 handler 再写日志会被丢弃计数。写入回调若不理会 ctx，worker 可能在资源关闭后才结束（会记录告警），
 这是 Go 无法强杀协程带来的限制。
 容量、worker 数、等待时间见 `config/autoload/http/http.yaml`

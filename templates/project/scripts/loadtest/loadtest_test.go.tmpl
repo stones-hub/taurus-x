@@ -1,0 +1,804 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+const (
+	testUser     = "loadtest-user"
+	testPassword = "Pa55-word-for-test-only"
+)
+
+// fakeBackend 按生成项目的真实约定实现 /auth/login、/auth/logout 和列表接口：
+//   - 登录：只收 POST、Origin 必须等于 scheme://Host、Content-Type 必须正好是 application/json；
+//     成功时下发 HttpOnly 的 jwt_token Cookie 和 x-csrf-token Cookie + 响应头，响应体不含令牌；
+//   - 业务错误按 httpx.SendResponse 的形态回 HTTP 200 + body.code（401 等），限流回真实 429；
+//   - 列表：只认 jwt_token Cookie（带 Authorization 头会被记下来让测试失败），
+//     x-csrf-token 请求头必须等于 Cookie 且属于这个会话；
+//   - 登出（与 backend/app/controller/auth_controller.go 的 Logout 一致）：请求里没有有效令牌时
+//     也回成功（只清 Cookie）；令牌有效但 CSRF 不匹配回 HTTP 403；成功后吊销会话并下发过期 Cookie。
+type fakeBackend struct {
+	t *testing.T
+
+	mu       sync.Mutex
+	sessions map[string]string // jwt -> csrf
+	issued   []string          // 发出过的全部 jwt / csrf 值，用来检查报告没有泄漏
+	used     map[string]bool   // 列表请求实际用到的 jwt
+
+	loginLimit int64 // >0 时第 loginLimit+1 次起回 429
+	// jwtPath 非空时 jwt_token Cookie 用这个 Path：jar 不会把它发给 /auth/logout，
+	// 模拟「登录成功但 jar 不发送令牌」（例如 Secure Cookie 遇上非回环的 http 地址）。
+	jwtPath     string
+	noClear     bool          // 登出回成功但不下发过期 Cookie（用来验证工具不只看 body.code）
+	noHttpOnly  bool          // 登录下发的 jwt_token 不带 HttpOnly：工具判登录失败，但会话已经建了
+	noCSRF      bool          // 登录不下发 CSRF Cookie / 响应头：会话已建，但之后带不出 CSRF，登出会被拒
+	onLogin     func(n int64) // 第 n 次登录成功建会话后调用（在服务启动前设置）
+	listDelay   time.Duration
+	listBody    []byte
+	logins      atomic.Int64
+	inflight    atomic.Int64
+	maxInflight atomic.Int64
+	sawAuthz    atomic.Bool
+}
+
+// newFakeBackend 起假后端。opts 在服务启动**之前**应用：服务端 goroutine 读这些字段，
+// 启动后再改会构成数据竞争（请求来自子进程时，race 检测器看不到跨进程的先后关系）。
+func newFakeBackend(t *testing.T, opts ...func(*fakeBackend)) (*fakeBackend, *httptest.Server) {
+	fb := &fakeBackend{t: t, sessions: map[string]string{}, used: map[string]bool{}}
+	for _, opt := range opts {
+		opt(fb)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/auth/login", fb.login)
+	mux.HandleFunc("/auth/logout", fb.logout)
+	mux.HandleFunc("/admin/user/list", fb.list)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return fb, srv
+}
+
+func randomToken() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(b)
+}
+
+func writeEnvelope(w http.ResponseWriter, code int, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"code": code, "message": "x", "data": data})
+}
+
+func (fb *fakeBackend) checkCommon(w http.ResponseWriter, r *http.Request) bool {
+	if r.Header.Get("Authorization") != "" {
+		fb.sawAuthz.Store(true)
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return false
+	}
+	if r.Header.Get("Origin") != "http://"+r.Host {
+		http.Error(w, "Forbidden origin", http.StatusForbidden)
+		return false
+	}
+	return true
+}
+
+func (fb *fakeBackend) login(w http.ResponseWriter, r *http.Request) {
+	if !fb.checkCommon(w, r) {
+		return
+	}
+	if n := fb.logins.Add(1); fb.loginLimit > 0 && n > fb.loginLimit {
+		w.Header().Set("Retry-After", "6")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": 429, "message": "Too Many Requests"})
+		return
+	}
+	if r.Header.Get("Content-Type") != "application/json" {
+		writeEnvelope(w, 400, map[string]string{"message": "请求参数解析失败"})
+		return
+	}
+	var req struct{ Username, Password string }
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeEnvelope(w, 400, map[string]string{"message": "请求参数解析失败"})
+		return
+	}
+	if req.Username != testUser || req.Password != testPassword {
+		writeEnvelope(w, 401, map[string]string{"message": "用户名或密码错误"})
+		return
+	}
+	jwt, csrf := randomToken(), randomToken()
+	fb.mu.Lock()
+	fb.sessions[jwt] = csrf
+	fb.issued = append(fb.issued, jwt, csrf)
+	fb.mu.Unlock()
+	jwtPath := "/"
+	if fb.jwtPath != "" {
+		jwtPath = fb.jwtPath
+	}
+	http.SetCookie(w, &http.Cookie{Name: "jwt_token", Value: jwt, Path: jwtPath, HttpOnly: !fb.noHttpOnly, SameSite: http.SameSiteLaxMode})
+	if !fb.noCSRF {
+		http.SetCookie(w, &http.Cookie{Name: "x-csrf-token", Value: csrf, Path: "/", SameSite: http.SameSiteLaxMode})
+		w.Header().Set("x-csrf-token", csrf)
+	}
+	if fb.onLogin != nil {
+		fb.onLogin(fb.logins.Load())
+	}
+	writeEnvelope(w, 200, map[string]any{"user": map[string]any{"user_id": 1}, "expires_at": time.Now().Add(time.Hour)})
+}
+
+// session 返回请求对应的 jwt；CSRF 不匹配或会话不存在时返回空。
+func (fb *fakeBackend) session(r *http.Request) string {
+	ck, err := r.Cookie("jwt_token")
+	if err != nil {
+		return ""
+	}
+	csrfCookie, err := r.Cookie("x-csrf-token")
+	if err != nil {
+		return ""
+	}
+	header := r.Header.Get("x-csrf-token")
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	want, ok := fb.sessions[ck.Value]
+	if !ok || header == "" || header != csrfCookie.Value || header != want {
+		return ""
+	}
+	return ck.Value
+}
+
+func (fb *fakeBackend) list(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Authorization") != "" {
+		fb.sawAuthz.Store(true)
+	}
+	n := fb.inflight.Add(1)
+	defer fb.inflight.Add(-1)
+	for {
+		old := fb.maxInflight.Load()
+		if n <= old || fb.maxInflight.CompareAndSwap(old, n) {
+			break
+		}
+	}
+	jwt := fb.session(r)
+	if jwt == "" {
+		writeEnvelope(w, 401, map[string]string{"message": "CSRF token 不匹配"})
+		return
+	}
+	// 与用户列表页一致的「不过滤」请求：status 必须是 -1（QUERY_ALL），不是缺省的 0。
+	var req struct {
+		PageNo   int     `json:"page_no"`
+		PageSize int     `json:"page_size"`
+		Keyword  *string `json:"username_mobile_email"`
+		Status   *int    `json:"status"`
+	}
+	if r.Header.Get("Content-Type") != "application/json" || json.NewDecoder(r.Body).Decode(&req) != nil ||
+		req.PageNo != 1 || req.PageSize < 1 || req.Keyword == nil || req.Status == nil || *req.Status != -1 {
+		writeEnvelope(w, 400, map[string]string{"message": "请求参数格式错误"})
+		return
+	}
+	fb.mu.Lock()
+	fb.used[jwt] = true
+	fb.mu.Unlock()
+	if fb.listDelay > 0 {
+		select {
+		case <-time.After(fb.listDelay):
+		case <-r.Context().Done():
+			return
+		}
+	}
+	if fb.listBody != nil {
+		w.Write(fb.listBody)
+		return
+	}
+	writeEnvelope(w, 200, map[string]any{"list": []any{}, "total": 0})
+}
+
+func (fb *fakeBackend) logout(w http.ResponseWriter, r *http.Request) {
+	if !fb.checkCommon(w, r) {
+		return
+	}
+	if ck, err := r.Cookie("jwt_token"); err == nil {
+		fb.mu.Lock()
+		_, valid := fb.sessions[ck.Value]
+		fb.mu.Unlock()
+		if valid {
+			jwt := fb.session(r)
+			if jwt == "" {
+				http.Error(w, "Invalid CSRF token", http.StatusForbidden)
+				return
+			}
+			fb.mu.Lock()
+			delete(fb.sessions, jwt)
+			fb.mu.Unlock()
+		}
+	}
+	// 真实后端：没有有效令牌时无需吊销，照样清 Cookie、回「登出成功」。
+	if !fb.noClear {
+		http.SetCookie(w, &http.Cookie{Name: "jwt_token", Value: "", Path: "/", MaxAge: -1})
+		http.SetCookie(w, &http.Cookie{Name: "x-csrf-token", Value: "", Path: "/", MaxAge: -1})
+	}
+	writeEnvelope(w, 200, map[string]string{"message": "登出成功"})
+}
+
+func (fb *fakeBackend) liveSessions() int {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	return len(fb.sessions)
+}
+
+func testEnv(name string) string {
+	switch name {
+	case envUsername:
+		return testUser
+	case envPassword:
+		return testPassword
+	}
+	return ""
+}
+
+// runTool 跑一次工具，返回退出码、标准输出、标准错误与 JSON 报告。
+func runTool(t *testing.T, args ...string) (int, string, string, *report) {
+	t.Helper()
+	jsonPath := filepath.Join(t.TempDir(), "report.json")
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), append(args, "-json", jsonPath), testEnv, &stdout, &stderr)
+	var rep *report
+	if data, err := os.ReadFile(jsonPath); err == nil {
+		rep = &report{}
+		if err := json.Unmarshal(data, rep); err != nil {
+			t.Fatalf("JSON 报告无法解析: %v\n%s", err, data)
+		}
+		info, _ := os.Stat(jsonPath)
+		if info.Mode().Perm() != 0o600 {
+			t.Errorf("JSON 报告权限应为 0600，实际 %v", info.Mode().Perm())
+		}
+		stdout.WriteString(string(data))
+	}
+	return code, stdout.String(), stderr.String(), rep
+}
+
+func assertNoSecrets(t *testing.T, fb *fakeBackend, outputs ...string) {
+	t.Helper()
+	fb.mu.Lock()
+	issued := append([]string(nil), fb.issued...)
+	fb.mu.Unlock()
+	for _, out := range outputs {
+		if strings.Contains(out, testPassword) {
+			t.Error("报告里出现了密码")
+		}
+		for _, v := range issued {
+			if strings.Contains(out, v) {
+				t.Error("报告里出现了 jwt / csrf 令牌值")
+			}
+		}
+	}
+}
+
+func TestLoginScenario_UsesRealCookieAndCSRF(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	code, out, errOut, rep := runTool(t, "-scenario", "login", "-base-url", srv.URL, "-duration", "300ms", "-concurrency", "2")
+	if code != exitOK || rep == nil {
+		t.Fatalf("退出码 %d，应为 0\nstdout:\n%s\nstderr:\n%s", code, out, errOut)
+	}
+	if rep.Success == 0 || rep.Success != rep.Total {
+		t.Fatalf("登录应全部成功: total=%d success=%d", rep.Total, rep.Success)
+	}
+	if rep.Latency == nil || rep.Latency.Samples != int(rep.Success) {
+		t.Fatalf("成功样本数应等于成功请求数: %+v", rep.Latency)
+	}
+	if rep.LogoutFailures != 0 || fb.liveSessions() != 0 {
+		t.Fatalf("每次登录后都应登出吊销会话: logoutFailures=%d live=%d", rep.LogoutFailures, fb.liveSessions())
+	}
+	if fb.sawAuthz.Load() {
+		t.Fatal("工具不应发送 Authorization 头")
+	}
+	assertNoSecrets(t, fb, out, errOut)
+}
+
+func TestLoginScenario_WrongPasswordIsBusinessFailure(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	var stdout, stderr bytes.Buffer
+	env := func(name string) string {
+		if name == envPassword {
+			return "wrong-password"
+		}
+		return testEnv(name)
+	}
+	code := run(context.Background(), []string{"-scenario", "login", "-base-url", srv.URL, "-duration", "100ms", "-concurrency", "1"}, env, &stdout, &stderr)
+	if code != exitFailed {
+		t.Fatalf("密码错误时退出码应为 1，实际 %d", code)
+	}
+	if !strings.Contains(stdout.String(), "body.code 401×") || !strings.Contains(stdout.String(), "无成功样本") {
+		t.Fatalf("应记为业务失败且不计算分位:\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "wrong-password") {
+		t.Fatal("报告里出现了密码")
+	}
+}
+
+func TestLoginScenario_RateLimitIsNotSuccess(t *testing.T) {
+	_, srv := newFakeBackend(t, func(fb *fakeBackend) { fb.loginLimit = 3 })
+	code, out, _, rep := runTool(t, "-scenario", "login", "-base-url", srv.URL, "-duration", "200ms", "-concurrency", "2")
+	if code != exitFailed {
+		t.Fatalf("出现 429 时退出码应为 1，实际 %d", code)
+	}
+	if rep.Success != 3 || rep.RateLimited == 0 || rep.RateLimited != rep.Total-3 {
+		t.Fatalf("429 应单独计数且不算成功: %+v", rep)
+	}
+	if rep.RetryAfter["6"] != rep.RateLimited {
+		t.Fatalf("应记录 Retry-After: %v", rep.RetryAfter)
+	}
+	if !strings.Contains(out, "量到的是限流器") {
+		t.Fatalf("出现 429 时报告应提示结果不代表服务容量:\n%s", out)
+	}
+	// -max-error-rate 放宽到 1 时允许 429，退出码为 0（显式选择，而不是默认把限流当成无误）。
+	_, srv2 := newFakeBackend(t, func(fb *fakeBackend) { fb.loginLimit = 1 })
+	if code, _, _, _ := runTool(t, "-scenario", "login", "-base-url", srv2.URL, "-duration", "100ms", "-max-error-rate", "1"); code != exitOK {
+		t.Fatalf("-max-error-rate 1 时退出码应为 0，实际 %d", code)
+	}
+}
+
+func TestListScenario_IsolatedSessionPerWorker(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	code, out, errOut, rep := runTool(t, "-scenario", "list", "-base-url", srv.URL, "-duration", "300ms", "-concurrency", "3")
+	if code != exitOK {
+		t.Fatalf("退出码 %d\n%s\n%s", code, out, errOut)
+	}
+	if rep.Success == 0 || rep.Success != rep.Total {
+		t.Fatalf("列表请求应全部成功: %+v", rep)
+	}
+	if got := fb.logins.Load(); got != 3 {
+		t.Fatalf("每个 worker 应各登录一次，实际登录 %d 次", got)
+	}
+	fb.mu.Lock()
+	used := len(fb.used)
+	fb.mu.Unlock()
+	if used != 3 {
+		t.Fatalf("3 个 worker 应各用自己的会话，实际用到 %d 个会话", used)
+	}
+	if fb.liveSessions() != 0 {
+		t.Fatalf("结束后应登出全部会话，剩余 %d", fb.liveSessions())
+	}
+	if fb.sawAuthz.Load() {
+		t.Fatal("列表请求只能靠 Cookie + CSRF，不能带 Authorization 头")
+	}
+	if !strings.HasSuffix(rep.Target, "/admin/user/list") {
+		t.Fatalf("目标应为列表接口: %s", rep.Target)
+	}
+	assertNoSecrets(t, fb, out, errOut)
+}
+
+func TestListScenario_SetupLoginFailureAborts(t *testing.T) {
+	fb, srv := newFakeBackend(t, func(fb *fakeBackend) { fb.loginLimit = 1 })
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{"-scenario", "list", "-base-url", srv.URL, "-duration", "100ms", "-concurrency", "3"}, testEnv, &stdout, &stderr)
+	if code != exitSetup {
+		t.Fatalf("预登录被限流时退出码应为 %d，实际 %d", exitSetup, code)
+	}
+	if !strings.Contains(stderr.String(), "429") || stdout.Len() != 0 {
+		t.Fatalf("应说明预登录被限流且不输出压测报告:\nstdout=%s\nstderr=%s", stdout.String(), stderr.String())
+	}
+	if fb.liveSessions() != 0 {
+		t.Fatalf("放弃前应登出已建立的会话，剩余 %d", fb.liveSessions())
+	}
+}
+
+func TestListScenario_ConcurrencyBudget(t *testing.T) {
+	fb, srv := newFakeBackend(t, func(fb *fakeBackend) { fb.listDelay = 20 * time.Millisecond })
+	code, _, _, rep := runTool(t, "-scenario", "list", "-base-url", srv.URL, "-duration", "300ms", "-concurrency", "4")
+	if code != exitOK {
+		t.Fatalf("退出码 %d", code)
+	}
+	if got := fb.maxInflight.Load(); got > 4 || got < 2 {
+		t.Fatalf("在途请求峰值应在 [2, 4]，实际 %d", got)
+	}
+	// 每个请求至少 20ms，4 个 worker、约 0.3s：总数有上界，用它确认没有「超发」。
+	if limit := int64(4 * (300/20 + 2)); rep.Total > limit {
+		t.Fatalf("请求数 %d 超过并发预算上界 %d", rep.Total, limit)
+	}
+}
+
+func TestListScenario_TimeoutBoundsRunAndEmptySamples(t *testing.T) {
+	_, srv := newFakeBackend(t, func(fb *fakeBackend) { fb.listDelay = 2 * time.Second })
+	start := time.Now()
+	code, out, _, rep := runTool(t, "-scenario", "list", "-base-url", srv.URL, "-duration", "100ms", "-timeout", "150ms", "-concurrency", "2")
+	if took := time.Since(start); took > 1500*time.Millisecond {
+		t.Fatalf("超时应约束总耗时，实际 %s", took)
+	}
+	if code != exitFailed {
+		t.Fatalf("全部超时时退出码应为 1，实际 %d", code)
+	}
+	if rep.TransportError == 0 || rep.TransportKinds["timeout"] != rep.TransportError || rep.Success != 0 {
+		t.Fatalf("应全部记为超时传输错误: %+v", rep)
+	}
+	if rep.Latency != nil || rep.ErrorRate == nil || *rep.ErrorRate != 1 {
+		t.Fatalf("无成功样本时不应给出分位，错误率应为 1: %+v", rep)
+	}
+	if strings.Contains(out, "NaN") {
+		t.Fatal("报告不应出现 NaN")
+	}
+	// 实际测量时长包含在途请求的收尾，长于设定时长；QPS 必须按实际时长算。
+	if rep.ElapsedSeconds < 0.1 {
+		t.Fatalf("实际测量时长 %.3fs 不应短于设定时长", rep.ElapsedSeconds)
+	}
+	if want := float64(rep.Total) / rep.ElapsedSeconds; rep.QPS != want {
+		t.Fatalf("QPS 应为 total/实际时长 = %v，实际 %v", want, rep.QPS)
+	}
+}
+
+func TestDo_ClassifiesResponses(t *testing.T) {
+	big := bytes.Repeat([]byte("a"), 2048)
+	cases := []struct {
+		name    string
+		handler http.HandlerFunc
+		want    outcome
+	}{
+		{"成功", func(w http.ResponseWriter, r *http.Request) { writeEnvelope(w, 200, nil) }, outcomeSuccess},
+		{"业务失败（HTTP 200 + code 403）", func(w http.ResponseWriter, r *http.Request) { writeEnvelope(w, 403, nil) }, outcomeBusinessFailure},
+		{"限流", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusTooManyRequests) }, outcomeRateLimited},
+		{"HTTP 403", func(w http.ResponseWriter, r *http.Request) { http.Error(w, "Forbidden origin", http.StatusForbidden) }, outcomeHTTPError},
+		{"重定向不跟随", func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, "/elsewhere", http.StatusFound) }, outcomeHTTPError},
+		{"不是 JSON", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("<html>")) }, outcomeInvalidResponse},
+		{"缺 code 字段", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{"data":1}`)) }, outcomeInvalidResponse},
+		{"响应体超限", func(w http.ResponseWriter, r *http.Request) { w.Write(big) }, outcomeInvalidResponse},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+			cfg, err := parseConfig([]string{"-scenario", "list", "-base-url", srv.URL, "-max-body", "1024"}, testEnv, &bytes.Buffer{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := newClient(cfg, http.DefaultTransport, newJar())
+			if got := c.list().outcome; got != tc.want {
+				t.Fatalf("分类为 %d，应为 %d", got, tc.want)
+			}
+		})
+	}
+	// 登录 code 200 但没下发 HttpOnly 的 jwt_token：不能算成功。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "jwt_token", Value: "v", Path: "/"})
+		http.SetCookie(w, &http.Cookie{Name: "x-csrf-token", Value: "c", Path: "/"})
+		writeEnvelope(w, 200, nil)
+	}))
+	defer srv.Close()
+	cfg, _ := parseConfig([]string{"-scenario", "login", "-base-url", srv.URL}, testEnv, &bytes.Buffer{})
+	if got := newClient(cfg, http.DefaultTransport, newJar()).login().outcome; got != outcomeInvalidResponse {
+		t.Fatalf("jwt_token 不是 HttpOnly 时应记为响应异常，实际 %d", got)
+	}
+}
+
+func TestTransportErrorWhenServerDown(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	base := srv.URL
+	srv.Close()
+	code, _, _, rep := runTool(t, "-scenario", "login", "-base-url", base, "-duration", "100ms", "-concurrency", "1")
+	if code != exitFailed || rep.TransportError == 0 || rep.TransportError != rep.Total {
+		t.Fatalf("连不上时应全部记为传输错误: code=%d %+v", code, rep)
+	}
+}
+
+func TestParseConfig_Guards(t *testing.T) {
+	ok := []string{"-scenario", "login"}
+	cases := []struct {
+		name string
+		args []string
+		env  func(string) string
+	}{
+		{"缺场景", []string{}, testEnv},
+		{"未知场景", []string{"-scenario", "write"}, testEnv},
+		{"非回环地址", append(ok, "-base-url", "http://10.0.0.8:9080"), testEnv},
+		{"域名也算非回环", append(ok, "-base-url", "https://admin.example.com"), testEnv},
+		{"带路径", append(ok, "-base-url", "http://127.0.0.1:9080/api"), testEnv},
+		{"带用户信息", append(ok, "-base-url", "http://u:p@127.0.0.1:9080"), testEnv},
+		{"非 http 协议", append(ok, "-base-url", "ftp://127.0.0.1"), testEnv},
+		{"时长为 0", append(ok, "-duration", "0s"), testEnv},
+		{"时长超上限", append(ok, "-duration", "11m"), testEnv},
+		{"并发为 0", append(ok, "-concurrency", "0"), testEnv},
+		{"并发超上限", append(ok, "-concurrency", "65"), testEnv},
+		{"超时超上限", append(ok, "-timeout", "61s"), testEnv},
+		{"响应上限过小", append(ok, "-max-body", "10"), testEnv},
+		{"非白名单列表接口", []string{"-scenario", "list", "-list-path", "/admin/user/delete"}, testEnv},
+		{"page-size 超上限", []string{"-scenario", "list", "-page-size", "201"}, testEnv},
+		{"错误率阈值非法", append(ok, "-max-error-rate", "1.5"), testEnv},
+		{"命令行传密码", append(ok, "-password", "x"), testEnv},
+		{"位置参数", append(ok, "extra"), testEnv},
+		{"缺账号环境变量", ok, func(string) string { return "" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			if _, err := parseConfig(tc.args, tc.env, &stderr); err == nil {
+				t.Fatal("应拒绝")
+			}
+		})
+	}
+	for _, base := range []string{"http://127.0.0.1:9080", "http://localhost:9080", "http://[::1]:9080", "http://127.0.0.1:9080/"} {
+		if _, err := parseConfig(append(ok, "-base-url", base), testEnv, &bytes.Buffer{}); err != nil {
+			t.Errorf("%s 应被接受: %v", base, err)
+		}
+	}
+	if _, err := parseConfig(append(ok, "-base-url", "http://10.0.0.8:9080", "-allow-non-loopback"), testEnv, &bytes.Buffer{}); err != nil {
+		t.Errorf("显式 -allow-non-loopback 后应接受非回环地址: %v", err)
+	}
+}
+
+func TestPercentile_NearestRank(t *testing.T) {
+	var hundred []time.Duration
+	for i := 1; i <= 100; i++ {
+		hundred = append(hundred, time.Duration(i)*time.Millisecond)
+	}
+	for p, want := range map[int]time.Duration{50: 50 * time.Millisecond, 95: 95 * time.Millisecond, 99: 99 * time.Millisecond, 100: 100 * time.Millisecond} {
+		if got := percentile(hundred, p); got != want {
+			t.Errorf("P%d = %s，应为 %s", p, got, want)
+		}
+	}
+	three := []time.Duration{1, 2, 3}
+	if percentile(three, 50) != 2 || percentile(three, 95) != 3 || percentile(three, 99) != 3 {
+		t.Error("n=3 时 P50 应取第 2 个，P95/P99 取第 3 个")
+	}
+	one := []time.Duration{7}
+	if percentile(one, 50) != 7 || percentile(one, 99) != 7 {
+		t.Error("单样本时各分位都等于该样本")
+	}
+	// summarize 不依赖输入顺序，且不修改调用方的切片。
+	in := []time.Duration{3 * time.Millisecond, time.Millisecond, 2 * time.Millisecond}
+	s := summarize(in)
+	if s.MinMs != 1 || s.MaxMs != 3 || s.P50Ms != 2 || in[0] != 3*time.Millisecond {
+		t.Errorf("summarize 结果不对或改动了输入: %+v %v", s, in)
+	}
+	if summarize(nil) != nil {
+		t.Error("空样本应返回 nil")
+	}
+}
+
+func TestBuildReport_EmptyAndZeroElapsed(t *testing.T) {
+	cfg, err := parseConfig([]string{"-scenario", "login"}, testEnv, &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep := buildReport(cfg, newTally(), time.Now(), 0, 0, false)
+	if rep.ErrorRate != nil || rep.Latency != nil || rep.QPS != 0 {
+		t.Fatalf("空样本不应产出错误率 / 分位 / QPS: %+v", rep)
+	}
+	if _, err := json.Marshal(rep); err != nil {
+		t.Fatalf("空报告应能序列化: %v", err)
+	}
+	var buf bytes.Buffer
+	rep.writeText(&buf)
+	if !strings.Contains(buf.String(), "无请求") || strings.Contains(buf.String(), "NaN") {
+		t.Fatalf("空报告文本不对:\n%s", buf.String())
+	}
+	if rep.exitCode(1) != exitFailed {
+		t.Fatal("没有完成任何请求时退出码应为 1，即使允许 100% 错误率")
+	}
+
+	tl := newTally()
+	for i := 0; i < 10; i++ {
+		tl.add(result{outcome: outcomeSuccess, latency: time.Millisecond})
+	}
+	rep = buildReport(cfg, tl, time.Now(), 2*time.Second, time.Second, false)
+	if rep.QPS != 5 || rep.SuccessQPS != 5 {
+		t.Fatalf("QPS 应按实际测量时长计算（准备阶段不计入）: %v", rep.QPS)
+	}
+	rep.Interrupted = true
+	if rep.exitCode(1) != exitFailed {
+		t.Fatal("被中断时退出码应为 1")
+	}
+}
+
+func TestRun_InterruptStopsNewRequests(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	var stdout, stderr bytes.Buffer
+	start := time.Now()
+	code := run(ctx, []string{"-scenario", "login", "-base-url", srv.URL, "-duration", "10s", "-concurrency", "1"}, testEnv, &stdout, &stderr)
+	if time.Since(start) > 3*time.Second {
+		t.Fatal("中断后应尽快结束")
+	}
+	if code != exitFailed || !strings.Contains(stdout.String(), "被中断") {
+		t.Fatalf("中断应在报告里标明并返回 1: code=%d\n%s", code, stdout.String())
+	}
+}
+
+// 登录成功但 jar 不会把 jwt_token 发出去（真实场景：JWT_COOKIE_SECURE=true 时用 http 压测非回环地址），
+// 后端对「没带令牌」的登出照样回成功。工具必须把这记为登出失败（会话留在服务端），并让退出码非 0。
+func TestLoginScenario_UnsentJWTLogoutFails(t *testing.T) {
+	fb, srv := newFakeBackend(t, func(fb *fakeBackend) { fb.jwtPath = "/not-sent" })
+	code, out, _, rep := runTool(t, "-scenario", "login", "-base-url", srv.URL, "-duration", "200ms", "-concurrency", "1")
+	if code != exitFailed {
+		t.Fatalf("有会话没能登出时退出码应为 1，实际 %d\n%s", code, out)
+	}
+	if rep.Success == 0 || rep.LogoutFailures != rep.Success {
+		t.Fatalf("每次成功登录后的登出都应记为失败: success=%d logoutFailures=%d", rep.Success, rep.LogoutFailures)
+	}
+	if fb.liveSessions() != int(rep.Success) {
+		t.Fatalf("假后端里应留下 %d 个未吊销的会话，实际 %d", rep.Success, fb.liveSessions())
+	}
+	if !strings.Contains(out, "有会话没能登出") {
+		t.Fatalf("报告应提示有会话没能登出:\n%s", out)
+	}
+}
+
+func TestLogout_RequiresJWTAndServerClearedCookie(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	cfg, err := parseConfig([]string{"-scenario", "login", "-base-url", srv.URL}, testEnv, &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// jar 里没有 jwt_token：不发请求也知道吊销不了任何会话。
+	if newClient(cfg, http.DefaultTransport, newJar()).logout() {
+		t.Fatal("jar 里没有 jwt_token 时登出不能算成功")
+	}
+	// 正常登出：服务端吊销并清 Cookie。
+	c := newClient(cfg, http.DefaultTransport, newJar())
+	if c.login().outcome != outcomeSuccess || !c.logout() || c.cookie(jwtCookieName) != "" || fb.liveSessions() != 0 {
+		t.Fatalf("正常登出应成功并清掉 jwt_token（剩余会话 %d）", fb.liveSessions())
+	}
+	// 服务端回了 code 200 但没清 Cookie：不能只凭 body.code 判成功。
+	fb.noClear = true
+	c = newClient(cfg, http.DefaultTransport, newJar())
+	if c.login().outcome != outcomeSuccess || c.logout() {
+		t.Fatal("登出响应没有清掉 jwt_token 时不能算成功")
+	}
+}
+
+func TestListScenario_InterruptedDuringSetup(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var stdout, stderr bytes.Buffer
+	code := run(ctx, []string{"-scenario", "list", "-base-url", srv.URL, "-concurrency", "3"}, testEnv, &stdout, &stderr)
+	if code != exitSetup || !strings.Contains(stderr.String(), "预登录阶段被中断") {
+		t.Fatalf("预登录阶段收到中断应以 %d 退出: code=%d\n%s", exitSetup, code, stderr.String())
+	}
+	if fb.logins.Load() != 0 || stdout.Len() != 0 {
+		t.Fatalf("中断后不应再登录、也不输出报告: logins=%d\n%s", fb.logins.Load(), stdout.String())
+	}
+}
+
+// 每个列表接口的请求体与前端列表页首次加载时一模一样（期望值独立写在这里，不复用 listEndpoints）。
+func TestListEndpoints_ExactRequestBodies(t *testing.T) {
+	want := map[string]string{
+		"/admin/user/list":          `{"page_no":1,"page_size":20,"status":-1,"username_mobile_email":""}`,
+		"/admin/role/list":          `{"page_no":1,"page_size":20,"role_name":"","status":-1}`,
+		"/admin/permission/list":    `{"page_no":1,"page_size":20,"permission_name":"","permission_type":-1,"status":-1}`,
+		"/admin/dept/list":          `{"dept_name":"","page_no":1,"page_size":20,"status":-1}`,
+		"/admin/login-log/list":     `{"login_status":-1,"page_no":1,"page_size":20}`,
+		"/admin/log/access/list":    `{"ip":"","method":"","page_no":1,"page_size":20,"path":"","status_code":0}`,
+		"/admin/log/operation/list": `{"action":"","method":"","page_no":1,"page_size":20,"path":"","resource":""}`,
+	}
+	if len(want) != len(listEndpoints) {
+		t.Fatalf("白名单有 %d 个接口，期望表有 %d 个", len(listEndpoints), len(want))
+	}
+	for _, ep := range listEndpoints {
+		var gotPath, gotBody, gotType, gotCSRF string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			data, _ := io.ReadAll(r.Body)
+			gotPath, gotBody, gotType, gotCSRF = r.URL.Path, string(data), r.Header.Get("Content-Type"), r.Header.Get(csrfName)
+			writeEnvelope(w, 200, nil)
+		}))
+		cfg, err := parseConfig([]string{"-scenario", "list", "-base-url", srv.URL, "-list-path", ep.Path, "-page-size", "20"}, testEnv, &bytes.Buffer{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		jar := newJar()
+		jar.SetCookies(cfg.BaseURL, []*http.Cookie{&http.Cookie{Name: csrfName, Value: "csrf-value"}})
+		newClient(cfg, http.DefaultTransport, jar).list()
+		srv.Close()
+		if gotPath != ep.Path || gotBody != want[ep.Path] || gotType != "application/json" || gotCSRF != "csrf-value" {
+			t.Errorf("%s 请求不对:\npath=%s type=%q csrf=%q\nbody=%s\nwant=%s", ep.Path, gotPath, gotType, gotCSRF, gotBody, want[ep.Path])
+		}
+	}
+}
+
+// -json 指向一个符号链接时，替换的是链接本身，不会顺着链接改写别的文件。
+func TestJSONReport_DoesNotFollowSymlink(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	dir := t.TempDir()
+	victim := filepath.Join(dir, "victim.txt")
+	link := filepath.Join(dir, "report.json")
+	if err := os.WriteFile(victim, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, link); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run(context.Background(), []string{"-scenario", "login", "-base-url", srv.URL, "-duration", "100ms", "-concurrency", "1", "-json", link}, testEnv, &stdout, &stderr); code != exitOK {
+		t.Fatalf("退出码 %d\n%s", code, stderr.String())
+	}
+	if data, _ := os.ReadFile(victim); string(data) != "keep" {
+		t.Fatalf("符号链接指向的文件被改写了: %q", data)
+	}
+	info, err := os.Lstat(link)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		t.Fatalf("报告应是权限 0600 的普通文件: %v %v", info.Mode(), err)
+	}
+	var rep report
+	if data, _ := os.ReadFile(link); json.Unmarshal(data, &rep) != nil || rep.Total == 0 {
+		t.Fatalf("报告内容不对: %s", data)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 2 {
+		t.Fatalf("不应留下临时文件: %v", entries)
+	}
+}
+
+// 登录被判为失败（jwt_token 不是 HttpOnly），但会话已经建了、jar 里有 jwt_token：照样要登出，不能泄漏。
+func TestLoginScenario_FailedLoginWithCookieIsLoggedOut(t *testing.T) {
+	fb, srv := newFakeBackend(t, func(fb *fakeBackend) { fb.noHttpOnly = true })
+	code, out, _, rep := runTool(t, "-scenario", "login", "-base-url", srv.URL, "-duration", "200ms", "-concurrency", "1")
+	if rep.Total == 0 || rep.InvalidResponse != rep.Total {
+		t.Fatalf("登录应全部判为响应异常: %+v", rep)
+	}
+	if rep.LogoutFailures != 0 || fb.liveSessions() != 0 {
+		t.Fatalf("判为失败的登录也应被登出: logoutFailures=%d live=%d\n%s", rep.LogoutFailures, fb.liveSessions(), out)
+	}
+	if code != exitFailed {
+		t.Fatalf("默认阈值下全部失败时退出码应为 1，实际 %d", code)
+	}
+}
+
+// 登录没下发 CSRF：会话已建，但登出带不出 CSRF、被后端拒绝。必须如实记为登出失败、退出码非 0，
+// 不能当成已经吊销。
+func TestLoginScenario_MissingCSRFCannotLogout(t *testing.T) {
+	fb, srv := newFakeBackend(t, func(fb *fakeBackend) { fb.noCSRF = true })
+	code, out, _, rep := runTool(t, "-scenario", "login", "-base-url", srv.URL, "-duration", "200ms", "-concurrency", "1", "-max-error-rate", "1")
+	if rep.Total == 0 || rep.LogoutFailures != rep.Total || fb.liveSessions() != int(rep.Total) {
+		t.Fatalf("每次都应尝试登出且如实记为失败: total=%d logoutFailures=%d live=%d", rep.Total, rep.LogoutFailures, fb.liveSessions())
+	}
+	if code != exitFailed || !strings.Contains(out, "有会话没能登出") {
+		t.Fatalf("有会话没能登出时退出码应为 1 并提示，实际 %d:\n%s", code, out)
+	}
+}
+
+// 预登录失败时，失败的那一次如果已经建了会话（jar 里有 jwt_token），也要登出。
+func TestListScenario_SetupFailureLogsOutCurrentClient(t *testing.T) {
+	fb, srv := newFakeBackend(t, func(fb *fakeBackend) { fb.noHttpOnly = true })
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{"-scenario", "list", "-base-url", srv.URL, "-concurrency", "3"}, testEnv, &stdout, &stderr)
+	if code != exitSetup || fb.logins.Load() != 1 {
+		t.Fatalf("第一次预登录判为失败就应放弃: code=%d logins=%d", code, fb.logins.Load())
+	}
+	if fb.liveSessions() != 0 || !strings.Contains(stderr.String(), "尝试登出 1 个会话，失败 0 个") {
+		t.Fatalf("失败那次建的会话也应登出: live=%d\n%s", fb.liveSessions(), stderr.String())
+	}
+}
+
+// 预登录进行到第 3 个时收到中断：停止继续登录，已经建好的 3 个会话全部登出。
+func TestListScenario_InterruptedAtKthLogin(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fb, srv := newFakeBackend(t, func(fb *fakeBackend) {
+		fb.onLogin = func(n int64) {
+			if n == 3 {
+				cancel()
+			}
+		}
+	})
+	var stdout, stderr bytes.Buffer
+	code := run(ctx, []string{"-scenario", "list", "-base-url", srv.URL, "-concurrency", "5"}, testEnv, &stdout, &stderr)
+	if code != exitSetup || !strings.Contains(stderr.String(), "预登录阶段被中断（已建立的 3 个会话登出失败 0 个）") {
+		t.Fatalf("应在第 3 次登录后停止: code=%d\n%s", code, stderr.String())
+	}
+	if fb.logins.Load() != 3 || fb.liveSessions() != 0 {
+		t.Fatalf("不应再登录，已建立的会话应全部登出: logins=%d live=%d", fb.logins.Load(), fb.liveSessions())
+	}
+}

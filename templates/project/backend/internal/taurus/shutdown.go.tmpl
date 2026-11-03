@@ -1,0 +1,281 @@
+package taurus
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"strings"
+{{- if .Has.consul }}
+	"sync/atomic"
+{{- end }}
+	"time"
+{{- if .Has.consul }}
+
+	"github.com/stones-hub/taurus-pro-consul/pkg/consul"
+{{- end }}
+{{- if .Has.tcp }}
+
+	tcpserver "github.com/stones-hub/taurus-pro-tcp/pkg/tcp"
+{{- end }}
+{{- if .Has.grpc }}
+
+	grpcserver "github.com/stones-hub/taurus-pro-grpc/pkg/grpc/server"
+{{- end }}
+)
+
+// 组件 cleanup 的单步上限。
+//
+// 退出时组件按初始化的逆序关闭（wire 生成的 cleanup 依次调用各 Provide* 返回的函数），
+// 每个组件一步、每步都有上限：到期不再等待，继续关下一个。一个卡住的组件不会让排在后面的
+// Consul / OTel / Redis / DB 都关不掉。上限写死在这里而不开放配置：它们只是「最多等多久」，
+// 正常关闭远远用不到。限时做在 Provide* 里（boundedCleanup），`make wire` 重新生成 wire_gen.go 不会丢。
+//
+// Go 无法终止忽略 ctx 的代码：超时只代表不再等，被放弃的关闭动作仍在后台运行，进程随后退出。
+const (
+	dbCleanupTimeout    = 1 * time.Second
+	redisCleanupTimeout = 1 * time.Second
+	logCleanupTimeout   = 1 * time.Second
+	// cronCleanupTimeout 等正在执行的定时任务结束；任务不会被终止，超时后它们仍在运行。
+	cronCleanupTimeout = 3 * time.Second
+{{- if .Has.consul }}
+	// consulCleanupTimeout 退出开始时已经注销过（见 DeregisterConsulService），这里通常只关客户端；
+	// 没注销过（启动中途失败的回滚）才在这个上限内补一次注销。
+	consulCleanupTimeout = 1 * time.Second
+{{- end }}
+{{- if .Has.opentelemetry }}
+	// otelCleanupTimeout flush 剩余 span 并关闭导出器。collector 不可达时到期放弃，未导出的 span 丢失。
+	otelCleanupTimeout = 2 * time.Second
+{{- end }}
+{{- if .Has.tcp }}
+	// tcpCleanupTimeout 兜底关闭（退出时入口阶段已经关过）。
+	tcpCleanupTimeout = 1 * time.Second
+{{- end }}
+{{- if .Has.grpc }}
+	// grpcCleanupTimeout 兜底关闭（退出时入口阶段已经关过）：一半时间优雅关闭，到期强制关闭。
+	grpcCleanupTimeout = 1 * time.Second
+{{- end }}
+{{- if .Has.milvus }}
+	// milvusCleanupTimeout 关闭客户端池。
+	milvusCleanupTimeout = 1 * time.Second
+{{- end }}
+)
+
+// ComponentsCleanupTimeout BuildComponents 返回的 cleanup 最长执行时间：选中组件各步上限之和。
+// app 把它作为资源关闭阶段「components」这一步的上限。
+const ComponentsCleanupTimeout = dbCleanupTimeout + redisCleanupTimeout + logCleanupTimeout + cronCleanupTimeout{{ if .Has.consul }} +
+	consulCleanupTimeout{{ end }}{{ if .Has.opentelemetry }} +
+	otelCleanupTimeout{{ end }}{{ if .Has.tcp }} +
+	tcpCleanupTimeout{{ end }}{{ if .Has.grpc }} +
+	grpcCleanupTimeout{{ end }}{{ if .Has.milvus }} +
+	milvusCleanupTimeout{{ end }}
+
+// errStopUnconfirmed 关闭动作已经执行，但当前组件版本没有办法确认它真的完成了，不能记成成功。
+var errStopUnconfirmed = errors.New("已调用关闭，但当前组件版本无法确认关闭已完成")
+
+// ShutdownCapabilities 当前编译进来的组件版本在退出时走哪条路径，app 启动时打印一次，
+// 联调时据此确认新 API 是否真的生效。只看类型（方法集），不含任何配置值。
+func ShutdownCapabilities() string {
+	var caps []string
+{{- if .Has.consul }}
+	if _, ok := serviceDeregisterer((*consul.Client)(nil)).(contextDeregisterer); ok {
+		caps = append(caps, "consul=context-deregister")
+	} else {
+		caps = append(caps, "consul=legacy-wait-only")
+	}
+{{- end }}
+{{- if .Has.tcp }}
+	if _, ok := any((*tcpserver.Server)(nil)).(tcpContextStopper); ok {
+		caps = append(caps, "tcp=stop-context")
+	} else {
+		caps = append(caps, "tcp=legacy-stop")
+	}
+{{- end }}
+{{- if .Has.grpc }}
+	caps = append(caps, "grpc=graceful-then-force-stop")
+{{- end }}
+{{- if .Has.opentelemetry }}
+	caps = append(caps, "otel=shutdown-ctx")
+{{- end }}
+	if len(caps) == 0 {
+		return "http-only"
+	}
+	return strings.Join(caps, " ")
+}
+
+// boundedCleanup 把一个组件的关闭包装成有上限的一步：成功、失败、超时、无法确认都按组件名记日志。
+func boundedCleanup(name string, timeout time.Duration, stop func(ctx context.Context) error) func() {
+	return func() {
+		err := runBounded(timeout, stop)
+		if errors.Is(err, errStopUnconfirmed) {
+			log.Printf("%s🔗 -> Clean up %s components unconfirmed: %v %s\n", colorYellow, name, err, colorReset)
+			return
+		}
+		if err != nil {
+			log.Printf("%s🔗 -> Clean up %s components failed: %v %s\n", colorRed, name, err, colorReset)
+			return
+		}
+		log.Printf("%s🔗 -> Clean up %s components successfully. %s\n", colorGreen, name, colorReset)
+	}
+}
+
+// runBounded 在 timeout 内执行 stop：ctx 到期即返回超时错误，不再等 stop 本身返回。
+func runBounded(timeout time.Duration, stop func(ctx context.Context) error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	done := make(chan error, 1)
+	go func() {
+		defer cancel()
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("panic: %v", r)
+			}
+		}()
+		done <- stop(ctx)
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		// 两者同时就绪时以结果为准
+		select {
+		case err := <-done:
+			return err
+		default:
+		}
+		return fmt.Errorf("未在 %s 内完成，不再等待（无法终止，它仍在后台运行）: %w", timeout, ctx.Err())
+	}
+}
+{{- if .Has.consul }}
+
+// consulRegistration 本进程在 Consul 里的注册。
+type consulRegistration struct {
+	client  serviceDeregisterer
+	id      string
+	started atomic.Bool
+}
+
+// consulRegistered ProvideConsulComponent 注册成功后设置；consul.enable=false 时为 nil。
+var consulRegistered *consulRegistration
+
+// serviceDeregisterer taurus-pro-consul 各版本都有的注销：不接收 ctx。旧版（v0.2.0 及以前）只有它，
+// 请求本身取消不了。
+type serviceDeregisterer interface {
+	DeregisterService(serviceID string) error
+}
+
+// contextDeregisterer taurus-pro-consul v0.3.0（生成项目默认依赖的版本）增加的可取消注销：
+// ctx 到期时底层 HTTP 请求随之中止。用类型断言探测，降级到旧版本照常编译、回落到限时等待。
+type contextDeregisterer interface {
+	DeregisterServiceContext(ctx context.Context, serviceID string) error
+}
+
+// DeregisterConsulService 从 Consul 注销本服务（退出的第一步：先摘流量，再关入口）。
+//
+// 只执行一次：之后组件 cleanup 不再重复注销，只关闭客户端。失败（Consul 不可达、超时）只返回错误
+// 供调用方记录，不重试；残留的注册由健康检查的 deregister_after 兜底摘除。
+// 没有启用 Consul 时直接返回 nil。
+func DeregisterConsulService(ctx context.Context) error {
+	if consulRegistered == nil {
+		return nil
+	}
+	return consulRegistered.deregister(ctx)
+}
+
+func (r *consulRegistration) deregister(ctx context.Context) error {
+	if !r.started.CompareAndSwap(false, true) {
+		return nil
+	}
+	return deregisterService(ctx, r.client, r.id)
+}
+
+// deregisterService 在 ctx 内注销。组件支持 DeregisterServiceContext 时请求会被真正取消；
+// 旧版本只能限时等待：到期返回错误，但那个 HTTP 请求仍可能在后台进行（客户端没有超时）。
+func deregisterService(ctx context.Context, client serviceDeregisterer, id string) error {
+	if c, ok := client.(contextDeregisterer); ok {
+		return c.DeregisterServiceContext(ctx, id)
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("consul 注销未执行: %w", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- client.DeregisterService(id) }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("consul 注销未在期限内完成（当前 taurus-pro-consul 版本不支持取消，请求可能仍在后台进行）: %w", ctx.Err())
+	}
+}
+{{- end }}
+{{- if .Has.grpc }}
+
+// ShutdownGRPC 优雅关闭 gRPC：立即关闭监听、通知客户端不再发新流（GOAWAY），在 ctx 内等现有流结束；
+// ctx 到期返回错误，由调用方接着调用 ForceStopGRPC。
+//
+// 用原始 *grpc.Server 的 GracefulStop，不用组件自带的 cleanup / Stop：那两个都是不限时的
+// GracefulStop，一条不结束的流（例如组件默认注册的 Health/Watch）会让它永远等下去。
+func ShutdownGRPC(ctx context.Context, srv *grpcserver.Server) error {
+	done := make(chan struct{})
+	go func() {
+		srv.Server().GracefulStop()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// ForceStopGRPC 强制关闭 gRPC：断开所有连接，正在执行的 handler 的 ctx 被取消。
+// 忽略 ctx 的 handler 不会被终止，ForceStopGRPC 也不等它们。
+func ForceStopGRPC(srv *grpcserver.Server) error {
+	srv.Server().Stop()
+	return nil
+}
+{{- end }}
+{{- if .Has.tcp }}
+
+// tcpContextStopper taurus-pro-tcp v0.2.0（生成项目默认依赖的版本）增加的 StopContext：Stop 只同步关闭
+// 监听和连接的 socket（不调用用户回调），StopContext 再在 ctx 内等连接处理协程（含 OnMessage / OnClose）退出。
+// 用类型断言探测，降级到旧版本照常编译、回落到下面的旧路径。
+type tcpContextStopper interface {
+	StopContext(ctx context.Context) error
+}
+
+// ShutdownTCP 关闭 TCP：先停止接入、关闭所有连接，再在 ctx 内等连接处理结束。
+//
+// 新版组件只有 StopContext 确认处理协程都已退出才返回 nil。
+//
+// served 是 Start 返回时关闭的 channel（nil 表示调用方拿不到 Start 的结束信号，例如组件 cleanup 兜底）。
+// 旧版 v0.1.0 没有 StopContext，而且它的 Stop 会同步调用每个连接的 OnClose（用户回调卡住 Stop 就卡住），
+// 所以放协程里调用，再等 Stop 返回（OnClose 都执行完）和 Start 返回（所有连接协程退出）。
+// v0.1.0 的 Stop 用 CAS 防重入：第二次调用会立刻返回，哪怕第一次还卡在 OnClose 里，
+// 所以 served 为 nil 时 Stop 返回也证明不了什么，只能返回 errStopUnconfirmed。
+func ShutdownTCP(ctx context.Context, srv *tcpserver.Server, served <-chan struct{}) error {
+	if s, ok := any(srv).(tcpContextStopper); ok {
+		srv.Stop()
+		return s.StopContext(ctx)
+	}
+	stopped := make(chan struct{})
+	go func() {
+		srv.Stop()
+		close(stopped)
+	}()
+	for _, ch := range []<-chan struct{}{stopped, served} {
+		if ch == nil {
+			continue
+		}
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return fmt.Errorf("tcp 连接处理未在期限内结束（回调不会被终止）: %w", ctx.Err())
+		}
+	}
+	if served == nil {
+		return errStopUnconfirmed
+	}
+	return nil
+}
+{{- end }}

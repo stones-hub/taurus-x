@@ -2,9 +2,6 @@ package app
 
 import (
 	"context"
-{{- if .Has.grpc }}
-	"errors"
-{{- end }}
 	"flag"
 	"fmt"
 	"log"
@@ -14,13 +11,11 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/debug"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/stones-hub/taurus-pro-common/pkg/recovery"
-{{- if .Has.grpc }}
-	"google.golang.org/grpc"
-{{- end }}
 
 	"{{ .Module }}/app/command"
 	"{{ .Module }}/app/crontab"
@@ -46,11 +41,23 @@ var (
 	env        = ".env.local"
 	configPath = "./config"
 	Core       *Injector
-	cleanups   []func()
+
+	// 资源关闭阶段的各步，由 cleanupSteps 按关闭顺序组装。
+	componentsCleanup func()                          // BuildComponents：框架组件按初始化逆序关闭
+	appCleanup        func()                          // buildInjector：应用组件图
+	stopLogCleaner    func(ctx context.Context) error // 日志清理器（未启用时为 nil）
+	stopPprof         func(ctx context.Context) error // pprof 调试服务（未启用时为 nil）
+
 	// stopRequestLogs 排空访问日志 / 操作日志队列，由 startRequestLogQueue 设置。
 	stopRequestLogs func(ctx context.Context) error
-	// shutdownBudget 退出各阶段的预算（见 app/helper/lifecycle），启动时按配置解析。
+	// shutdownBudget 入口与日志排空阶段的预算（见 app/helper/lifecycle），启动时按配置解析。
 	shutdownBudget lifecycle.Budget
+	// shuttingDown 退出已经开始：此后各服务 Start 的返回都是正常停止，不再当作启动 / 运行失败。
+	shuttingDown atomic.Bool
+{{- if .Has.tcp }}
+	// tcpServed TCP 的 Start 返回时关闭（旧版 TCP 组件靠它判断连接处理是否都已结束）。
+	tcpServed <-chan struct{}
+{{- end }}
 )
 
 // Run 启动 HTTP 服务并阻塞，等待信号后优雅关闭
@@ -61,57 +68,79 @@ func Run() {
 	// 启动 pprof 服务
 	runPprofServer()
 
+	// 退出最坏耗时必须比部署的停止等待短：用真实的退出计划、按配置允许的最大预算校验
+	maxBudget := lifecycle.Budget{HTTP: lifecycle.MaxHTTPShutdownSeconds * time.Second, DrainLogs: middleware.MaxRequestLogDrain}
+	if err := shutdownPlan(maxBudget).CheckDeployStopWait(); err != nil {
+		abortStartup("启动自检失败: %v", err)
+	}
+	// 退出时各组件走哪条路径（新版组件的可取消 API 是否生效），只含组件版本信息，不含配置值
+	log.Printf("%s🔗 -> Shutdown capabilities: %s %s\n", Cyan, taurus.ShutdownCapabilities(), Reset)
+
 	// 使用 errChan 接收各服务启动错误
 	errChan := make(chan error, 1)
 	taurus.Container.Http.Start(errChan)
 {{- if .Has.tcp }}
 
 	// TCP 服务（tcp.enable=false 时 Container.TCP 为 nil，跳过）。
-	//
-	// Start() 是**阻塞**的：内部 `go acceptLoop()` 之后还有 `wg.Wait()`，要一直等到
-	// 服务停止才返回，所以必须放协程里跑，否则主流程卡在这里 —— 后面的 gRPC 启动、
-	// 信号注册、优雅关闭全都不会发生。
-	// 监听失败会立刻返回错误；正常关闭（cleanup 调 Stop → acceptLoop 退出 → wg 归零）
-	// 返回 nil。关闭仍由 ProvideTCPComponent 注册的 cleanup 负责。
+	// Start() 是**阻塞**的（要等服务停止、连接处理协程都退出才返回），所以放协程里跑。
+	// 退出时在入口阶段与 HTTP 同时关闭（taurus.ShutdownTCP）。
 	if taurus.Container.TCP != nil {
-		go func() {
-			if err := taurus.Container.TCP.Start(); err != nil {
-				select {
-				case errChan <- fmt.Errorf("tcp server: %w", err):
-				default:
-				}
-			}
-		}()
+		tcpServed = serveInBackground("tcp", taurus.Container.TCP.Start, errChan)
 		log.Printf("%s🔗 -> TCP server started. %s\n", Green, Reset)
 	}
 {{- end }}
 {{- if .Has.grpc }}
 
 	// gRPC 服务（grpc.enable=false 时 Container.GRPC 为 nil，跳过）。
-	// Start() 同样会阻塞在 Serve 上，所以放协程里跑，启动失败走 errChan 触发整体关闭。
-	// 关闭由 ProvideGRPCComponent 注册的 cleanup 负责（gracefulShutdown 的资源关闭阶段里统一调用）。
+	// Start() 同样阻塞在 Serve 上，放协程里跑；退出时在入口阶段与 HTTP 同时关闭
+	// （taurus.ShutdownGRPC，到期 taurus.ForceStopGRPC）。
 	if taurus.Container.GRPC != nil {
-		go func() {
-			if err := taurus.Container.GRPC.Start(); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
-				select {
-				case errChan <- fmt.Errorf("grpc server: %w", err):
-				default:
-				}
-			}
-		}()
+		serveInBackground("grpc", taurus.Container.GRPC.Start, errChan)
 		log.Printf("%s🔗 -> gRPC server started. %s\n", Green, Reset)
 	}
 {{- end }}
 
 	// 阻塞直到收到信号或错误
 	if err := signalWaiter(errChan); err != nil {
-		log.Fatalf("%sServer startup failed: %v %s\n", Red, err, Reset)
+		// 启动失败（例如端口被占）：照样走完整的退出编排 —— 注销 Consul、关闭已经起来的入口、
+		// 排空日志、关闭资源 —— 再以非 0 码退出，而不是直接退出、跳过所有清理
+		shuttingDown.Store(true)
+		lifecycle.AbortStartup(fmt.Errorf("server startup failed: %w", err), shutdownPlan(shutdownBudget), os.Exit)
 	}
 
 	gracefulShutdown()
 }
 
-// signalWaiter 等待信号或错误
+// serveInBackground 在协程里跑阻塞的 Start，返回它结束时关闭的 channel。
+//
+// 退出开始之前就返回（不论是否带错误）说明这个服务没起来或者意外停了，送进 errChan 触发整体退出；
+// 退出开始之后的返回（包括「server stopped」一类错误）属于正常停止，只记日志。
+func serveInBackground(name string, start func() error, errChan chan<- error) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		err := start()
+		if shuttingDown.Load() {
+			if err != nil {
+				log.Printf("%s🔗 -> %s server stopped: %v %s\n", Yellow, name, err, Reset)
+			}
+			return
+		}
+		if err == nil {
+			err = fmt.Errorf("意外停止")
+		}
+		select {
+		case errChan <- fmt.Errorf("%s server: %w", name, err):
+		default:
+		}
+	}()
+	return done
+}
+
+// signalWaiter 等待信号或错误。
+//
+// 收到第一个信号后取消信号监听：退出过程中再收到 SIGINT / SIGTERM 时进程按系统默认行为立即终止，
+// 留给运维一个「不等了」的手段。
 func signalWaiter(errCh chan error) error {
 	signalToNotify := []os.Signal{syscall.SIGINT, syscall.SIGHUP, syscall.SIGTERM}
 	if signal.Ignored(syscall.SIGHUP) {
@@ -130,36 +159,115 @@ func signalWaiter(errCh chan error) error {
 		return nil
 	case err := <-errCh:
 		log.Printf("%s🔗 -> Received error: %v, starting shutdown... %s\n", Red, err, Reset)
+		signal.Stop(signals)
 		return err
 	}
 }
 
 // gracefulShutdown 分阶段优雅退出（详见 app/helper/lifecycle）：
-//  1. HTTP：停止接收新请求，等在途请求结束（http.shutdown_timeout）；超时后强制断开连接。
-//     仍在执行的 handler 不会被终止，它们之后产生的日志会因为队列已关闭而被丢弃计数；
+//  0. 摘除：Consul 启用时先注销本实例（lifecycle.DeregisterTimeout），失败只记录；
+//  1. 入口：HTTP / gRPC / TCP 同时停止接入新连接，并行等在途请求结束，共用 http.shutdown_timeout；
+//     到期强制断开。仍在执行的 handler / 回调不会被终止，它们之后产生的日志会因为队列已关闭而被丢弃计数；
 //  2. 日志排空：在 http.request_log.drain_timeout_seconds 内写完队列，超时取消剩余写入；
-//  3. 资源关闭：按顺序执行 cleanups（lifecycle.CleanupTimeout）。
+//  3. 资源关闭：按 cleanupSteps 的顺序逐步执行，每步单独限时，卡住的一步不阻塞后面的步骤。
 //
-// 三个阶段各自计时，HTTP 关得慢不会吃掉日志排空与资源关闭的预算。
-// cleanups 的顺序**就是**关闭顺序：后台任务必须排在资源关闭之前。BuildComponents 注册的
-// cleanup 关的是 DB / Redis / 日志，它一旦先跑，还在运行的后台任务就会拿着已关闭的连接池
-// 继续发语句，退出日志里全是 `sql: database is closed`。所以注册后台任务的停止函数时要
-// **头插**（见 startLogCleanup），不能直接 append。
+// 各阶段各自计时，前面的阶段慢不会吃掉后面阶段的预算；最坏总耗时见 Plan.WorstCase。
 func gracefulShutdown() {
-	log.Printf("%s🔗 -> Graceful shutdown: http=%s, drain logs=%s, cleanup=%s %s\n",
-		Yellow, shutdownBudget.HTTP, shutdownBudget.DrainLogs, shutdownBudget.Cleanup, Reset)
-	err := lifecycle.Plan{
-		Budget:         shutdownBudget,
-		StopHTTP:       taurus.Container.Http.Shutdown,
-		ForceCloseHTTP: taurus.Container.Http.Close,
-		DrainLogs:      stopRequestLogs,
-		Cleanups:       cleanups,
-	}.Run()
-	if err != nil {
+	shuttingDown.Store(true)
+	plan := shutdownPlan(shutdownBudget)
+	log.Printf("%s🔗 -> Graceful shutdown: ingress=%s, drain logs=%s, worst case=%s %s\n",
+		Yellow, shutdownBudget.HTTP, shutdownBudget.DrainLogs, plan.WorstCase(), Reset)
+	if err := plan.Run(); err != nil {
 		log.Printf("%s🔗 -> Shutdown finished with errors. %s\n", Red, Reset)
 		return
 	}
 	log.Printf("%s🔗 -> Shutdown completed successfully. %s\n", Green, Reset)
+}
+
+// shutdownPlan 退出计划：启动时用它校验最坏耗时，退出时按它执行，两处用的是同一份步骤。
+func shutdownPlan(budget lifecycle.Budget) lifecycle.Plan {
+	plan := lifecycle.Plan{
+		Budget:    budget,
+		Ingress:   ingresses(),
+		DrainLogs: stopRequestLogs,
+		Cleanups:  cleanupSteps(),
+	}
+{{- if .Has.consul }}
+	plan.Deregister = &lifecycle.Step{Name: "consul-deregister", Timeout: lifecycle.DeregisterTimeout, Run: taurus.DeregisterConsulService}
+{{- end }}
+	return plan
+}
+
+// ingresses 入口阶段要关闭的入站服务：HTTP 一定有，gRPC / TCP 启用时才有。
+func ingresses() []lifecycle.Ingress {
+	list := []lifecycle.Ingress{
+		{Name: "http", Shutdown: taurus.Container.Http.Shutdown, ForceClose: taurus.Container.Http.Close},
+	}
+{{- if .Has.grpc }}
+	if srv := taurus.Container.GRPC; srv != nil {
+		list = append(list, lifecycle.Ingress{
+			Name:       "grpc",
+			Shutdown:   func(ctx context.Context) error { return taurus.ShutdownGRPC(ctx, srv) },
+			ForceClose: func() error { return taurus.ForceStopGRPC(srv) },
+		})
+	}
+{{- end }}
+{{- if .Has.tcp }}
+	if srv := taurus.Container.TCP; srv != nil {
+		served := tcpServed
+		// TCP 的 Shutdown 已经关闭了所有连接的 socket，没有更强的强制关闭手段
+		list = append(list, lifecycle.Ingress{
+			Name:     "tcp",
+			Shutdown: func(ctx context.Context) error { return taurus.ShutdownTCP(ctx, srv, served) },
+		})
+	}
+{{- end }}
+	return list
+}
+
+// cleanupSteps 资源关闭阶段的步骤，**顺序就是关闭顺序**：
+//  1. 日志清理器：会对数据库发 DELETE 的后台任务，必须在数据库关闭之前停下；
+//  2. 应用组件图（app 的 wire injector）：业务层依赖框架组件，先于它们关闭；
+//  3. 框架组件：按初始化逆序逐个关闭（Consul / OTel / Cron / Redis / DB / 日志……每个组件单独限时，
+//     见 internal/taurus 的 ComponentsCleanupTimeout）；
+//  4. pprof：调试服务，最后关，退出卡住时还能用它看协程栈。
+//
+// 新增会访问数据库 / Redis 的后台任务时，它的停止函数要排在 components 之前，否则退出日志里
+// 全是 `sql: database is closed`。
+func cleanupSteps() []lifecycle.Step {
+	var steps []lifecycle.Step
+	if stopLogCleaner != nil {
+		steps = append(steps, lifecycle.Step{Name: "log-cleaner", Timeout: lifecycle.BackgroundStopTimeout, Run: stopLogCleaner})
+	}
+	if appCleanup != nil {
+		steps = append(steps, lifecycle.Step{Name: "app", Timeout: lifecycle.AppCleanupTimeout, Run: runCleanup(appCleanup)})
+	}
+	if componentsCleanup != nil {
+		steps = append(steps, lifecycle.Step{Name: "components", Timeout: taurus.ComponentsCleanupTimeout, Run: runCleanup(componentsCleanup)})
+	}
+	if stopPprof != nil {
+		steps = append(steps, lifecycle.Step{Name: "pprof", Timeout: lifecycle.PprofStopTimeout, Run: stopPprof})
+	}
+	return steps
+}
+
+// runCleanup 把不接收 ctx 的 cleanup 包装成退出步骤（上限由 lifecycle 控制）。
+func runCleanup(cleanup func()) func(context.Context) error {
+	return func(context.Context) error {
+		cleanup()
+		return nil
+	}
+}
+
+// abortStartup 启动中途失败。
+//
+// 走到这里时组件已经初始化（例如已经在 Consul 注册、已经连上 DB），直接退出会跳过所有清理，
+// 留下一条指向死进程的注册。所以先按退出编排有界地清理（入口还没启动，跳过入口阶段），再以非 0 码退出。
+func abortStartup(format string, args ...any) {
+	shuttingDown.Store(true)
+	plan := shutdownPlan(shutdownBudget)
+	plan.Ingress = nil
+	lifecycle.AbortStartup(fmt.Errorf(format, args...), plan, os.Exit)
 }
 
 // init 自动在 main 之前执行
@@ -179,12 +287,12 @@ func init() {
 	flag.StringVar(&configPath, "c", "config", "Path to the configuration file or directory (alias)")
 	flag.Parse()
 
-	// 初始化框架组件
-	cleanup, err := taurus.BuildComponents(configPath, env)
+	// 初始化框架组件（失败时已初始化的组件由 BuildComponents 自己回滚，这里直接退出即可）
+	var err error
+	componentsCleanup, err = taurus.BuildComponents(configPath, env)
 	if err != nil {
 		log.Fatal(err)
 	}
-	cleanups = append(cleanups, cleanup)
 
 	// 安全启动自检：密钥没配好就不要起服务
 	checkSecurityConfig()
@@ -202,11 +310,10 @@ func init() {
 	setGoConfig()
 
 	// 初始化项目模块（应用组件图）
-	Core, cleanup, err = buildInjector()
+	Core, appCleanup, err = buildInjector()
 	if err != nil {
-		log.Fatal(err)
+		abortStartup("初始化应用组件失败: %v", err)
 	}
-	cleanups = append(cleanups, cleanup)
 
 	// 启动 hooks
 	if err := hooks.StartHook(); err != nil {
@@ -223,50 +330,47 @@ func init() {
 }
 
 // checkSecurityConfig 启动前的安全配置自检。
-// 校验不过直接 log.Fatalf 退出：带着弱密钥跑起来的服务等于没有认证。
+// 校验不过直接终止启动（abortStartup：清理已初始化的组件后以非 0 码退出）：带着弱密钥跑起来的服务等于没有认证。
 //
 // 刻意不看 http.jwt.enabled：那个开关只决定 JWTMiddleware 是否拦请求，
 // 而登录签发 / 刷新 / 解析 Token 始终在用 http.jwt.secret。
 // 按开关跳过自检，等于允许密钥没配好就提供签名功能。
 func checkSecurityConfig() {
 	if err := helper.ValidateStartupSecurity(taurus.Container.Config.GetString); err != nil {
-		log.Fatalf("%s启动自检失败: %v%s\n", Red, err, Reset)
+		abortStartup("启动自检失败: %v", err)
 	}
 }
 
 // startLogCleanup 启动日志表的定期清理（保留期由 log_retention_days 配置决定）。
 //
-// 配置非法时直接退出：这个配置项控制不可逆的删除，宁可启动失败也不要按一个
+// 配置非法时终止启动：这个配置项控制不可逆的删除，宁可启动失败也不要按一个
 // 猜出来的保留期去删数据（理由详见 service.ResolveLogRetentionDays）。
 //
-// 停止函数**头插**进 cleanups：cleanups 是顺序执行的，而 BuildComponents 的
-// cleanup（关 DB / Redis / 日志）已经在队首。append 的话会先关数据库、
-// 再去停这个还在发 DELETE 的后台任务。
+// 停止函数是资源关闭阶段的 log-cleaner 步骤，排在 components（关 DB / Redis / 日志）之前
+// （见 cleanupSteps）：否则会先关数据库、再去停这个还在发 DELETE 的后台任务。
 func startLogCleanup() {
 	days, err := service.ResolveLogRetentionDays(taurus.Container.Config.GetString)
 	if err != nil {
-		log.Fatalf("%s启动自检失败: %v%s\n", Red, err, Reset)
+		abortStartup("启动自检失败: %v", err)
 	}
-	if stop := service.NewLogCleaner(repo.NewStore(), days).Start(); stop != nil {
-		cleanups = append([]func(){stop}, cleanups...)
-	}
+	stopLogCleaner = service.NewLogCleaner(repo.NewStore(), days).Start()
 }
 
 // startRequestLogQueue 建好访问日志 / 操作日志的有界写入队列并启动固定数量的 worker，
 // 同时确定退出各阶段的预算（配置非法时启动失败）。
 //
-// 停止函数不进 cleanups，而是作为 gracefulShutdown 的独立阶段：排在 HTTP 关闭之后、
-// 资源关闭之前，用自己的预算，不会被 HTTP 阶段占用。
+// 停止函数不进资源关闭的步骤，而是作为 gracefulShutdown 的独立阶段：排在入口关闭之后、
+// 资源关闭之前，用自己的预算，不会被入口阶段占用。
 func startRequestLogQueue() {
 	cfg, err := middleware.ResolveRequestLogQueueConfig(taurus.Container.Config.GetString)
 	if err != nil {
-		log.Fatalf("%s启动自检失败: %v%s\n", Red, err, Reset)
+		abortStartup("启动自检失败: %v", err)
 	}
 	httpBudget, err := lifecycle.ResolveHTTPShutdown(taurus.Container.Config.GetString)
 	if err != nil {
-		log.Fatalf("%s启动自检失败: %v%s\n", Red, err, Reset)
+		abortStartup("启动自检失败: %v", err)
 	}
-	shutdownBudget = lifecycle.Budget{HTTP: httpBudget, DrainLogs: cfg.DrainTimeout, Cleanup: lifecycle.CleanupTimeout}
+	shutdownBudget = lifecycle.Budget{HTTP: httpBudget, DrainLogs: cfg.DrainTimeout}
 	stopRequestLogs = middleware.StartRequestLogQueue(cfg)
 }
 
@@ -279,7 +383,7 @@ func startRequestLogQueue() {
 //     init() 早于 main()，所以这个顺序是天然成立的。
 func initAdminRateLimit() {
 	if err := middleware.InitAdminRateLimiter(taurus.Container.Config.GetString); err != nil {
-		log.Fatalf("%s启动自检失败: %v%s\n", Red, err, Reset)
+		abortStartup("启动自检失败: %v", err)
 	}
 }
 
@@ -292,11 +396,7 @@ func runPprofServer() {
 				log.Printf("%s🔗 -> pprof server error: %v %s\n", Red, err, Reset)
 			}
 		}()
-		cleanups = append(cleanups, func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-			_ = server.Shutdown(ctx)
-		})
+		stopPprof = server.Shutdown
 	}
 }
 

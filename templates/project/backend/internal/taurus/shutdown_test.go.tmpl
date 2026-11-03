@@ -1,0 +1,468 @@
+package taurus
+
+import (
+	"context"
+	"errors"
+{{- if or .Has.tcp .Has.grpc }}
+	"net"
+{{- end }}
+	"strings"
+{{- if .Has.consul }}
+	"sync/atomic"
+{{- end }}
+	"testing"
+	"time"
+{{- if .Has.consul }}
+
+	"github.com/stones-hub/taurus-pro-consul/pkg/consul"
+{{- end }}
+{{- if .Has.grpc }}
+
+	grpcserver "github.com/stones-hub/taurus-pro-grpc/pkg/grpc/server"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+{{- end }}
+{{- if .Has.tcp }}
+
+	tcpserver "github.com/stones-hub/taurus-pro-tcp/pkg/tcp"
+	"github.com/stones-hub/taurus-pro-tcp/pkg/tcp/protocol"
+{{- end }}
+)
+
+// TestRunBounded_StuckStopReturnsAtTimeout 忽略 ctx 的关闭动作只等到上限，返回带超时的错误。
+func TestRunBounded_StuckStopReturnsAtTimeout(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	start := time.Now()
+	err := runBounded(80*time.Millisecond, func(context.Context) error { <-release; return nil })
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("卡住的关闭让调用方等了 %v", elapsed)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("应返回超时错误，实际 %v", err)
+	}
+}
+
+// TestRunBounded_ResultAndPanic 正常返回透传错误；panic 转成错误，不让进程崩溃。
+func TestRunBounded_ResultAndPanic(t *testing.T) {
+	want := errors.New("close failed")
+	if err := runBounded(time.Second, func(context.Context) error { return want }); !errors.Is(err, want) {
+		t.Fatalf("应透传关闭错误，实际 %v", err)
+	}
+	if err := runBounded(time.Second, func(context.Context) error { panic("boom") }); err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("panic 应转成错误，实际 %v", err)
+	}
+	if err := runBounded(time.Second, func(context.Context) error { return nil }); err != nil {
+		t.Fatalf("正常关闭应返回 nil，实际 %v", err)
+	}
+}
+
+// TestBoundedCleanup_StuckComponentDoesNotBlockNext 模拟 wire 生成的逆序回滚：
+// 一个组件的关闭卡住，后面的组件照样被关闭，总耗时只多出卡住那一步的上限。
+func TestBoundedCleanup_StuckComponentDoesNotBlockNext(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	var closed []string
+	cleanups := []func(){
+		boundedCleanup("database", time.Second, func(context.Context) error { closed = append(closed, "database"); return nil }),
+		boundedCleanup("redis", time.Second, func(context.Context) error { closed = append(closed, "redis"); return nil }),
+		boundedCleanup("stuck", 80*time.Millisecond, func(context.Context) error { <-release; return nil }),
+	}
+	start := time.Now()
+	for i := len(cleanups) - 1; i >= 0; i-- {
+		cleanups[i]()
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("卡住的组件让回滚等了 %v", elapsed)
+	}
+	if len(closed) != 2 || closed[0] != "redis" || closed[1] != "database" {
+		t.Fatalf("卡住的组件之后的组件都应按逆序关闭，实际 %v", closed)
+	}
+}
+
+// TestShutdownCapabilities_ReportsDetectedPaths 启动日志里的能力路径与实际探测结果一致
+// （日志 marker：「Shutdown capabilities:」），不含任何配置值。
+func TestShutdownCapabilities_ReportsDetectedPaths(t *testing.T) {
+	caps := ShutdownCapabilities()
+	t.Logf("Shutdown capabilities: %s", caps)
+{{- if .Has.consul }}
+	_, consulNew := serviceDeregisterer(&consul.Client{}).(contextDeregisterer)
+	if want := map[bool]string{true: "consul=context-deregister", false: "consul=legacy-wait-only"}[consulNew]; !strings.Contains(caps, want) {
+		t.Errorf("Consul 能力应为 %s，实际 %q", want, caps)
+	}
+{{- end }}
+{{- if .Has.tcp }}
+	_, tcpNew := any(&tcpserver.Server{}).(tcpContextStopper)
+	if want := map[bool]string{true: "tcp=stop-context", false: "tcp=legacy-stop"}[tcpNew]; !strings.Contains(caps, want) {
+		t.Errorf("TCP 能力应为 %s，实际 %q", want, caps)
+	}
+{{- end }}
+{{- if not (or .Has.consul .Has.tcp .Has.grpc .Has.opentelemetry) }}
+	if caps != "http-only" {
+		t.Errorf("没有可选组件时应为 http-only，实际 %q", caps)
+	}
+{{- end }}
+}
+
+// TestComponentsCleanupTimeoutIsPositive 组件关闭的总上限至少覆盖必选组件（DB / Redis / 日志 / cron）。
+func TestComponentsCleanupTimeoutIsPositive(t *testing.T) {
+	if min := dbCleanupTimeout + redisCleanupTimeout + logCleanupTimeout + cronCleanupTimeout; ComponentsCleanupTimeout < min {
+		t.Fatalf("ComponentsCleanupTimeout=%v 小于必选组件上限之和 %v", ComponentsCleanupTimeout, min)
+	}
+}
+{{- if .Has.consul }}
+
+// fakeLegacyConsul 只有不接收 ctx 的 DeregisterService（旧版 taurus-pro-consul v0.2.0 及以前）。
+type fakeLegacyConsul struct {
+	calls   atomic.Int32
+	release chan struct{}
+}
+
+func (f *fakeLegacyConsul) DeregisterService(string) error {
+	f.calls.Add(1)
+	if f.release != nil {
+		<-f.release
+	}
+	return nil
+}
+
+// fakeContextConsul 新版本的可取消注销。
+type fakeContextConsul struct {
+	fakeLegacyConsul
+	ctxCalls atomic.Int32
+}
+
+func (f *fakeContextConsul) DeregisterServiceContext(ctx context.Context, _ string) error {
+	f.ctxCalls.Add(1)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestDeregisterService_PrefersCancellableAPI 组件支持 DeregisterServiceContext 时用它，期限到即中止。
+func TestDeregisterService_PrefersCancellableAPI(t *testing.T) {
+	f := &fakeContextConsul{}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := deregisterService(ctx, f, "svc-1"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("应返回 ctx 的超时，实际 %v", err)
+	}
+	if f.ctxCalls.Load() != 1 || f.calls.Load() != 0 {
+		t.Fatalf("应只走可取消的注销: ctx=%d legacy=%d", f.ctxCalls.Load(), f.calls.Load())
+	}
+}
+
+// TestDeregisterService_LegacyIsBoundedButHonest 旧版本只能限时等待：到期返回错误，
+// 并在错误里说明请求取消不了；预先取消的 ctx 不再发出请求。
+func TestDeregisterService_LegacyIsBoundedButHonest(t *testing.T) {
+	f := &fakeLegacyConsul{release: make(chan struct{})}
+	defer close(f.release)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := deregisterService(ctx, f, "svc-1")
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("卡住的注销让退出等了 %v", elapsed)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "不支持取消") {
+		t.Fatalf("应返回超时并说明请求无法取消，实际 %v", err)
+	}
+
+	pre, cancelPre := context.WithCancel(context.Background())
+	cancelPre()
+	g := &fakeLegacyConsul{}
+	if err := deregisterService(pre, g, "svc-1"); !errors.Is(err, context.Canceled) || g.calls.Load() != 0 {
+		t.Fatalf("预先取消时不应发出请求: err=%v calls=%d", err, g.calls.Load())
+	}
+}
+
+// TestConsulRegistration_DeregistersOnce 退出开始时注销过，组件 cleanup 不再重复注销；
+// 第一次还卡着时，第二次调用也不会跟着卡住。
+func TestConsulRegistration_DeregistersOnce(t *testing.T) {
+	f := &fakeLegacyConsul{release: make(chan struct{})}
+	r := &consulRegistration{client: f, id: "svc-1"}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := r.deregister(ctx); err == nil {
+		t.Fatal("卡住的注销应超时")
+	}
+	start := time.Now()
+	if err := r.deregister(context.Background()); err != nil {
+		t.Fatalf("重复注销应直接跳过，实际 %v", err)
+	}
+	if time.Since(start) > 100*time.Millisecond {
+		t.Fatal("重复注销不应等第一次的结果")
+	}
+	close(f.release)
+	if f.calls.Load() != 1 {
+		t.Fatalf("只应注销一次，实际 %d 次", f.calls.Load())
+	}
+}
+
+// TestDeregisterConsulService_NotRegistered 没有启用 Consul 时直接返回 nil。
+func TestDeregisterConsulService_NotRegistered(t *testing.T) {
+	prev := consulRegistered
+	consulRegistered = nil
+	t.Cleanup(func() { consulRegistered = prev })
+	if err := DeregisterConsulService(context.Background()); err != nil {
+		t.Fatalf("未注册时应返回 nil，实际 %v", err)
+	}
+}
+{{- end }}
+{{- if .Has.grpc }}
+
+// TestShutdownGRPC_LongStreamIsForceClosed 一条不结束的流（组件默认注册的 Health/Watch）
+// 不会让 gRPC 关闭无限等待：优雅关闭在期限到时返回，强制关闭断开流；关闭一开始就不再接新连接。
+func TestShutdownGRPC_LongStreamIsForceClosed(t *testing.T) {
+	srv, _, err := grpcserver.NewServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := make(chan error, 1)
+	go func() { served <- srv.Server().Serve(lis) }()
+
+	conn, err := grpc.NewClient("passthrough:///"+lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	stream, err := healthpb.NewHealthClient(conn).Watch(context.Background(), &healthpb.HealthCheckRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp, err := stream.Recv(); err != nil || resp.GetStatus() != healthpb.HealthCheckResponse_SERVING {
+		t.Fatalf("Watch 首条应为 SERVING: %v %v", resp, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = ShutdownGRPC(ctx, srv)
+	if elapsed := time.Since(start); !errors.Is(err, context.DeadlineExceeded) || elapsed > time.Second {
+		t.Fatalf("长流存在时优雅关闭应在期限到时返回超时: err=%v elapsed=%v", err, elapsed)
+	}
+	// 优雅关闭已经关掉监听：新连接被拒
+	if c, err := net.DialTimeout("tcp", lis.Addr().String(), 200*time.Millisecond); err == nil {
+		_ = c.Close()
+		t.Fatal("开始关闭后不应再接受新连接")
+	}
+
+	if err := ForceStopGRPC(srv); err != nil {
+		t.Fatal(err)
+	}
+	recvErr := make(chan error, 1)
+	go func() {
+		_, err := stream.Recv()
+		recvErr <- err
+	}()
+	select {
+	case err := <-recvErr:
+		if err == nil {
+			t.Fatal("强制关闭后长流应收到错误")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("强制关闭后长流仍未结束")
+	}
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("关闭后 Serve 应返回 nil，实际 %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("强制关闭后 Serve 没有返回")
+	}
+}
+
+// TestShutdownGRPC_IdleServerStopsPromptly 没有在途流时优雅关闭立即完成。
+func TestShutdownGRPC_IdleServerStopsPromptly(t *testing.T) {
+	srv, _, err := grpcserver.NewServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Server().Serve(lis) }()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := ShutdownGRPC(ctx, srv); err != nil {
+		t.Fatalf("空闲时优雅关闭应成功，实际 %v", err)
+	}
+}
+{{- end }}
+{{- if .Has.tcp }}
+
+// blockingCloseHandler OnClose 一直阻塞到 release 关闭（模拟卡住的用户回调）。
+type blockingCloseHandler struct {
+	connected chan struct{}
+	release   chan struct{}
+}
+
+func (h *blockingCloseHandler) OnConnect(*tcpserver.Connection) {
+	select {
+	case h.connected <- struct{}{}:
+	default:
+	}
+}
+func (h *blockingCloseHandler) OnMessage(*tcpserver.Connection, interface{}) {}
+func (h *blockingCloseHandler) OnClose(*tcpserver.Connection) {
+	if h.release != nil {
+		<-h.release
+	}
+}
+func (h *blockingCloseHandler) OnError(*tcpserver.Connection, error) {}
+
+// startTestTCP 在随机空闲端口上启动一个 TCP 服务并建立一个客户端连接。
+func startTestTCP(t *testing.T, h *blockingCloseHandler) (*tcpserver.Server, string, <-chan struct{}, net.Conn) {
+	t.Helper()
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := probe.Addr().String()
+	_ = probe.Close()
+
+	proto, err := protocol.NewProtocol(protocol.WithType(protocol.JSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, _, err := tcpserver.NewServer(addr, proto, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		_ = srv.Start()
+	}()
+	var conn net.Conn
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		conn, err = net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err == nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("连不上测试 TCP 服务: %v", err)
+	}
+	select {
+	case <-h.connected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("服务端没有收到连接")
+	}
+	return srv, addr, served, conn
+}
+
+// TestShutdownTCP_StuckCallbackIsBounded 用户的 OnClose 卡住时，关闭在期限到时返回错误；
+// 关闭一开始就不再接新连接。
+//
+// 客户端连接何时断开取决于组件版本：新版（v0.2.0 起有 StopContext）的 Stop 先关 socket、不调用回调，
+// 客户端立即看到断开；旧版 v0.1.0 的 Stop 先同步调用 OnClose 再关 socket，回调卡住期间
+// 这个连接不会断开（v0.1.0 的已知限制，v0.2.0 已解决），回调返回后才断开。
+func TestShutdownTCP_StuckCallbackIsBounded(t *testing.T) {
+	h := &blockingCloseHandler{connected: make(chan struct{}, 1), release: make(chan struct{})}
+	released := false
+	defer func() {
+		if !released {
+			close(h.release)
+		}
+	}()
+	srv, addr, served, conn := startTestTCP(t, h)
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := ShutdownTCP(ctx, srv, served)
+	if elapsed := time.Since(start); !errors.Is(err, context.DeadlineExceeded) || elapsed > time.Second {
+		t.Fatalf("回调卡住时应在期限到时返回超时: err=%v elapsed=%v", err, elapsed)
+	}
+	if c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond); err == nil {
+		_ = c.Close()
+		t.Fatal("开始关闭后不应再接受新连接")
+	}
+	if _, ok := any(srv).(tcpContextStopper); !ok {
+		close(h.release)
+		released = true
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("关闭后客户端连接应被断开")
+	}
+}
+
+// TestShutdownTCP_CompletesWhenCallbacksReturn 回调正常返回时关闭在期限内完成。
+func TestShutdownTCP_CompletesWhenCallbacksReturn(t *testing.T) {
+	h := &blockingCloseHandler{connected: make(chan struct{}, 1)}
+	srv, _, served, conn := startTestTCP(t, h)
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := ShutdownTCP(ctx, srv, served); err != nil {
+		t.Fatalf("回调正常时关闭应成功，实际 %v", err)
+	}
+	// 重复关闭无害（组件 cleanup 兜底会再调一次）
+	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
+	defer cancel2()
+	if err := ShutdownTCP(ctx2, srv, served); err != nil {
+		t.Fatalf("重复关闭应成功，实际 %v", err)
+	}
+}
+
+// TestShutdownTCP_FallbackCleanupNeverReportsFalseSuccess 组件 cleanup 兜底（拿不到 Start 的结束信号，served=nil）
+// 不能把「没确认」说成成功：
+//   - 旧版 v0.1.0：入口阶段的第一次 Stop 还卡在 OnClose 里，第二次 Stop 因 CAS 立刻返回，
+//     必须返回 errStopUnconfirmed，而且不能等（快速返回本身没问题，问题是不能报成功）；
+//   - 新版：StopContext 等的是真实的结束信号，回调卡住就到期返回超时。
+func TestShutdownTCP_FallbackCleanupNeverReportsFalseSuccess(t *testing.T) {
+	h := &blockingCloseHandler{connected: make(chan struct{}, 1), release: make(chan struct{})}
+	defer close(h.release)
+	srv, _, served, conn := startTestTCP(t, h)
+	defer conn.Close()
+
+	ingress, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := ShutdownTCP(ingress, srv, served); err == nil {
+		t.Fatal("回调卡住时入口阶段的关闭不应成功")
+	}
+
+	ctx, cancel2 := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel2()
+	err := ShutdownTCP(ctx, srv, nil)
+	if _, ok := any(srv).(tcpContextStopper); ok {
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("新版组件回调仍卡住时兜底关闭应超时，实际 %v", err)
+		}
+	} else if !errors.Is(err, errStopUnconfirmed) {
+		t.Fatalf("旧版组件的第二次 Stop 立刻返回，兜底关闭必须报告无法确认，实际 %v", err)
+	}
+}
+
+// TestShutdownTCP_FallbackAfterCleanStop 回调都已正常结束后的兜底关闭：新版能确认完成（nil），
+// 旧版仍然只能报告无法确认（它没有任何完成信号可查）。
+func TestShutdownTCP_FallbackAfterCleanStop(t *testing.T) {
+	h := &blockingCloseHandler{connected: make(chan struct{}, 1)}
+	srv, _, served, conn := startTestTCP(t, h)
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := ShutdownTCP(ctx, srv, served); err != nil {
+		t.Fatalf("回调正常时关闭应成功，实际 %v", err)
+	}
+	err := ShutdownTCP(ctx, srv, nil)
+	if _, ok := any(srv).(tcpContextStopper); ok {
+		if err != nil {
+			t.Fatalf("新版组件已真实完成，兜底关闭应返回 nil，实际 %v", err)
+		}
+	} else if !errors.Is(err, errStopUnconfirmed) {
+		t.Fatalf("旧版组件兜底关闭应报告无法确认，实际 %v", err)
+	}
+}
+{{- end }}

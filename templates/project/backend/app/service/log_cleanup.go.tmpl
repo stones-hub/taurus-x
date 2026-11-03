@@ -104,17 +104,21 @@ type LogCleaner struct {
 	firstDelay func() time.Duration
 	// maxBatches 单表单轮的批次上限，测试注入小值以断言安全阀生效。
 	maxBatches int
+	// runOnce 每轮执行的清理，默认 RunOnce；测试注入不响应取消的实现，以断言停止函数有上限。
+	runOnce func(ctx context.Context)
 }
 
 // NewLogCleaner 创建清理器。retentionDays <= 0 表示不清理。
 func NewLogCleaner(store *repo.Store, retentionDays int) *LogCleaner {
-	return &LogCleaner{
+	c := &LogCleaner{
 		store:         store,
 		retentionDays: retentionDays,
 		now:           time.Now,
 		firstDelay:    randomizedStartDelay,
 		maxBatches:    logCleanupMaxBatches,
 	}
+	c.runOnce = c.RunOnce
+	return c
 }
 
 // randomizedStartDelay 首次执行延迟 = 基础延迟 + 0~logCleanupStartJitter 的随机抖动。
@@ -135,10 +139,11 @@ func (c *LogCleaner) Cutoff(now time.Time) time.Time {
 
 // Start 启动后台清理任务，返回用于停止它的函数；未启用时返回 nil。
 //
-// 返回的停止函数会等 goroutine 真正退出才返回，所以进程退出时不会留下
-// 半截执行的 DELETE 循环，也不会泄漏 goroutine。调用方必须把它排在
-// 「关闭数据库」之前（见 app.startLogCleanup 的头插）。
-func (c *LogCleaner) Start() func() {
+// 停止函数先取消后台任务（正在执行的 DELETE 随 ctx 中止），再在 ctx 内等 goroutine 真正退出：
+// 退出了返回 nil，进程退出时不会留下半截执行的 DELETE 循环；ctx 先到期返回错误，
+// 不再等待（Go 无法终止它，它会在后台继续直到自己返回）。可以重复调用。
+// 调用方必须把它排在「关闭数据库」之前（见 app 的 cleanupSteps）。
+func (c *LogCleaner) Start() func(ctx context.Context) error {
 	if !c.Enabled() {
 		log.Printf("🔗 -> 日志清理未启用（%s = 0，日志永久保留）\n", logRetentionConfigKey)
 		return nil
@@ -160,14 +165,25 @@ func (c *LogCleaner) Start() func() {
 				return
 			case <-timer.C:
 			}
-			c.RunOnce(ctx)
+			c.runOnce(ctx)
 			timer.Reset(logCleanupInterval)
 		}
 	}()
 
-	return func() {
+	return func(stopCtx context.Context) error {
 		cancel()
-		<-done
+		// 已经退出（含重复调用）：先非阻塞判断，不让一个已过期的 ctx 在 select 里随机胜出、误报超时
+		select {
+		case <-done:
+			return nil
+		default:
+		}
+		select {
+		case <-done:
+			return nil
+		case <-stopCtx.Done():
+			return fmt.Errorf("日志清理任务未在期限内退出: %w", stopCtx.Err())
+		}
 	}
 }
 

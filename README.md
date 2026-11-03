@@ -38,6 +38,7 @@
 | 日志 | 登录、访问、操作、前端错误四类日志 |
 | 个人中心 | 编辑个人资料、使用旧密码修改自己的密码 |
 | 项目基础设施 | 配置、日志、MySQL、Redis、Wire 依赖注入、前端构建与托管 |
+| 运维工具 | MySQL 备份 / 恢复脚本、登录与列表接口压测工具、SBOM 与 govulncheck 的 Makefile 入口（见生成项目 `docs/运维手册.md`；只是工具和步骤，演练与基准要在你的环境实际执行） |
 
 **不包含订单、客户、财务等业务模块，也不是业务代码自动生成器。** 文档中的业务示例不等于已实现的功能。
 
@@ -152,7 +153,7 @@ taurus-x new my-admin
 5. 安全自检：`JWT_SECRET` 未配置、过短或是弱值时拒绝启动。
 6. 用 Wire 生成的代码组装业务层：数据访问（repo）→ 业务逻辑（service）→ 接口（controller）。
 7. 注入权限检查器和登录状态校验，注册全部路由。
-8. 启动 HTTP 服务（选了 TCP / gRPC 且已开启时一并启动），收到停止信号后优雅关闭。
+8. 启动 HTTP 服务（选了 TCP / gRPC 且已开启时一并启动），收到停止信号后优雅关闭：先注销 Consul（选了时），HTTP / gRPC / TCP 同时停止接新连接并限时等待、到期强制断开，再排空日志，最后逐个组件限时关闭；启动失败也走同一套清理再非 0 退出（详见生成项目 README 的「优雅退出」）。
 
 **一次请求怎么走**：
 
@@ -216,7 +217,7 @@ go install github.com/stones-hub/taurus-x@latest
 也可以安装指定版本，所有版本见 GitHub 的 [Releases](https://github.com/stones-hub/taurus-x/releases) 页面：
 
 ```bash
-go install github.com/stones-hub/taurus-x@v0.4.0
+go install github.com/stones-hub/taurus-x@v0.5.0
 ```
 
 安装后命令通常位于 `$(go env GOPATH)/bin`，需要该目录在 `PATH` 中。如果提示找不到命令，先检查安装目录，不必重复安装。
@@ -319,7 +320,9 @@ my-admin/
 ├── backend/                 Go 后端、配置、Wire、后端 Makefile
 ├── frontend/                Vue 前端
 ├── scripts/sql/init.sql     初始表、角色、权限、管理员凭证散列
-├── docs/                    生成项目的开发与部署说明
+├── scripts/db/              MySQL 备份 / 恢复脚本
+├── scripts/loadtest/        登录 / 列表接口压测工具（独立 Go module）
+├── docs/                    生成项目的开发、部署与运维说明
 ├── Dockerfile               前后端多阶段构建
 ├── docker-compose.yml       所选组件的容器编排
 ├── Makefile                 前后端快捷命令
@@ -558,6 +561,9 @@ unset MYSQL_ROOT_PASSWORD
 | `make frontend-build` | 前端类型检查与构建，要求 pnpm |
 | `make dev` | 同时启动前后端，要求 pnpm；本文推荐两终端，便于看日志和退出 |
 | `make build` | 编译后端与前端，要求 pnpm |
+| `make db-backup` / `make db-restore` | MySQL 备份 / 恢复到空库，需要本机 MySQL 8.x 客户端，连接参数走 `MYSQL_OPS_*` 环境变量 |
+| `make sbom` | 生成前后端 CycloneDX SBOM 到 `artifacts/sbom/`（`go run` / `npm exec` 固定版本工具，不全局安装） |
+| `make vuln` | 用固定版本 govulncheck 扫描依赖漏洞，退出码原样返回 |
 
 Makefile 的提示文字使用默认端口；你改过配置时，应以实际监听地址为准。没有全局 pnpm 时，直接使用本文的 `npm exec --yes pnpm@10.34.7 -- ...`。
 
@@ -645,6 +651,8 @@ HTTPS代理终止TLS时须配置`AUTH_TRUSTED_ORIGINS=https://实际后台域名
 从 v0.4.0 起，生成项目的浏览器端只用 HttpOnly Cookie：登录 / 刷新的响应体和响应头不再返回令牌，后端不再接受 `Authorization: Bearer`，前端不再把令牌存进 localStorage（旧版本残留的会在启动时删除）。自己写脚本或用 curl 调接口时改用 cookie jar + `x-csrf-token` 头，示例见生成项目 `docs/商用加固一期说明.md`。HttpOnly 降低的是 JS 直接读取令牌的风险，不能阻止 XSS 借用户浏览器发请求。
 
 v0.4.0 同时补上：访问日志 / 操作日志改为有界队列 + 固定 worker（队列满丢弃并限频告警，退出分 HTTP 关闭 / 日志排空 / 资源关闭三段各自计时，默认总上限 15.5 秒）、操作日志按业务 code 判定成败、接口不再回显数据库等内部错误原文；未接入路由的 HostMiddleware 与 `http.host_white_list` 已删除，按 IP 限制后台访问请用 Nginx 或防火墙。
+
+v0.5.0：退出改为 摘除（Consul 注销）→ 入口（HTTP / gRPC / TCP 并行、共用预算、到期强制关闭）→ 日志排空 → 资源关闭（每步有名字、单独限时，卡住一步不阻塞后续）四段，最坏总耗时全选组件约 37.7 秒，部署停止等待统一改为 45 秒并在启动时校验；Consul 可取消注销、TCP `StopContext` 通过类型断言自动启用，生成项目默认依赖 taurus-pro-consul v0.3.0、taurus-pro-tcp v0.2.0、taurus-pro-opentelemetry v0.2.0 以走这些新路径（降级到 consul v0.2.0 / tcp v0.1.0 时回落到限时等待，限制见生成项目 README）。Go 无法终止忽略 ctx 的代码，超时只代表不再等待。
 
 仍保留可选组件生产运行、其他权限并发窗口、许可证/SBOM、Go漏洞审计、备份恢复与容量验收等风险；日志队列在退出超时或进程被强杀时仍可能丢失少量日志。
 

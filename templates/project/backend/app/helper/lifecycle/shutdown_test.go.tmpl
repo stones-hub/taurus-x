@@ -3,12 +3,16 @@ package lifecycle
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// recorder 记录阶段顺序与每个阶段拿到的剩余预算。
+// recorder 记录各步的执行顺序。
 type recorder struct {
 	mu     sync.Mutex
 	events []string
@@ -26,50 +30,201 @@ func (r *recorder) list() []string {
 	return append([]string(nil), r.events...)
 }
 
-// TestPlan_SlowHTTPDoesNotConsumeLaterBudgets HTTP 阶段把自己的预算用光（模拟慢请求），
-// 日志排空阶段仍拿到完整预算，资源关闭照常执行，顺序是 HTTP → 强制关闭 → 排空 → 资源关闭。
+// stepOK 立即成功的一步。
+func stepOK(rec *recorder, name string, timeout time.Duration) Step {
+	return Step{Name: name, Timeout: timeout, Run: func(context.Context) error { rec.add(name); return nil }}
+}
+
+// stepStuck 忽略 ctx、一直不返回的一步（模拟卡死的用户代码），release 关闭后才返回。
+func stepStuck(rec *recorder, name string, timeout time.Duration, release <-chan struct{}) Step {
+	return Step{Name: name, Timeout: timeout, Run: func(context.Context) error { rec.add(name); <-release; return nil }}
+}
+
+var quiet = func(string, ...any) {}
+
+// TestPlan_SlowHTTPDoesNotConsumeLaterBudgets HTTP 把入口预算用光（模拟慢请求），
+// 日志排空仍拿到完整预算，资源关闭照常执行，顺序是 摘除 → HTTP → 强制关闭 → 排空 → 资源关闭。
 func TestPlan_SlowHTTPDoesNotConsumeLaterBudgets(t *testing.T) {
 	rec := &recorder{}
 	var drainRemaining, httpTook time.Duration
 	start := time.Now()
-	err := Plan{
-		Budget: Budget{HTTP: 150 * time.Millisecond, DrainLogs: 400 * time.Millisecond, Cleanup: 400 * time.Millisecond},
-		StopHTTP: func(ctx context.Context) error {
-			rec.add("http")
-			<-ctx.Done() // 慢请求一直不结束
-			return ctx.Err()
+	dereg := stepOK(rec, "deregister", time.Second)
+	plan := Plan{
+		Budget:     Budget{HTTP: 150 * time.Millisecond, DrainLogs: 400 * time.Millisecond},
+		Deregister: &dereg,
+		Ingress: []Ingress{
+			{
+				Name: "http",
+				Shutdown: func(ctx context.Context) error {
+					rec.add("http")
+					<-ctx.Done() // 慢请求一直不结束
+					return ctx.Err()
+				},
+				ForceClose: func() error { httpTook = time.Since(start); rec.add("force-close"); return nil },
+			},
 		},
-		ForceCloseHTTP: func() error { httpTook = time.Since(start); rec.add("force-close"); return nil },
 		DrainLogs: func(ctx context.Context) error {
 			deadline, _ := ctx.Deadline()
 			drainRemaining = time.Until(deadline)
 			rec.add("drain")
 			return nil
 		},
-		Cleanups: []func(){func() { rec.add("cleanup-1") }, func() { rec.add("cleanup-db") }},
-		Logf:     func(string, ...any) {},
-	}.Run()
+		Cleanups: []Step{stepOK(rec, "cleanup-1", time.Second), stepOK(rec, "cleanup-db", time.Second)},
+		Logf:     quiet,
+	}
+	err := plan.Run()
 	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("HTTP 超时应体现在返回的错误里，实际 %v", err)
 	}
-	want := []string{"http", "force-close", "drain", "cleanup-1", "cleanup-db"}
-	if got := rec.list(); len(got) != len(want) {
+	want := []string{"deregister", "http", "force-close", "drain", "cleanup-1", "cleanup-db"}
+	if got := rec.list(); !slices.Equal(got, want) {
 		t.Fatalf("阶段顺序 %v，期望 %v", got, want)
-	} else {
-		for i := range want {
-			if got[i] != want[i] {
-				t.Fatalf("阶段顺序 %v，期望 %v", got, want)
-			}
-		}
 	}
-	if httpTook < 140*time.Millisecond || httpTook > 300*time.Millisecond {
+	if httpTook < 140*time.Millisecond || httpTook > 400*time.Millisecond {
 		t.Fatalf("HTTP 阶段应恰好用掉自己的 150ms 预算，实际 %v", httpTook)
 	}
 	if drainRemaining < 350*time.Millisecond {
 		t.Fatalf("日志排空阶段只拿到 %v，被 HTTP 阶段占用了预算", drainRemaining)
 	}
-	if elapsed := time.Since(start); elapsed > 150*time.Millisecond+400*time.Millisecond+400*time.Millisecond {
-		t.Fatalf("退出耗时 %v 超过三段预算之和", elapsed)
+	if elapsed := time.Since(start); elapsed > plan.WorstCase() {
+		t.Fatalf("退出耗时 %v 超过最坏上限 %v", elapsed, plan.WorstCase())
+	}
+}
+
+// TestPlan_IngressesStopInParallel 三个入口在入口阶段一开始就**同时**开始关闭（都立即停止接新连接），
+// 不会因为 HTTP 慢就让 gRPC / TCP 晚停；它们共用一份预算，整个阶段不超过 预算 + 强制关闭上限。
+func TestPlan_IngressesStopInParallel(t *testing.T) {
+	var mu sync.Mutex
+	started := map[string]time.Time{}
+	forced := map[string]bool{}
+	mk := func(name string, finishAfter time.Duration) Ingress {
+		return Ingress{
+			Name: name,
+			Shutdown: func(ctx context.Context) error {
+				mu.Lock()
+				started[name] = time.Now()
+				mu.Unlock()
+				select {
+				case <-time.After(finishAfter):
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			},
+			ForceClose: func() error { mu.Lock(); forced[name] = true; mu.Unlock(); return nil },
+		}
+	}
+	begin := time.Now()
+	err := Plan{
+		Budget:  Budget{HTTP: 300 * time.Millisecond},
+		Ingress: []Ingress{mk("http", time.Hour), mk("grpc", 10*time.Millisecond), mk("tcp", time.Hour)},
+		Logf:    quiet,
+	}.Run()
+	elapsed := time.Since(begin)
+	if err == nil || !strings.Contains(err.Error(), "http") || !strings.Contains(err.Error(), "tcp") || strings.Contains(err.Error(), "入口 grpc") {
+		t.Fatalf("应只报告超时的 http、tcp，实际 %v", err)
+	}
+	for _, name := range []string{"http", "grpc", "tcp"} {
+		if d := started[name].Sub(begin); started[name].IsZero() || d > 100*time.Millisecond {
+			t.Fatalf("入口 %s 应在阶段开始时立即开始关闭，实际延后 %v", name, d)
+		}
+	}
+	if !forced["http"] || !forced["tcp"] || forced["grpc"] {
+		t.Fatalf("只有超时的入口才强制关闭，实际 %v", forced)
+	}
+	if elapsed > 300*time.Millisecond+ForceCloseTimeout {
+		t.Fatalf("入口阶段耗时 %v 超过共用预算 + 强制关闭上限", elapsed)
+	}
+	if elapsed > 700*time.Millisecond {
+		t.Fatalf("入口应并行等待，耗时 %v 说明是串行的", elapsed)
+	}
+}
+
+// TestPlan_StuckIngressIsForceClosedAndBounded 优雅关闭忽略 ctx 永不返回（例如一条不结束的长流），
+// 到期调用强制关闭；强制关闭本身也卡住时最多等 ForceCloseTimeout，后面的阶段照常执行。
+func TestPlan_StuckIngressIsForceClosedAndBounded(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	rec := &recorder{}
+	begin := time.Now()
+	var forcedAt atomic.Int64 // ForceClose 卡住不返回，跨协程读写要同步
+	err := Plan{
+		Budget: Budget{HTTP: 100 * time.Millisecond, DrainLogs: time.Second},
+		Ingress: []Ingress{
+			{
+				Name:     "grpc",
+				Shutdown: func(context.Context) error { <-release; return nil },
+				ForceClose: func() error {
+					forcedAt.Store(int64(time.Since(begin)))
+					rec.add("force-close")
+					<-release
+					return nil
+				},
+			},
+		},
+		DrainLogs: func(context.Context) error { rec.add("drain"); return nil },
+		Cleanups:  []Step{stepOK(rec, "db", time.Second)},
+		Logf:      quiet,
+	}.Run()
+	elapsed := time.Since(begin)
+	if err == nil || !strings.Contains(err.Error(), "强制关闭入口 grpc 未在") {
+		t.Fatalf("强制关闭超时应体现在错误里，实际 %v", err)
+	}
+	if at := time.Duration(forcedAt.Load()); at < 90*time.Millisecond || at > 400*time.Millisecond {
+		t.Fatalf("应在入口预算到期时强制关闭，实际 %v", at)
+	}
+	if want := []string{"force-close", "drain", "db"}; !slices.Equal(rec.list(), want) {
+		t.Fatalf("顺序 %v，期望 %v", rec.list(), want)
+	}
+	if elapsed > 100*time.Millisecond+ForceCloseTimeout+500*time.Millisecond {
+		t.Fatalf("卡住的入口让退出等了 %v", elapsed)
+	}
+}
+
+// TestPlan_StuckCleanupDoesNotBlockLaterSteps 资源关闭里一步卡住（忽略 ctx），只等它的上限，
+// 然后继续执行后面的步骤（Consul / OTel / Redis / DB 都要被执行到），错误里带上卡住的步骤名。
+func TestPlan_StuckCleanupDoesNotBlockLaterSteps(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	rec := &recorder{}
+	plan := Plan{
+		Cleanups: []Step{
+			stepStuck(rec, "cron", 100*time.Millisecond, release),
+			stepOK(rec, "otel", time.Second),
+			stepOK(rec, "redis", time.Second),
+			stepOK(rec, "db", time.Second),
+		},
+		Logf: quiet,
+	}
+	start := time.Now()
+	err := plan.Run()
+	elapsed := time.Since(start)
+	if err == nil || !strings.Contains(err.Error(), "退出步骤 cron 未在") || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("卡住的步骤应带名字报告，实际 %v", err)
+	}
+	if want := []string{"cron", "otel", "redis", "db"}; !slices.Equal(rec.list(), want) {
+		t.Fatalf("卡住的步骤之后的步骤都要执行，实际 %v", rec.list())
+	}
+	if elapsed > 100*time.Millisecond+StepGrace+200*time.Millisecond {
+		t.Fatalf("卡住的步骤让退出等了 %v，应只等它自己的上限", elapsed)
+	}
+}
+
+// TestPlan_PanicStepDoesNotStopLaterSteps 一步 panic 记为错误，后面的步骤照常执行。
+func TestPlan_PanicStepDoesNotStopLaterSteps(t *testing.T) {
+	rec := &recorder{}
+	err := Plan{
+		Cleanups: []Step{
+			{Name: "boom", Timeout: time.Second, Run: func(context.Context) error { panic("boom") }},
+			stepOK(rec, "db", time.Second),
+		},
+		Logf: quiet,
+	}.Run()
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("panic 应转为错误，实际 %v", err)
+	}
+	if !slices.Equal(rec.list(), []string{"db"}) {
+		t.Fatalf("panic 之后的步骤应执行，实际 %v", rec.list())
 	}
 }
 
@@ -77,47 +232,167 @@ func TestPlan_SlowHTTPDoesNotConsumeLaterBudgets(t *testing.T) {
 func TestPlan_DrainTimeoutStillRunsCleanup(t *testing.T) {
 	rec := &recorder{}
 	err := Plan{
-		Budget:   Budget{HTTP: time.Second, DrainLogs: 50 * time.Millisecond, Cleanup: time.Second},
-		StopHTTP: func(context.Context) error { rec.add("http"); return nil },
+		Budget: Budget{HTTP: time.Second, DrainLogs: 50 * time.Millisecond},
+		Ingress: []Ingress{
+			{Name: "http", Shutdown: func(context.Context) error { rec.add("http"); return nil }},
+		},
 		DrainLogs: func(ctx context.Context) error {
 			<-ctx.Done()
 			rec.add("drain-timeout")
 			return errors.New("drain timeout")
 		},
-		Cleanups: []func(){func() { rec.add("cleanup") }},
-		Logf:     func(string, ...any) {},
+		Cleanups: []Step{stepOK(rec, "cleanup", time.Second)},
+		Logf:     quiet,
 	}.Run()
 	if err == nil {
 		t.Fatal("排空超时应返回错误")
 	}
-	got := rec.list()
-	if len(got) != 3 || got[0] != "http" || got[1] != "drain-timeout" || got[2] != "cleanup" {
-		t.Fatalf("阶段顺序 %v", got)
+	if want := []string{"http", "drain-timeout", "cleanup"}; !slices.Equal(rec.list(), want) {
+		t.Fatalf("阶段顺序 %v", rec.list())
 	}
 }
 
-// TestPlan_CleanupTimeoutIsBounded cleanup 卡住时不无限等待：在 Cleanup 预算到期时返回错误；
-// HTTP 正常结束时不调用强制关闭。
-func TestPlan_CleanupTimeoutIsBounded(t *testing.T) {
+// TestPlan_HealthyIngressIsNotForceClosed 入口按时关闭时不调用强制关闭。
+func TestPlan_HealthyIngressIsNotForceClosed(t *testing.T) {
+	forced := false
+	err := Plan{
+		Budget: Budget{HTTP: time.Second},
+		Ingress: []Ingress{
+			{
+				Name:       "http",
+				Shutdown:   func(context.Context) error { return nil },
+				ForceClose: func() error { forced = true; return nil },
+			},
+		},
+		Logf: quiet,
+	}.Run()
+	if err != nil || forced {
+		t.Fatalf("正常关闭不应报错或强制关闭: err=%v forced=%v", err, forced)
+	}
+}
+
+// TestPlan_PreCancelledStepReturnsPromptly 上限为 0 的步骤拿到的是已经到期的 ctx：
+// 遵守 ctx 的实现立即返回，忽略 ctx 的实现也只多等 StepGrace。
+func TestPlan_PreCancelledStepReturnsPromptly(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
-	forced := false
+	rec := &recorder{}
+	var sawDone bool
 	start := time.Now()
 	err := Plan{
-		Budget:         Budget{HTTP: time.Second, DrainLogs: time.Second, Cleanup: 80 * time.Millisecond},
-		StopHTTP:       func(context.Context) error { return nil },
-		ForceCloseHTTP: func() error { forced = true; return nil },
-		Cleanups:       []func(){func() { <-release }},
-		Logf:           func(string, ...any) {},
+		Cleanups: []Step{
+			{Name: "respects-ctx", Timeout: 0, Run: func(ctx context.Context) error {
+				select {
+				case <-ctx.Done():
+					sawDone = true
+					return ctx.Err()
+				case <-time.After(time.Second):
+					return nil
+				}
+			}},
+			stepStuck(rec, "ignores-ctx", 0, release),
+			stepOK(rec, "db", time.Second),
+		},
+		Logf: quiet,
 	}.Run()
+	if elapsed := time.Since(start); elapsed > 2*StepGrace+200*time.Millisecond {
+		t.Fatalf("已到期的步骤让退出等了 %v", elapsed)
+	}
+	if !sawDone || err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("已到期的 ctx 应立即可见并体现在错误里: sawDone=%v err=%v", sawDone, err)
+	}
+	if !slices.Equal(rec.list(), []string{"ignores-ctx", "db"}) {
+		t.Fatalf("后续步骤应执行，实际 %v", rec.list())
+	}
+}
+
+// TestPlan_EverythingStuckIsBoundedByWorstCase 所有步骤都卡死（全部忽略 ctx，强制关闭也卡死）：
+// Run 仍按顺序执行到最后一步，总耗时不超过 WorstCase。
+func TestPlan_EverythingStuckIsBoundedByWorstCase(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	rec := &recorder{}
+	stuck := func(name string) func(context.Context) error {
+		return func(context.Context) error { rec.add(name); <-release; return nil }
+	}
+	dereg := Step{Name: "consul-deregister", Timeout: 50 * time.Millisecond, Run: stuck("consul-deregister")}
+	stuckIngress := func(name string) Ingress {
+		return Ingress{Name: name, Shutdown: stuck(name), ForceClose: func() error { <-release; return nil }}
+	}
+	plan := Plan{
+		Budget:     Budget{HTTP: 50 * time.Millisecond, DrainLogs: 50 * time.Millisecond},
+		Deregister: &dereg,
+		Ingress:    []Ingress{stuckIngress("http"), stuckIngress("grpc"), stuckIngress("tcp")},
+		DrainLogs:  stuck("drain"),
+		Cleanups: []Step{
+			stepStuck(rec, "log-cleaner", 50*time.Millisecond, release),
+			stepStuck(rec, "components", 50*time.Millisecond, release),
+		},
+		Logf: quiet,
+	}
+	start := time.Now()
+	err := plan.Run()
+	elapsed := time.Since(start)
 	if err == nil {
-		t.Fatal("cleanup 超时应返回错误")
+		t.Fatal("全部卡住应返回错误")
 	}
-	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
-		t.Fatalf("cleanup 超时后仍等待了 %v", elapsed)
+	if elapsed > plan.WorstCase()+300*time.Millisecond {
+		t.Fatalf("耗时 %v 超过最坏上限 %v", elapsed, plan.WorstCase())
 	}
-	if forced {
-		t.Fatal("HTTP 正常关闭时不应强制关闭连接")
+	got := rec.list()
+	// 入口是并行的，组内顺序不定；阶段之间的顺序必须固定
+	if len(got) != 7 || got[0] != "consul-deregister" || got[4] != "drain" || got[5] != "log-cleaner" || got[6] != "components" {
+		t.Fatalf("阶段顺序 %v", got)
+	}
+	if ingress := got[1:4]; !slices.Contains(ingress, "http") || !slices.Contains(ingress, "grpc") || !slices.Contains(ingress, "tcp") {
+		t.Fatalf("三个入口都应开始关闭，实际 %v", ingress)
+	}
+	for _, name := range []string{"consul-deregister", "drain", "log-cleaner", "components", "http", "grpc", "tcp"} {
+		if !strings.Contains(err.Error(), name) {
+			t.Errorf("错误里应带上卡住的 %s: %v", name, err)
+		}
+	}
+}
+
+// TestPlan_WorstCaseArithmetic 最坏上限 = 各步上限 + 每步的收尾等待。
+func TestPlan_WorstCaseArithmetic(t *testing.T) {
+	noop := func(context.Context) error { return nil }
+	dereg := Step{Timeout: DeregisterTimeout}
+	plan := Plan{
+		Budget:     Budget{HTTP: 5 * time.Second, DrainLogs: 5 * time.Second},
+		Deregister: &dereg,
+		Ingress:    make([]Ingress, 2),
+		DrainLogs:  noop,
+		Cleanups: []Step{
+			{Timeout: time.Second},
+			{Timeout: 3 * time.Second},
+		},
+	}
+	want := (DeregisterTimeout + StepGrace) +
+		(5*time.Second + ForceCloseTimeout) +
+		(5*time.Second + DrainCancelWait + StepGrace) +
+		(time.Second + StepGrace) + (3*time.Second + StepGrace)
+	if got := plan.WorstCase(); got != want {
+		t.Fatalf("WorstCase = %v，期望 %v", got, want)
+	}
+	if (Plan{}).WorstCase() != 0 {
+		t.Fatal("空计划的上限应为 0")
+	}
+}
+
+// TestPlan_CheckDeployStopWait 超出部署停止等待（含余量）时报错。
+func TestPlan_CheckDeployStopWait(t *testing.T) {
+	ok := Plan{Cleanups: []Step{
+		{Timeout: DeployStopWait - DeployStopMargin - StepGrace},
+	}}
+	if err := ok.CheckDeployStopWait(); err != nil {
+		t.Fatalf("恰好留足余量应通过: %v", err)
+	}
+	tooLong := Plan{Cleanups: []Step{
+		{Timeout: DeployStopWait - DeployStopMargin},
+	}}
+	if err := tooLong.CheckDeployStopWait(); err == nil {
+		t.Fatal("余量不足应报错")
 	}
 }
 
@@ -133,5 +408,83 @@ func TestResolveHTTPShutdown(t *testing.T) {
 		if _, err := ResolveHTTPShutdown(get(bad)); err == nil {
 			t.Fatalf("%q 应拒绝", bad)
 		}
+	}
+}
+
+// logSink 并发安全地收集 Logf 输出（入口阶段的日志来自多个协程）。
+type logSink struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *logSink) logf(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+}
+
+func (l *logSink) text() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.lines, "")
+}
+
+// TestAbortStartup_CleansUpThenExitsNonZero 启动失败：先按计划清理（注销 → 入口 → 日志排空 → 资源），
+// 全部执行完才以 1 调用 exit；日志写明是启动失败，不出现「成功关闭」一类的误导提示。
+func TestAbortStartup_CleansUpThenExitsNonZero(t *testing.T) {
+	rec := &recorder{}
+	logs := &logSink{}
+	exitCode := -1
+	dereg := stepOK(rec, "consul-deregister", time.Second)
+	plan := Plan{
+		Budget:     Budget{HTTP: time.Second, DrainLogs: time.Second},
+		Deregister: &dereg,
+		Ingress: []Ingress{
+			{Name: "http", Shutdown: func(context.Context) error { rec.add("http"); return nil }},
+		},
+		DrainLogs: func(context.Context) error { rec.add("drain"); return nil },
+		Cleanups:  []Step{stepOK(rec, "db", time.Second)},
+		Logf:      logs.logf,
+	}
+	AbortStartup(errors.New("grpc server: listen tcp :50051: bind: address already in use"), plan, func(code int) {
+		rec.add("exit")
+		exitCode = code
+	})
+	if want := []string{"consul-deregister", "http", "drain", "db", "exit"}; !slices.Equal(rec.list(), want) {
+		t.Fatalf("启动失败应先清理再退出，顺序 %v，期望 %v", rec.list(), want)
+	}
+	if exitCode != 1 {
+		t.Fatalf("启动失败应以 1 退出，实际 %d", exitCode)
+	}
+	out := logs.text()
+	if !strings.Contains(out, "启动失败: grpc server: listen tcp") || !strings.Contains(out, "启动失败，清理已完成，以非 0 码退出") {
+		t.Fatalf("日志应写明启动失败的原因与清理结果:\n%s", out)
+	}
+	if strings.Contains(out, "successfully") {
+		t.Fatalf("启动失败的日志不应出现成功关闭的提示:\n%s", out)
+	}
+}
+
+// TestAbortStartup_StuckCleanupStillExits 清理里有一步卡住：照样在上限内以 1 退出，日志说明部分步骤出错。
+func TestAbortStartup_StuckCleanupStillExits(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	rec := &recorder{}
+	logs := &logSink{}
+	exitCode := -1
+	plan := Plan{
+		Cleanups: []Step{stepStuck(rec, "components", 50*time.Millisecond, release), stepOK(rec, "pprof", time.Second)},
+		Logf:     logs.logf,
+	}
+	start := time.Now()
+	AbortStartup(errors.New("启动自检失败"), plan, func(code int) { exitCode = code })
+	if elapsed := time.Since(start); elapsed > plan.WorstCase()+300*time.Millisecond {
+		t.Fatalf("卡住的清理让启动失败的退出等了 %v", elapsed)
+	}
+	if exitCode != 1 || !slices.Equal(rec.list(), []string{"components", "pprof"}) {
+		t.Fatalf("exit=%d 步骤=%v", exitCode, rec.list())
+	}
+	if out := logs.text(); !strings.Contains(out, "部分步骤出错") || !strings.Contains(out, "退出步骤 components 未在") {
+		t.Fatalf("日志应带上卡住的步骤名:\n%s", out)
 	}
 }

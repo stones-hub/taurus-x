@@ -1,0 +1,62 @@
+//go:build unix
+
+package main
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"syscall"
+	"testing"
+	"time"
+)
+
+// 第一次 SIGINT：不再发新请求，等在途请求；第二次 SIGINT：直接结束进程，不用等 -timeout。
+// 需要真实进程的信号处理，所以编译出二进制来跑。
+func TestSecondInterruptForcesExit(t *testing.T) {
+	fb, srv := newFakeBackend(t, func(fb *fakeBackend) { fb.listDelay = 30 * time.Second })
+	bin := filepath.Join(t.TempDir(), "loadtest")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("编译失败: %v\n%s", err, out)
+	}
+	cmd := exec.Command(bin, "-scenario", "list", "-base-url", srv.URL, "-duration", "1m", "-timeout", "60s", "-concurrency", "1")
+	cmd.Env = append(os.Environ(), envUsername+"="+testUser, envPassword+"="+testPassword)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { cmd.Wait(); close(done) }()
+	defer func() {
+		cmd.Process.Kill()
+		<-done
+	}()
+
+	waitFor(t, func() bool { return fb.inflight.Load() > 0 }, "列表请求没有发出")
+	cmd.Process.Signal(syscall.SIGINT)
+	select {
+	case <-done:
+		t.Fatal("第一次 SIGINT 应等在途请求，不应立即退出")
+	case <-time.After(300 * time.Millisecond):
+	}
+	cmd.Process.Signal(syscall.SIGINT)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("第二次 SIGINT 后进程应立即结束")
+	}
+	ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus)
+	if !ok || !ws.Signaled() || ws.Signal() != syscall.SIGINT {
+		t.Fatalf("第二次 SIGINT 应按默认处理结束进程，实际 %v", cmd.ProcessState)
+	}
+}
+
+func waitFor(t *testing.T, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal(msg)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

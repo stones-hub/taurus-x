@@ -7,7 +7,8 @@
 
 package taurus
 
-// buildComponents 按依赖顺序初始化框架组件；任一环节失败都会回滚已初始化的组件。
+// buildComponents 按 Components 的字段顺序初始化框架组件；任一环节失败都会回滚已初始化的组件。
+// 返回的 cleanup 按初始化的逆序关闭（每个组件的关闭都有上限，见 shutdown.go）。
 func buildComponents(opts *ConfigOptions) (*Components, func(), error) {
 	var cleanups []func()
 
@@ -22,6 +23,13 @@ func buildComponents(opts *ConfigOptions) (*Components, func(), error) {
 	if err != nil {
 		return nil, nil, err
 	}
+
+	logManager, logCleanup, err := ProvideLoggerComponent(cfg)
+	if err != nil {
+		unwind()
+		return nil, nil, err
+	}
+	cleanups = append(cleanups, logCleanup)
 
 	dbList, dbCleanup, err := ProvideDbComponent(cfg)
 	if err != nil {
@@ -42,20 +50,6 @@ func buildComponents(opts *ConfigOptions) (*Components, func(), error) {
 		unwind()
 		return nil, nil, err
 	}
-
-	cronManager, cronCleanup, err := ProvideCronComponent(cfg)
-	if err != nil {
-		unwind()
-		return nil, nil, err
-	}
-	cleanups = append(cleanups, cronCleanup)
-
-	logManager, logCleanup, err := ProvideLoggerComponent(cfg)
-	if err != nil {
-		unwind()
-		return nil, nil, err
-	}
-	cleanups = append(cleanups, logCleanup)
 {{- if .Has.consul }}
 
 	consulClient, consulCleanup, err := ProvideConsulComponent(cfg)
@@ -102,13 +96,19 @@ func buildComponents(opts *ConfigOptions) (*Components, func(), error) {
 	cleanups = append(cleanups, milvusCleanup)
 {{- end }}
 
+	cronManager, cronCleanup, err := ProvideCronComponent(cfg)
+	if err != nil {
+		unwind()
+		return nil, nil, err
+	}
+	cleanups = append(cleanups, cronCleanup)
+
 	components := &Components{
 		Config: cfg,
+		Logger: logManager,
 		DbList: dbList,
 		Redis:  redisClient,
 		Http:   httpServer,
-		Cron:   cronManager,
-		Logger: logManager,
 {{- if .Has.consul }}
 		Consul: consulClient,
 {{- end }}
@@ -124,6 +124,7 @@ func buildComponents(opts *ConfigOptions) (*Components, func(), error) {
 {{- if .Has.milvus }}
 		Milvus: milvusPool,
 {{- end }}
+		Cron:   cronManager,
 	}
 
 	return components, unwind, nil

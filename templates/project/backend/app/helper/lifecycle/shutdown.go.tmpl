@@ -1,15 +1,22 @@
 // Package lifecycle 进程优雅退出的分阶段编排。
 //
-// 退出分三个阶段，**各自独立计时**，前一阶段超时不会吃掉后一阶段的预算：
-//  1. HTTP：停止接收新请求并等在途请求结束（预算 http.shutdown_timeout）。超时后强制关闭
-//     监听与连接。注意 Go 不能终止正在跑的 handler 协程：超时只代表「不再等」，
-//     不代表所有请求都停了；这些 handler 之后写的日志会因为日志队列已关闭而被丢弃计数。
+// 退出分四个阶段，**各自独立计时**，前一阶段超时不会吃掉后一阶段的预算：
+//  0. 摘除：从服务发现（Consul）注销本实例，让调用方不再把新流量导过来（DeregisterTimeout）。
+//     失败只记录，不阻塞后面的退出；
+//  1. 入口：HTTP / gRPC / TCP **同时**开始关闭：立即停止接入新连接，并行等在途请求 / 流 / 连接
+//     处理结束，共用一份预算（http.shutdown_timeout）。到期后对每个入口强制关闭（断开剩余连接），
+//     强制关闭本身最多等 ForceCloseTimeout；
 //  2. 日志排空：把访问日志 / 操作日志队列里已收下的日志写完（预算 http.request_log.drain_timeout_seconds），
-//     超时则取消在写的写入、不再开始新写入（见 middleware 的 logQueue.shutdown）。
-//  3. 资源关闭：按注册顺序执行 cleanups（停后台任务、关 DB / Redis / 日志等，预算 CleanupTimeout）。
+//     超时则取消在写的写入、不再开始新写入（见 middleware 的 logQueue.shutdown）；
+//  3. 资源关闭：按顺序执行带名字的步骤（停后台任务、关 DB / Redis / 日志等），**每步单独限时**，
+//     一步卡住只记录步骤名并跳到下一步，不会让后面的 Consul / OTel / Redis / DB 都关不掉。
 //
-// 总退出上限 = 三个预算之和 + 日志 worker 响应取消的等待（0.5 秒）。部署时守护进程的停止等待
-// （Docker stop_grace_period、supervisor stopwaitsecs、launchd ExitTimeOut）必须大于这个值，
+// Go 无法终止忽略 ctx 的协程：任何一步「超时」都只代表不再等它，它会在后台继续运行直到自己返回，
+// 进程随后退出。所以超时之后仍可能有迟到的 handler / 回调去访问已经关闭的连接池，
+// 这里能保证的只是「退出有上限、每一步都被执行到、超时会被记录」。
+//
+// 总退出上限见 Plan.WorstCase：部署时守护进程的停止等待（Docker stop_grace_period、
+// supervisor stopwaitsecs、launchd ExitTimeOut，统一为 DeployStopWait）必须比它长至少 DeployStopMargin，
 // 否则进程会在清理途中被 SIGKILL。
 package lifecycle
 
@@ -20,30 +27,52 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	// HTTPShutdownKey HTTP 阶段预算（秒）。
+	// HTTPShutdownKey 入口阶段预算（秒），HTTP / gRPC / TCP 共用。
 	HTTPShutdownKey = "http.shutdown_timeout"
-	// DefaultHTTPShutdownSeconds / MaxHTTPShutdownSeconds HTTP 阶段默认与上限。
+	// DefaultHTTPShutdownSeconds / MaxHTTPShutdownSeconds 入口阶段默认与上限。
 	DefaultHTTPShutdownSeconds = 5
 	MaxHTTPShutdownSeconds     = 10
-	// CleanupTimeout 资源关闭阶段预算。
-	CleanupTimeout = 5 * time.Second
+
+	// DeregisterTimeout 摘除阶段（Consul 注销）的上限。
+	DeregisterTimeout = 2 * time.Second
+	// ForceCloseTimeout 入口优雅关闭到期后，强制关闭最多等多久。
+	ForceCloseTimeout = 1 * time.Second
+	// DrainCancelWait 日志排空到期、取消在写的写入后，等 worker 退出的时间
+	// （与 middleware 的 requestLogStopGrace 一致，由测试钉住）。
+	DrainCancelWait = 500 * time.Millisecond
+	// StepGrace 每一步的 ctx 到期后再多等的时间：让遵守 ctx 的实现把错误返回来，而不是被当成「卡住」。
+	StepGrace = 200 * time.Millisecond
+
+	// 资源关闭阶段 app 层各步的上限（组件各步的上限见 internal/taurus 的 ComponentsCleanupTimeout）。
+	//
+	// BackgroundStopTimeout 停后台任务（日志清理器）。
+	BackgroundStopTimeout = 1 * time.Second
+	// AppCleanupTimeout 应用组件图（app 的 wire injector）的 cleanup。
+	AppCleanupTimeout = 1 * time.Second
+	// PprofStopTimeout 关 pprof 调试服务。
+	PprofStopTimeout = 1 * time.Second
+
+	// DeployStopWait 部署文件里守护进程的停止等待（docker-compose stop_grace_period、
+	// supervisor stopwaitsecs、launchd ExitTimeOut）。改这里必须同步改部署文件。
+	DeployStopWait = 45 * time.Second
+	// DeployStopMargin 停止等待比退出最坏耗时至少多出的余量（进程调度、日志落盘等）。
+	DeployStopMargin = 5 * time.Second
 )
 
-// Budget 各阶段预算。
+// Budget 可配置的阶段预算。
 type Budget struct {
-	HTTP      time.Duration
+	// HTTP 入口阶段预算（http.shutdown_timeout），HTTP / gRPC / TCP 共用。
+	HTTP time.Duration
+	// DrainLogs 日志排空阶段预算（http.request_log.drain_timeout_seconds）。
 	DrainLogs time.Duration
-	Cleanup   time.Duration
 }
 
-// Total 三个阶段预算之和（不含日志 worker 响应取消的等待）。
-func (b Budget) Total() time.Duration { return b.HTTP + b.DrainLogs + b.Cleanup }
-
-// ResolveHTTPShutdown 解析 HTTP 阶段预算：未配置取默认值；非整数或不在 [1, 上限] 内返回 error（启动失败）。
+// ResolveHTTPShutdown 解析入口阶段预算：未配置取默认值；非整数或不在 [1, 上限] 内返回 error（启动失败）。
 func ResolveHTTPShutdown(getString func(string) string) (time.Duration, error) {
 	raw := strings.TrimSpace(getString(HTTPShutdownKey))
 	if raw == "" {
@@ -59,70 +88,215 @@ func ResolveHTTPShutdown(getString func(string) string) (time.Duration, error) {
 	return time.Duration(v) * time.Second, nil
 }
 
-// Plan 一次退出要做的事。StopHTTP / ForceCloseHTTP / DrainLogs 可以为 nil（跳过该阶段）。
+// Step 一个有名字、有上限的退出步骤。
+type Step struct {
+	Name    string
+	Timeout time.Duration
+	// Run 执行这一步。ctx 在 Timeout 到期时取消；遵守 ctx 的实现应随即返回。
+	// 不遵守的也只会被多等 StepGrace，之后不再等待（它在后台继续运行）。
+	Run func(ctx context.Context) error
+}
+
+// Ingress 一个入站服务（HTTP / gRPC / TCP）。
+type Ingress struct {
+	Name string
+	// Shutdown 优雅关闭：立即停止接入新连接，再等在途请求 / 流 / 连接处理结束。
+	// ctx 到期后不再等待它，接着调用 ForceClose。
+	Shutdown func(ctx context.Context) error
+	// ForceClose 优雅关闭到期后调用，断开剩余连接；可以为 nil（Shutdown 已经断开了所有连接）。
+	ForceClose func() error
+}
+
+// Plan 一次退出要做的事。各字段都可以为空（跳过对应阶段）。
 type Plan struct {
 	Budget Budget
-	// StopHTTP 优雅关闭 HTTP（http.Server.Shutdown）：ctx 到期前返回。
-	StopHTTP func(ctx context.Context) error
-	// ForceCloseHTTP StopHTTP 超时后调用（http.Server.Close），断开剩余连接。
-	ForceCloseHTTP func() error
-	// DrainLogs 排空日志队列；关闭队列后，任何还在跑的 handler 再写日志都会被丢弃计数。
+	// Deregister 阶段 0：从服务发现摘除本实例。
+	Deregister *Step
+	// Ingress 阶段 1：并行关闭，共用 Budget.HTTP。
+	Ingress []Ingress
+	// DrainLogs 阶段 2：排空日志队列；关闭队列后，任何还在跑的 handler 再写日志都会被丢弃计数。
 	DrainLogs func(ctx context.Context) error
-	// Cleanups 资源关闭，按顺序执行。
-	Cleanups []func()
+	// Cleanups 阶段 3：资源关闭，按切片顺序逐步执行，顺序就是关闭顺序。
+	Cleanups []Step
 	// Logf 输出阶段日志，nil 时用 log.Printf。
 	Logf func(format string, args ...any)
 }
 
-// Run 按 HTTP → 日志排空 → 资源关闭的顺序执行，每个阶段用自己的预算；返回各阶段错误的合并。
+// WorstCase 每一步都卡满时的退出总耗时上限（Run 的实际耗时不会超过它，调度误差除外）。
+func (p Plan) WorstCase() time.Duration {
+	var d time.Duration
+	if p.Deregister != nil {
+		d += p.Deregister.Timeout + StepGrace
+	}
+	if len(p.Ingress) > 0 {
+		d += p.Budget.HTTP + ForceCloseTimeout
+	}
+	if p.DrainLogs != nil {
+		d += p.Budget.DrainLogs + DrainCancelWait + StepGrace
+	}
+	for _, s := range p.Cleanups {
+		d += s.Timeout + StepGrace
+	}
+	return d
+}
+
+// CheckDeployStopWait 校验退出最坏耗时比部署的停止等待短至少 DeployStopMargin。
 //
-// 资源关闭阶段超时只是不再等待（cleanup 函数无法被打断），剩余 cleanup 会在后台继续，
-// 进程随后退出。
+// 比对的是代码常量 DeployStopWait，不是运维实际配置的 stop_grace_period / stopwaitsecs / ExitTimeOut
+// （进程读不到它们）：部署文件被改小时这里发现不了。
+func (p Plan) CheckDeployStopWait() error {
+	if worst := p.WorstCase(); worst+DeployStopMargin > DeployStopWait {
+		return fmt.Errorf("退出最坏耗时 %s 加余量 %s 超过部署停止等待 %s：请减少退出步骤的上限，或同步调大 lifecycle.DeployStopWait 与部署文件",
+			worst, DeployStopMargin, DeployStopWait)
+	}
+	return nil
+}
+
+// Run 按 摘除 → 入口 → 日志排空 → 资源关闭 的顺序执行，每个阶段用自己的预算；返回各步错误的合并。
 func (p Plan) Run() error {
 	logf := p.Logf
 	if logf == nil {
 		logf = log.Printf
 	}
 	var errs []error
-
-	if p.StopHTTP != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), p.Budget.HTTP)
-		err := p.StopHTTP(ctx)
-		cancel()
-		if err != nil {
-			errs = append(errs, fmt.Errorf("HTTP 未在 %s 内优雅关闭（仍在执行的请求不会被终止，其后的日志将被丢弃）: %w", p.Budget.HTTP, err))
-			logf("%v\n", errs[len(errs)-1])
-			if p.ForceCloseHTTP != nil {
-				if cerr := p.ForceCloseHTTP(); cerr != nil {
-					logf("强制关闭 HTTP 连接失败: %v\n", cerr)
-				}
-			}
-		}
-	}
-
-	if p.DrainLogs != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), p.Budget.DrainLogs)
-		err := p.DrainLogs(ctx)
-		cancel()
+	record := func(err error) {
 		if err != nil {
 			errs = append(errs, err)
 			logf("%v\n", err)
 		}
 	}
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for _, cleanup := range p.Cleanups {
-			cleanup()
+	if p.Deregister != nil {
+		record(runStep(*p.Deregister, StepGrace, logf))
+	}
+
+	if len(p.Ingress) > 0 {
+		results := make([]error, len(p.Ingress))
+		var wg sync.WaitGroup
+		for i, in := range p.Ingress {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				results[i] = runIngress(in, p.Budget.HTTP, logf)
+			}()
 		}
-	}()
-	select {
-	case <-done:
-	case <-time.After(p.Budget.Cleanup):
-		err := fmt.Errorf("资源关闭未在 %s 内完成，不再等待", p.Budget.Cleanup)
-		errs = append(errs, err)
-		logf("%v\n", err)
+		wg.Wait()
+		for _, err := range results {
+			record(err)
+		}
+	}
+
+	if p.DrainLogs != nil {
+		drain := Step{Name: "drain-logs", Timeout: p.Budget.DrainLogs, Run: p.DrainLogs}
+		record(runStep(drain, DrainCancelWait+StepGrace, logf))
+	}
+
+	for _, s := range p.Cleanups {
+		record(runStep(s, StepGrace, logf))
 	}
 	return errors.Join(errs...)
+}
+
+// AbortStartup 启动失败后的收尾：按 plan 有界清理（注销、关闭已启动的入口、排空日志、关闭资源），
+// 记下清理结果，再以 1 调用 exit。生产里 exit 就是 os.Exit；测试注入记录函数，不会真的终止进程。
+//
+// 日志写的是「启动失败、清理已完成」，不会出现「Shutdown completed successfully」那类误导性的成功提示。
+func AbortStartup(cause error, plan Plan, exit func(code int)) {
+	logf := plan.Logf
+	if logf == nil {
+		logf = log.Printf
+	}
+	logf("启动失败: %v；开始清理已初始化的组件（最坏 %s），之后以非 0 码退出\n", cause, plan.WorstCase())
+	if err := plan.Run(); err != nil {
+		logf("启动失败，清理已结束但部分步骤出错，以非 0 码退出\n")
+	} else {
+		logf("启动失败，清理已完成，以非 0 码退出\n")
+	}
+	exit(1)
+}
+
+// runStep 执行一步：ctx 在 Timeout 到期时取消，最多等 Timeout + grace。
+// 到期仍未返回只记录、不再等待；它之后返回的错误照样记日志，方便对照排查。
+func runStep(s Step, grace time.Duration, logf func(string, ...any)) error {
+	if s.Run == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), s.Timeout)
+	done := make(chan error, 1)
+	go func() {
+		defer cancel()
+		done <- safeCall(func() error { return s.Run(ctx) })
+	}()
+	timer := time.NewTimer(s.Timeout + grace)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("退出步骤 %s 失败: %w", s.Name, err)
+		}
+		logf("退出步骤 %s 完成\n", s.Name)
+		return nil
+	case <-timer.C:
+		go func() {
+			if err := <-done; err != nil {
+				logf("退出步骤 %s 在超时之后才返回: %v\n", s.Name, err)
+			}
+		}()
+		return fmt.Errorf("退出步骤 %s 未在 %s 内结束，不再等待（无法终止，它仍在后台运行）: %w", s.Name, s.Timeout+grace, context.DeadlineExceeded)
+	}
+}
+
+// runIngress 关闭一个入口：先在 budget 内优雅关闭，到期再强制关闭（最多等 ForceCloseTimeout）。
+func runIngress(in Ingress, budget time.Duration, logf func(string, ...any)) error {
+	if in.Shutdown == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- safeCall(func() error { return in.Shutdown(ctx) }) }()
+
+	var err error
+	select {
+	case err = <-done:
+	case <-ctx.Done():
+		// 两者同时就绪时以结果为准
+		select {
+		case err = <-done:
+		default:
+			err = ctx.Err()
+		}
+	}
+	if err == nil {
+		logf("入口 %s 已关闭\n", in.Name)
+		return nil
+	}
+	err = fmt.Errorf("入口 %s 未在 %s 内优雅关闭（仍在执行的请求 / 回调不会被终止，其后的日志将被丢弃）: %w", in.Name, budget, err)
+	if in.ForceClose == nil {
+		return err
+	}
+	forced := make(chan error, 1)
+	go func() { forced <- safeCall(in.ForceClose) }()
+	timer := time.NewTimer(ForceCloseTimeout)
+	defer timer.Stop()
+	select {
+	case ferr := <-forced:
+		if ferr != nil {
+			return errors.Join(err, fmt.Errorf("强制关闭入口 %s 失败: %w", in.Name, ferr))
+		}
+		logf("入口 %s 已强制关闭\n", in.Name)
+		return err
+	case <-timer.C:
+		return errors.Join(err, fmt.Errorf("强制关闭入口 %s 未在 %s 内完成，不再等待", in.Name, ForceCloseTimeout))
+	}
+}
+
+// safeCall 把 panic 转成错误：一步 panic 不能让后面的步骤都不执行。
+func safeCall(fn func() error) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+	return fn()
 }

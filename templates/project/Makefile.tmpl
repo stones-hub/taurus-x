@@ -1,5 +1,6 @@
 # 统一脚本：启动后端、前端、打包
-.PHONY: backend-wire backend-run backend-build frontend-install frontend-dev frontend-build dev build
+.PHONY: backend-wire backend-run backend-build frontend-install frontend-dev frontend-build dev build \
+	db-backup db-restore sbom sbom-backend sbom-frontend vuln
 
 # ---------------------------- 后端 ----------------------------
 # 生成依赖注入代码（在 backend/ 下执行）
@@ -33,3 +34,65 @@ dev:
 
 # 打包（后端二进制 + 前端静态产物）
 build: backend-build frontend-build
+
+# ---------------------------- 运维（用法与结果解读见 docs/运维手册.md） ----------------------------
+# 工具版本固定、不跟随最新版：同一份代码每次扫出来的结果要可比。
+# 这三个版本是实现时查询确认存在并试跑过的版本（待独立验证）；升级时改这里并重新验证。
+CYCLONEDX_GOMOD_VERSION := v1.12.0
+CDXGEN_VERSION := 12.9.0
+GOVULNCHECK_VERSION := v1.9.0
+SBOM_DIR := artifacts/sbom
+
+# MySQL 备份 / 恢复。连接参数只走环境变量 MYSQL_OPS_HOST / PORT / USER / PASSWORD。
+# make 变量通过环境传给 shell（"$$DB"），不在 make 里拼进命令行，库名等值由脚本做白名单校验。
+#   make db-backup DB=<库名>
+#   make db-restore BACKUP_FILE=backups/<文件>.sql.gz DB=<目标库> CONFIRM=<目标库>@<主机>:<端口> [CREATE=1]
+db-backup:
+	./scripts/db/backup.sh --database "$$DB"
+
+# 只有 CREATE=1 才传 --create（CREATE=0 / CREATE=yes 都不算）。
+db-restore:
+	if [ "$${CREATE:-}" = 1 ]; then set -- --create; else set --; fi; \
+	./scripts/db/restore.sh --file "$$BACKUP_FILE" --database "$$DB" --confirm "$$CONFIRM" "$$@"
+
+# SBOM（CycloneDX 1.6 JSON），输出到 artifacts/sbom/（已被 .gitignore 忽略）。
+# 工具先写临时文件，再用 scripts/sbomcheck（标准库小工具）校验格式、spec 版本、组件与依赖关系非空、
+# 每个组件都有版本，通过后才改名成正式文件：任何一步失败都不替换已有的正式报告。
+sbom: sbom-backend sbom-frontend
+
+# 后端：go run 固定版本的 cyclonedx-gomod，读 go.mod 的模块图（不含仅测试用的依赖），不改 go.mod / go.sum。
+sbom-backend:
+	@mkdir -p $(SBOM_DIR)
+	rm -f $(SBOM_DIR)/.backend.cdx.json.tmp
+	cd backend && go run github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@$(CYCLONEDX_GOMOD_VERSION) \
+		mod -json -output-version 1.6 -output ../$(SBOM_DIR)/.backend.cdx.json.tmp .
+	cd scripts/sbomcheck && go run . -spec 1.6 ../../$(SBOM_DIR)/.backend.cdx.json.tmp
+	mv $(SBOM_DIR)/.backend.cdx.json.tmp $(SBOM_DIR)/backend.cdx.json
+
+# 前端：npm exec 临时拉固定版本的 cdxgen，直接解析 pnpm-lock.yaml（-t pnpm），
+# 不安装项目依赖（--no-install-deps）、不改 package.json / pnpm-lock.yaml。
+# env -i 只留 PATH / HOME：不把当前 shell 里的密钥类环境变量带给第三方工具；
+# npm_config_ignore_scripts=true：npm 安装 cdxgen 时不执行任何包的安装脚本。
+# 注意：这里只固定了 cdxgen 本身的版本，它的传递依赖在首次下载时按 cdxgen 发布时的声明解析，
+# 没有锁文件锁定（见运维手册）。
+sbom-frontend:
+	@mkdir -p $(SBOM_DIR)
+	rm -f $(SBOM_DIR)/.frontend.cdx.json.tmp
+	cd frontend && env -i PATH="$$PATH" HOME="$$HOME" npm_config_ignore_scripts=true \
+		npm exec --yes @cyclonedx/cdxgen@$(CDXGEN_VERSION) -- \
+		-t pnpm --no-install-deps --no-recurse --no-babel --spec-version 1.6 --fail-on-error \
+		-o ../$(SBOM_DIR)/.frontend.cdx.json.tmp .
+	cd scripts/sbomcheck && go run . -spec 1.6 ../../$(SBOM_DIR)/.frontend.cdx.json.tmp
+	mv $(SBOM_DIR)/.frontend.cdx.json.tmp $(SBOM_DIR)/frontend.cdx.json
+
+# 漏洞扫描：go run 固定版本的 govulncheck，依次扫本项目的三个 Go module。
+# 退出码：govulncheck 自己 0 = 代码可达漏洞为 0；3 = 发现代码可达漏洞；其它非 0 = 工具出错（不等于没有漏洞）。
+# 但经过包装后看不到原值：go run 遇到程序非 0 退出时统一返回 1（并打印「exit status N」），
+# make 再统一返回 2（并打印「Error 1」）。所以 make vuln 只能区分「通过（0）/ 没通过（非 0）」，
+# 没通过时看输出里的「exit status N」和「Your code is affected by ...」判断是发现漏洞还是工具出错。
+# 任何一个 module 没通过，make 立即停止，后面的 module 不会被扫描。
+# 「模块里有、但代码没调用」的告警不影响退出码，用 -show verbose 查看，判定见运维手册。
+vuln:
+	cd backend && go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+	cd scripts/loadtest && go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+	cd scripts/sbomcheck && go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...

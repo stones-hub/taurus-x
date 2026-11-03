@@ -1,11 +1,13 @@
 http:
   address: "${SERVER_ADDRESS:0.0.0.0}"
   port: ${SERVER_PORT:9080}
-  # 优雅退出分三个阶段、各自计时（见 app/helper/lifecycle）：
-  #   HTTP 关闭 shutdown_timeout（1~10 秒）→ 日志排空 request_log.drain_timeout_seconds（1~8 秒）
-  #   → 资源关闭 5 秒。总退出上限 = 三者之和 + 0.5 秒，默认 15.5 秒、最大 23.5 秒；
+  # 优雅退出分四个阶段、各自计时（见 app/helper/lifecycle）：
+  #   Consul 注销（选了 Consul 时，2 秒）→ 入口关闭 shutdown_timeout（1~10 秒，HTTP / gRPC / TCP
+  #   同时停止接新连接、共用这份预算，到期强制断开，再最多等 1 秒）→ 日志排空
+  #   request_log.drain_timeout_seconds（1~8 秒）→ 资源关闭（逐个组件、每步单独限时）。
+  # 所有步骤都卡满时的总上限：全选组件、两项都取最大值约 37.7 秒（默认值约 29.7 秒）。
   # 守护进程的停止等待（Docker stop_grace_period、supervisor stopwaitsecs、launchd ExitTimeOut）
-  # 必须大于它，部署文档里给的是 30 秒。HTTP 超时只代表不再等待，仍在执行的请求不会被终止。
+  # 统一为 45 秒，启动时会校验余量。超时只代表不再等待，仍在执行的请求 / 回调不会被终止。
   shutdown_timeout: ${HTTP_SHUTDOWN_TIMEOUT_SECONDS:5}
   read_timeout: 30
   write_timeout: 30

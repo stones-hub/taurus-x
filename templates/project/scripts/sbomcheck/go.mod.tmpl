@@ -1,0 +1,5 @@
+// SBOM 校验工具是独立 module，只用标准库：不进 backend/go.mod，也不需要 go.sum。
+// 由根目录 Makefile 的 sbom-backend / sbom-frontend 调用。
+module sbomcheck
+
+go {{ .GoVersion }}

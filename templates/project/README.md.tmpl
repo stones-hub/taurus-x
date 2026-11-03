@@ -69,8 +69,11 @@
 │   └── config/                  # 配置（autoload/ 按组件分目录）
 ├── frontend/
 │   └── src/{api,types,router,views,composables,components,directives,stores}
-├── scripts/sql/init.sql         # 建表 + 底座权限数据 + 初始管理员
-├── docs/                        # 项目规范 / 前后端开发流程 / 部署文档
+├── scripts/
+│   ├── sql/init.sql             # 建表 + 底座权限数据 + 初始管理员
+│   ├── db/                      # MySQL 备份 / 恢复脚本（make db-backup / db-restore）
+│   └── loadtest/                # 登录 / 列表接口压测工具（独立 Go module，go run）
+├── docs/                        # 项目规范 / 前后端开发流程 / 部署文档 / 运维手册
 ├── Dockerfile
 └── docker-compose.yml
 ```
@@ -190,6 +193,15 @@ mysql -uroot -p {{ .DBName }} -e "UPDATE admin_user_logins SET login_credential=
 - 不同 CPU 架构（amd64 / arm64）怎么编译、怎么出包；
 - 可选的 nginx 反向代理，以及必须同步设置的 `TRUSTED_PROXIES`；
 - 常见问题排查。
+
+上线后的日常运维写在 [`docs/运维手册.md`](docs/运维手册.md)：
+
+| 命令 | 用途 |
+|------|------|
+| `make db-backup DB=<库>` / `make db-restore ...` | MySQL 备份 / 恢复到空库（连接参数走 `MYSQL_OPS_*` 环境变量，恢复从不覆盖非空库） |
+| `cd scripts/loadtest && go run . -scenario login\|list` | 登录 / 列表接口压测（默认只压本机，先读 `scripts/loadtest/README.md` 的限流说明） |
+| `make sbom` | 前后端 CycloneDX SBOM → `artifacts/sbom/` |
+| `make vuln` | govulncheck 依赖漏洞扫描（已知的 x/crypto/openpgp 模块告警及判定见运维手册） |
 {{- if .Has.milvus }}
 
 > ⚠️ 本项目勾选了 milvus：Docker 方式当前会在拉取 minio 镜像时失败，详见部署文档第二节的已知阻塞说明；app 自身不依赖 Milvus 启动。
@@ -214,8 +226,55 @@ mysql -uroot -p {{ .DBName }} -e "UPDATE admin_user_logins SET login_credential=
 4. **访问日志、操作日志走容量有限的队列异步写库**（`app/middleware/request_log_queue.go`）：
    队列满时新日志直接丢弃（计数并每分钟最多告警一条），退出时在独立的「日志排空」阶段最多等
    `http.request_log.drain_timeout_seconds` 秒写完（不受 HTTP 关闭阶段影响），超时、HTTP 超时后仍在跑的请求、
-   或进程被强杀时，未写完的日志仍会丢失。退出总上限默认 15.5 秒，守护进程停止等待需更长（部署文档用 30 秒）。容量 / worker 数见 `config/autoload/http/http.yaml` 的 `http.request_log`。
+   或进程被强杀时，未写完的日志仍会丢失。退出最坏总耗时见下面的「优雅退出」，守护进程停止等待为 45 秒。容量 / worker 数见 `config/autoload/http/http.yaml` 的 `http.request_log`。
 5. **应用内不做来源 IP 白名单**：需要按 IP 限制后台访问时，在 Nginx（`allow` / `deny`）或防火墙上配置，见 `docs/部署文档.md` 7.5。
+
+### 优雅退出（`app/helper/lifecycle`，由 `app/bootstrap.go` 的 `gracefulShutdown` 编排）
+
+收到 SIGTERM / SIGINT 后分四个阶段，各自计时，前一阶段慢不占用后一阶段的预算：
+
+| 阶段 | 做什么 | 上限 |
+|---|---|---|
+| 0 摘除 | 选了 Consul 时先注销本实例，失败只记录、不阻塞退出；组件 cleanup 不再重复注销 | 2 秒 |
+| 1 入口 | HTTP / gRPC / TCP **同时**停止接新连接，并行等在途请求 / 流 / 连接处理结束；到期强制断开（gRPC 用原始 `Stop`，长流如 `Health/Watch` 不会卡住退出） | `http.shutdown_timeout`（1~10 秒）+ 强制关闭 1 秒 |
+| 2 日志排空 | 写完访问日志 / 操作日志队列，超时取消剩余写入 | `drain_timeout_seconds`（1~8 秒）+ 0.5 秒 |
+| 3 资源关闭 | 按顺序逐步执行：日志清理器 → 应用组件图 → 框架组件（按初始化逆序：Cron 最先停 → Milvus / gRPC / TCP / OTel / Consul 客户端 → Redis → DB → 日志最后关）→ pprof。**每步单独限时**，卡住的一步只记录步骤名，后面的照常执行 | 每步 1~3 秒，见 `internal/taurus/shutdown.go` |
+
+每一步的 ctx 到期后再多等 0.2 秒收尾。所有步骤都卡满时的总上限（`Plan.WorstCase`）：全选组件、两项预算取最大值约 37.7 秒，
+默认配置约 29.7 秒；部署的停止等待（Docker `stop_grace_period`、supervisor `stopwaitsecs`、launchd `ExitTimeOut`）
+统一为 45 秒（`lifecycle.DeployStopWait`），启动时会用真实的退出计划校验至少留 5 秒余量，不满足拒绝启动。
+注意这个校验比对的是**代码里的常量**，读不到运维实际配置的 `stop_grace_period` / `stopwaitsecs` / `ExitTimeOut`：
+部署文件被手工改小不会被发现，改部署文件时请对照这里的最坏耗时自行核对（反过来改常量时也要同步改部署文件）。
+启动失败（端口被占、启动自检不过）也走同一套清理（Consul 注销、关闭已启动的入口和已初始化的组件），
+日志写「启动失败，清理已完成，以非 0 码退出」，再以非 0 码退出。
+退出过程中再发一次 SIGTERM / SIGINT 会立即终止进程。
+
+启动日志里有一行 `Shutdown capabilities: ...`，说明当前编译进来的组件版本在退出时走哪条路径
+（如 `consul=context-deregister` / `consul=legacy-wait-only`、`tcp=stop-context` / `tcp=legacy-stop`），
+联调时据此确认新 API 是否生效；它只含组件版本信息，不含配置值。
+
+已知限制：
+
+- Go 无法终止忽略 ctx 的协程。任何一步「超时」都只代表不再等它：它在后台继续运行，进程随后退出，
+  所以仍可能有迟到的 handler / 定时任务 / TCP 回调去访问已经关闭的连接池（日志里会看到对应步骤的超时告警）。
+- 依赖的组件版本决定能做到什么程度（`backend/go.mod` 默认 taurus-pro-consul v0.3.0、taurus-pro-tcp v0.2.0、
+  taurus-pro-opentelemetry v0.2.0；新 API 都靠类型断言探测，降级到旧版本照常编译，回落到下面写的旧版行为）：
+  - taurus-pro-consul v0.3.0 提供 `DeregisterServiceContext`（启动日志 `consul=context-deregister`），到期时注销请求被真正取消。
+    旧版 v0.2.0 及以前的注销不接收 ctx（`consul=legacy-wait-only`），到期只能放弃等待，那个 HTTP 请求取消不了。
+  - taurus-pro-tcp v0.2.0 提供 `StopContext`（启动日志 `tcp=stop-context`）：先关全部 socket、不调用回调，再限时等
+    `OnMessage` / `OnClose` 返回；回调卡住时到期放弃等待，回调本身不会被终止。
+    旧版 v0.1.0（`tcp=legacy-stop`）的 `Stop` 会先同步调用每个连接的 `OnClose` 再关 socket，
+    回调卡住时对应连接不会断开、后面的连接也排着，`OnClose` 无法被取消。
+    v0.1.0 还有一个启动竞态：进程刚启动、TCP 的 `Start` 还没真正开始时就收到停止信号，`Stop` 会成为空操作，
+    随后 `Start` 照常监听，入口阶段只能等到超时，日志排空期间 TCP 仍可能接入连接，直到资源关闭阶段的兜底才停掉。
+    兜底关闭拿不到 `Start` 的结束信号，且 v0.1.0 的重复 `Stop` 会立刻返回，所以日志只会写 `unconfirmed`（无法确认已关闭），不会写成功。
+    v0.1.0 的默认 handler 在连接数打满时会因空连接 panic，降级到 v0.1.0 时开启 TCP 前请注册自己的 handler。
+    （v0.2.0 中 `Stop` 先于 `Start` 时 `Start` 返回 `ErrServerStopped`、不再监听，默认 handler 对空连接只记日志，
+    见组件 README。）
+  - OpenTelemetry 用 `Shutdown(ctx)` 限时 flush，collector 不可达时到期放弃，未导出的 span 丢失；SDK 内部吞掉的导出错误拿不到。
+- Consul 注销失败后不重试，残留的注册由健康检查的 `deregister_after` 兜底摘除。
+- 信号监听在 `Run` 里才注册：`init`（组件初始化、Consul 注册、启动自检）期间收到 SIGTERM / SIGINT 时，
+  进程按系统默认行为立即终止，不走上面的清理，Consul 注册同样要等 `deregister_after` 摘除。
 
 ### 行为约定（不是缺陷，容易被当成 bug）
 

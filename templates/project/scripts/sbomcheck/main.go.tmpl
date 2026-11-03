@@ -1,0 +1,114 @@
+// sbomcheck 校验一份 CycloneDX JSON 是否「可用」：make sbom 在把临时文件改名成正式文件之前调用它，
+// 校验不过就不替换，旧的正式报告保持不变。
+//
+// 只检查结构上的硬性要求，不做许可证或漏洞判断：
+//   - 是合法 JSON，bomFormat 为 CycloneDX，specVersion 等于 -spec；
+//   - metadata.component 有名字（这份 SBOM 描述的是谁）；
+//   - components 非空，且每个组件都有 name 和 version；
+//   - dependencies 非空，且每条都有 ref。
+//
+// 退出码：0 通过；1 校验不通过或文件读不了；2 参数错误。
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+)
+
+// maxSBOMBytes 单个 SBOM 的大小上限：本项目的 SBOM 只有几百 KB，超过这个量级说明拿错了文件。
+const maxSBOMBytes = 64 << 20
+
+type bom struct {
+	BOMFormat   string `json:"bomFormat"`
+	SpecVersion string `json:"specVersion"`
+	Metadata    struct {
+		Component *struct {
+			Name string `json:"name"`
+		} `json:"component"`
+	} `json:"metadata"`
+	Components []struct {
+		Name    string `json:"name"`
+		Version string `json:"version"`
+	} `json:"components"`
+	Dependencies []struct {
+		Ref string `json:"ref"`
+	} `json:"dependencies"`
+}
+
+func main() {
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+func run(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("sbomcheck", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	spec := fs.String("spec", "1.6", "期望的 CycloneDX specVersion")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(stderr, "用法: sbomcheck [-spec 1.6] <文件.cdx.json>")
+		return 2
+	}
+	path := fs.Arg(0)
+	b, err := load(path)
+	if err == nil {
+		err = check(b, *spec)
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "SBOM 校验失败 %s: %v\n", path, err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "SBOM 校验通过 %s: CycloneDX %s，%d 个组件，%d 条依赖关系\n", path, b.SpecVersion, len(b.Components), len(b.Dependencies))
+	return 0
+}
+
+func load(path string) (*bom, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxSBOMBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxSBOMBytes {
+		return nil, fmt.Errorf("文件超过 %d 字节", maxSBOMBytes)
+	}
+	var b bom
+	if err := json.Unmarshal(data, &b); err != nil {
+		return nil, fmt.Errorf("不是合法 JSON: %w", err)
+	}
+	return &b, nil
+}
+
+func check(b *bom, spec string) error {
+	switch {
+	case b.BOMFormat != "CycloneDX":
+		return fmt.Errorf("bomFormat 应为 CycloneDX，实际 %q", b.BOMFormat)
+	case b.SpecVersion != spec:
+		return fmt.Errorf("specVersion 应为 %s，实际 %q", spec, b.SpecVersion)
+	case b.Metadata.Component == nil || b.Metadata.Component.Name == "":
+		return errors.New("缺少 metadata.component.name")
+	case len(b.Components) == 0:
+		return errors.New("components 为空")
+	case len(b.Dependencies) == 0:
+		return errors.New("dependencies 为空")
+	}
+	for i, c := range b.Components {
+		if c.Name == "" || c.Version == "" {
+			return fmt.Errorf("第 %d 个组件缺少 name 或 version（name=%q）", i+1, c.Name)
+		}
+	}
+	for i, d := range b.Dependencies {
+		if d.Ref == "" {
+			return fmt.Errorf("第 %d 条依赖关系缺少 ref", i+1)
+		}
+	}
+	return nil
+}

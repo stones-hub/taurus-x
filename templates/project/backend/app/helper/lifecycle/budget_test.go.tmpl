@@ -1,0 +1,40 @@
+package lifecycle_test
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"{{ .Module }}/app/helper/lifecycle"
+	"{{ .Module }}/app/middleware"
+	"{{ .Module }}/internal/taurus"
+)
+
+// TestDeployStopWaitCoversWorstCase 部署的停止等待必须比退出最坏耗时长至少 DeployStopMargin。
+//
+// 按 app 的 shutdownPlan 的结构、取配置允许的最大预算（http.shutdown_timeout=10、
+// drain_timeout_seconds=8），用各步真实的上限常量求和：摘除（选了 Consul 时）+ 入口 + 日志排空
+// + 资源关闭（log-cleaner / app / components / pprof 全部启用）。app 启动时还会用真实的退出计划
+// 再校验一次（Run 里的 CheckDeployStopWait），步骤结构变了那里也会拦住。
+func TestDeployStopWaitCoversWorstCase(t *testing.T) {
+	noop := func(context.Context) error { return nil }
+	plan := lifecycle.Plan{
+		Budget:    lifecycle.Budget{HTTP: lifecycle.MaxHTTPShutdownSeconds * time.Second, DrainLogs: middleware.MaxRequestLogDrain},
+		Ingress:   make([]lifecycle.Ingress, 1), // 入口阶段的上限与入口个数无关（并行、共用预算）
+		DrainLogs: noop,
+		Cleanups: []lifecycle.Step{
+			{Name: "log-cleaner", Timeout: lifecycle.BackgroundStopTimeout},
+			{Name: "app", Timeout: lifecycle.AppCleanupTimeout},
+			{Name: "components", Timeout: taurus.ComponentsCleanupTimeout},
+			{Name: "pprof", Timeout: lifecycle.PprofStopTimeout},
+		},
+	}
+{{- if .Has.consul }}
+	plan.Deregister = &lifecycle.Step{Name: "consul-deregister", Timeout: lifecycle.DeregisterTimeout}
+{{- end }}
+	t.Logf("退出最坏耗时 %v（其中组件关闭 %v），部署停止等待 %v，要求余量 %v",
+		plan.WorstCase(), taurus.ComponentsCleanupTimeout, lifecycle.DeployStopWait, lifecycle.DeployStopMargin)
+	if err := plan.CheckDeployStopWait(); err != nil {
+		t.Fatal(err)
+	}
+}

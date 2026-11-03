@@ -51,7 +51,7 @@ service 返回的错误统一由 `controller.FailByError` 输出：越权回 403
 ## 访问日志与操作日志
 
 - 操作日志的成败按响应体业务 code 判断（只解析前 4KB，取不到时回退 HTTP 状态），HTTP 200 + code≠2xx 记「失败」。
-- 两类日志进入有界队列，由固定数量 worker 写库；队列满时丢弃并计数，丢弃与写库失败每分钟最多告警一条汇总；优雅退出分 HTTP 关闭 → 日志排空 → 资源关闭三段、各自计时（默认 5 / 5 / 5 秒，总上限加 0.5 秒），排空超时取消剩余写入。HTTP 超时只代表不再等待，仍在执行的请求不会被终止，其后的日志被丢弃计数；忽略取消的写入可能在资源关闭后才结束。配置项 `http.request_log.queue_capacity` / `workers` / `drain_timeout_seconds`（默认 1000 / 2 / 5 秒，`.env` 中为 `REQUEST_LOG_QUEUE_CAPACITY` / `REQUEST_LOG_WORKERS` / `REQUEST_LOG_DRAIN_TIMEOUT_SECONDS`）。退出超时或进程被强杀时，队列里未写完的日志仍会丢失。
+- 两类日志进入有界队列，由固定数量 worker 写库；队列满时丢弃并计数，丢弃与写库失败每分钟最多告警一条汇总；优雅退出中日志排空是入口关闭与资源关闭之间的独立阶段、单独计时（阶段划分与总上限见 README 的「优雅退出」），排空超时取消剩余写入。HTTP 超时只代表不再等待，仍在执行的请求不会被终止，其后的日志被丢弃计数；忽略取消的写入可能在资源关闭后才结束。配置项 `http.request_log.queue_capacity` / `workers` / `drain_timeout_seconds`（默认 1000 / 2 / 5 秒，`.env` 中为 `REQUEST_LOG_QUEUE_CAPACITY` / `REQUEST_LOG_WORKERS` / `REQUEST_LOG_DRAIN_TIMEOUT_SECONDS`）。退出超时或进程被强杀时，队列里未写完的日志仍会丢失。
 
 ## Redis轮换边界
 
@@ -83,3 +83,5 @@ Pi须对当前代码重新进行全新只读复审，并用隔离MySQL8.0/Redis7
 v0.4.0 已补：日志有界队列及退出drain、操作日志按业务code判定成败；IP白名单不在应用内实现（HostMiddleware已删除，改由Nginx/防火墙负责，见部署文档7.5）。
 
 一期仍不覆盖：Consul/Milvus/OTEL完整生产配置和运行、短信供应商、权限升级与角色删除等其他并发窗口、许可证/SBOM完整交付、Go依赖漏洞审计、备份恢复及容量验收。不得将本期代码修复等同于无条件商用。
+
+后续已补运维工具（见 `运维手册.md`）：MySQL 备份恢复脚本、登录/列表压测工具、`make sbom`、`make vuln`。这些只是工具和步骤：真库「备份→删测试库→恢复→登录」演练、在你的硬件与限流配置下的压测基准、许可证审查，仍要在你的环境实际执行并留档，工具存在不等于已验收。

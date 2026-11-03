@@ -124,9 +124,9 @@ services:
     image: {{ .ProjectName }}-app:latest
     container_name: {{ .ProjectName }}-app
     restart: unless-stopped
-    # 优雅退出总上限默认 15.5 秒、最大 23.5 秒（见 config/autoload/http/http.yaml 的 shutdown_timeout 注释），
-    # Docker 默认只等 10 秒就 SIGKILL，这里放宽到 30 秒
-    stop_grace_period: 30s
+    # 优雅退出的最坏总耗时：全选组件且退出预算取最大值约 37.7 秒（见 config/autoload/http/http.yaml 的
+    # shutdown_timeout 注释）。Docker 默认只等 10 秒就 SIGKILL，这里放宽到 45 秒（= lifecycle.DeployStopWait）
+    stop_grace_period: 45s
     depends_on:
       mysql:
         condition: service_healthy

@@ -1,0 +1,345 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/cookiejar"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+)
+
+// 与后端约定的 Cookie / 请求头名（见 backend/app/middleware/jwt.go、csrf.go）。
+const (
+	jwtCookieName = "jwt_token"
+	csrfName      = "x-csrf-token"
+)
+
+// outcome 单个请求的结果分类。互斥：每个请求只落进一类。
+type outcome int
+
+const (
+	// outcomeSuccess HTTP 200 且 body.code == 200；登录还要求下发了 jwt_token（HttpOnly）与 CSRF Cookie。
+	outcomeSuccess outcome = iota
+	// outcomeBusinessFailure HTTP 200 但 body.code != 200。后端的 401/403/500 业务错误都是这种形态
+	// （httpx.SendResponse 把它们包成 HTTP 200，真实码只在 body.code 里）。
+	outcomeBusinessFailure
+	// outcomeRateLimited HTTP 429：被限流。计入错误率，不算成功，也不算「服务没问题」。
+	outcomeRateLimited
+	// outcomeHTTPError 其它非 200 状态（如来源校验失败的 403、413、5xx、重定向）。
+	outcomeHTTPError
+	// outcomeTransportError 连接失败、超时等，没拿到完整响应。
+	outcomeTransportError
+	// outcomeInvalidResponse 拿到了响应，但超过 -max-body、不是预期 JSON，或登录成功却没下发 Cookie。
+	outcomeInvalidResponse
+	numOutcomes
+)
+
+// result 一次请求的观测值。不保存响应体、Cookie 值等任何可能含令牌的内容。
+type result struct {
+	outcome    outcome
+	latency    time.Duration
+	httpStatus int
+	bodyCode   int
+	retryAfter string
+	transport  string
+}
+
+// client 一个 worker 的 HTTP 客户端。Transport（连接池）全局共享，Cookie jar 每个会话独立。
+type client struct {
+	cfg  *config
+	base string
+	hc   *http.Client
+}
+
+func newClient(cfg *config, transport http.RoundTripper, jar http.CookieJar) *client {
+	return &client{
+		cfg:  cfg,
+		base: cfg.BaseURL.String(),
+		hc: &http.Client{
+			Transport: transport,
+			Jar:       jar,
+			Timeout:   cfg.Timeout,
+			// 不跟随重定向：后端接口不该重定向，跟过去量到的就不是目标接口了。
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+	}
+}
+
+func newJar() http.CookieJar {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		// cookiejar.New(nil) 不会返回错误；真出错说明标准库行为变了，直接暴露。
+		panic(err)
+	}
+	return jar
+}
+
+// cookie 从本会话的 jar 里取「会随请求发给目标地址」的 Cookie 值。
+// 注意 jar 按浏览器规则过滤：Secure Cookie 不会发给 http 地址，这里也就取不到。
+func (c *client) cookie(name string) string {
+	for _, ck := range c.hc.Jar.Cookies(c.cfg.BaseURL) {
+		if ck.Name == name {
+			return ck.Value
+		}
+	}
+	return ""
+}
+
+// csrfToken 从本会话的 jar 里取 CSRF Cookie（前端也是从 Cookie 读它再放进请求头）。
+func (c *client) csrfToken() string {
+	return c.cookie(csrfName)
+}
+
+// login 走真实登录：POST JSON + Origin。Content-Type 必须正好是 application/json（后端按等值判断）。
+// 成功的判定除了 body.code == 200，还要求响应真的下发了 HttpOnly 的 jwt_token 与 CSRF Cookie：
+// 只看 code 会把「登录接口返回成功但会话没建起来」算成成功。
+func (c *client) login() result {
+	body, _ := json.Marshal(map[string]string{"username": c.cfg.Username, "password": c.cfg.Password})
+	req, err := http.NewRequest(http.MethodPost, c.base+"/auth/login", bytes.NewReader(body))
+	if err != nil {
+		return result{outcome: outcomeTransportError, transport: "build_request"}
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", c.base)
+	return c.do(req, func(resp *http.Response) bool {
+		var jwtOK, csrfOK bool
+		for _, ck := range resp.Cookies() {
+			switch ck.Name {
+			case jwtCookieName:
+				jwtOK = ck.Value != "" && ck.HttpOnly
+			case csrfName:
+				csrfOK = ck.Value != ""
+			}
+		}
+		return jwtOK && csrfOK
+	})
+}
+
+// list 调一次只读列表接口：Cookie 由 jar 自动带上，CSRF 放请求头（双提交），不带任何 Authorization 头。
+func (c *client) list() result {
+	req, err := http.NewRequest(http.MethodPost, c.base+c.cfg.ListPath, bytes.NewReader(c.cfg.ListBody))
+	if err != nil {
+		return result{outcome: outcomeTransportError, transport: "build_request"}
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", c.base)
+	req.Header.Set(csrfName, c.csrfToken())
+	return c.do(req, nil)
+}
+
+// logout 吊销本会话。不计入延迟样本；失败计数，并让退出码非 0。
+//
+// 只看 body.code 不够：后端对「请求里根本没带令牌」的登出也回成功（只清 Cookie，无需吊销）。
+// 例如 JWT_COOKIE_SECURE=true 时用 http 压测非回环地址：jar 和浏览器一样不会把 Secure 的
+// jwt_token 发给 http 地址（回环地址例外，按安全上下文处理），登出照样「成功」，
+// 会话其实还留在 Redis 里。所以：
+//   - 登出前 jar 里必须有会发出去的 jwt_token，否则直接记为失败；
+//   - 登出后 jar 里的 jwt_token 必须已被服务端清掉（后端登出会下发过期 Cookie）。
+func (c *client) logout() bool {
+	if c.cookie(jwtCookieName) == "" {
+		return false
+	}
+	req, err := http.NewRequest(http.MethodPost, c.base+"/auth/logout", nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Origin", c.base)
+	req.Header.Set(csrfName, c.csrfToken())
+	return c.do(req, nil).outcome == outcomeSuccess && c.cookie(jwtCookieName) == ""
+}
+
+// do 发请求并分类。延迟从发出请求到读完响应体（受 -max-body 限制）为止。
+// extra 非 nil 时，在 body.code == 200 之后再做一次场景相关的成功校验。
+func (c *client) do(req *http.Request, extra func(*http.Response) bool) result {
+	start := time.Now()
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return result{outcome: outcomeTransportError, latency: time.Since(start), transport: transportKind(err)}
+	}
+	defer resp.Body.Close()
+	data, readErr := io.ReadAll(io.LimitReader(resp.Body, c.cfg.MaxBody+1))
+	res := result{latency: time.Since(start), httpStatus: resp.StatusCode}
+	switch {
+	case readErr != nil:
+		res.outcome, res.transport = outcomeTransportError, transportKind(readErr)
+	case int64(len(data)) > c.cfg.MaxBody:
+		res.outcome = outcomeInvalidResponse
+	case resp.StatusCode == http.StatusTooManyRequests:
+		res.outcome, res.retryAfter = outcomeRateLimited, resp.Header.Get("Retry-After")
+	case resp.StatusCode != http.StatusOK:
+		res.outcome = outcomeHTTPError
+	default:
+		var envelope struct {
+			Code *int `json:"code"`
+		}
+		if err := json.Unmarshal(data, &envelope); err != nil || envelope.Code == nil {
+			res.outcome = outcomeInvalidResponse
+			break
+		}
+		res.bodyCode = *envelope.Code
+		switch {
+		case res.bodyCode != http.StatusOK:
+			res.outcome = outcomeBusinessFailure
+		case extra != nil && !extra(resp):
+			res.outcome = outcomeInvalidResponse
+		default:
+			res.outcome = outcomeSuccess
+		}
+	}
+	return res
+}
+
+// transportKind 把网络错误归成几个固定类别。不输出错误原文：原文里带完整 URL，
+// 没必要进报告；类别足够判断是超时、连不上还是被对端断开。
+func transportKind(err error) string {
+	var netErr net.Error
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &netErr) && netErr.Timeout():
+		return "timeout"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "connection_refused"
+	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, io.EOF):
+		return "connection_reset"
+	default:
+		return "other"
+	}
+}
+
+// execute 跑一次压测：准备（list 场景预登录）→ 定时压测 → 收尾（登出）。
+func execute(ctx context.Context, cfg *config) (*report, error) {
+	transport := &http.Transport{
+		Proxy:               nil, // 不走环境变量里的代理：压测目标就是给定地址
+		MaxIdleConns:        cfg.Concurrency,
+		MaxIdleConnsPerHost: cfg.Concurrency,
+		IdleConnTimeout:     30 * time.Second,
+	}
+	defer transport.CloseIdleConnections()
+
+	// list 场景：每个 worker 各登录一次，拿到各自独立的会话（等价 N 个浏览器）。
+	// 顺序登录、任何一个失败就整体放弃：带着半数没登录的 worker 去压列表，
+	// 量到的只是「缺少 JWT 令牌」的速度。
+	var sessions []*client
+	setupStart := time.Now()
+	if cfg.Scenario == "list" {
+		for i := 0; i < cfg.Concurrency; i++ {
+			if ctx.Err() != nil {
+				failed := logoutAll(sessions)
+				return nil, fmt.Errorf("预登录阶段被中断（已建立的 %d 个会话登出失败 %d 个）", len(sessions), failed)
+			}
+			c := newClient(cfg, transport, newJar())
+			if res := c.login(); res.outcome != outcomeSuccess {
+				// 这次登录虽然判为失败（比如缺 CSRF Cookie），jar 里却可能已经有 jwt_token：
+				// 服务端多半已经建了会话，同样要尝试登出，不能只清之前成功的那些。
+				cleanup := sessions
+				if c.cookie(jwtCookieName) != "" {
+					cleanup = append(cleanup, c)
+				}
+				failed := logoutAll(cleanup)
+				return nil, fmt.Errorf("第 %d 个 worker 预登录失败（%s）%s；尝试登出 %d 个会话，失败 %d 个",
+					i+1, describe(res), setupHint(res), len(cleanup), failed)
+			}
+			sessions = append(sessions, c)
+		}
+	}
+	setupElapsed := time.Since(setupStart)
+
+	tallies := make([]*tally, cfg.Concurrency)
+	var (
+		wg          sync.WaitGroup
+		interrupted atomic.Bool
+	)
+	start := time.Now()
+	deadline := start.Add(cfg.Duration)
+	for i := 0; i < cfg.Concurrency; i++ {
+		t := newTally()
+		tallies[i] = t
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// 截止时间和中断只决定「还发不发下一个请求」，不取消已发出的请求：
+			// 在途请求被取消会被误记成传输错误。
+			for time.Now().Before(deadline) {
+				if ctx.Err() != nil {
+					interrupted.Store(true)
+					return
+				}
+				if cfg.Scenario == "list" {
+					t.add(sessions[i].list())
+					continue
+				}
+				// login 场景：每次都用全新的 jar（等价一个新浏览器），成功后立刻登出，
+				// 不让会话在 Redis 里堆积。登出时间不计入延迟样本，但占用 worker 时间。
+				c := newClient(cfg, transport, newJar())
+				res := c.login()
+				t.add(res)
+				// 要登出的情况：登录成功（会话已建立），或者 jar 里已经有 jwt_token（登录虽判为失败，
+				// 比如缺 HttpOnly / CSRF Cookie，服务端可能照样建了会话）。登出没成功一律计数：
+				// 例如缺 CSRF 时后端拒绝吊销，会话确实留在服务端，不能当成已清理。
+				if cfg.Logout && (res.outcome == outcomeSuccess || c.cookie(jwtCookieName) != "") && !c.logout() {
+					t.logoutFailures++
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	logoutFailures := int64(0)
+	if cfg.Scenario == "list" && cfg.Logout {
+		logoutFailures = int64(logoutAll(sessions))
+	}
+	rep := buildReport(cfg, mergeTallies(tallies), start, elapsed, setupElapsed, interrupted.Load())
+	rep.LogoutFailures += logoutFailures
+	return rep, nil
+}
+
+// logoutAll 依次登出，返回失败个数。
+func logoutAll(sessions []*client) int {
+	failed := 0
+	for _, c := range sessions {
+		if !c.logout() {
+			failed++
+		}
+	}
+	return failed
+}
+
+func describe(res result) string {
+	switch res.outcome {
+	case outcomeBusinessFailure:
+		return "业务失败 code=" + strconv.Itoa(res.bodyCode)
+	case outcomeRateLimited:
+		return "HTTP 429 被限流"
+	case outcomeHTTPError:
+		return "HTTP " + strconv.Itoa(res.httpStatus)
+	case outcomeTransportError:
+		return "传输错误 " + res.transport
+	case outcomeInvalidResponse:
+		return "响应不符合约定"
+	default:
+		return "成功"
+	}
+}
+
+func setupHint(res result) string {
+	switch res.outcome {
+	case outcomeRateLimited:
+		return "：list 场景每个 worker 都要登录一次，登录限流默认每 IP 突发 10 次、之后每 6 秒回 1 次；调小 -concurrency 或等待令牌回补（见 README）"
+	case outcomeHTTPError:
+		if res.httpStatus == http.StatusForbidden {
+			return "：来源校验失败，-base-url 须与浏览器访问后台用的地址一致"
+		}
+	case outcomeBusinessFailure:
+		return "：检查 " + envUsername + " / " + envPassword + " 与账号状态"
+	}
+	return ""
+}

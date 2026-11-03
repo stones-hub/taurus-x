@@ -52,19 +52,19 @@ var All = []Component{
 	{
 		Name:        "consul",
 		Package:     "github.com/stones-hub/taurus-pro-consul",
-		Version:     "v0.2.0",
+		Version:     "v0.3.0",
 		Description: "Consul：服务注册/注销 + 配置监听",
 	},
 	{
 		Name:        "opentelemetry",
 		Package:     "github.com/stones-hub/taurus-pro-opentelemetry",
-		Version:     "v0.1.0",
+		Version:     "v0.2.0",
 		Description: "OpenTelemetry：Tracer Provider，关闭时 flush",
 	},
 	{
 		Name:        "tcp",
 		Package:     "github.com/stones-hub/taurus-pro-tcp",
-		Version:     "v0.1.0",
+		Version:     "v0.2.0",
 		Description: "TCP 服务端：独立端口，与 HTTP 一起启动和关闭",
 	},
 	{

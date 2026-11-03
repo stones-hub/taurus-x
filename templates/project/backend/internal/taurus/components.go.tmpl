@@ -1,6 +1,7 @@
 package taurus
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -56,13 +57,16 @@ type ConfigOptions struct {
 //
 // 字段由 taurus-x 生成时选中的组件决定：未选中的可选组件不会出现在这里，
 // 也不会出现在 go.mod、config/autoload 和 docker-compose.yml 中。
+//
+// 字段顺序就是 wire 的初始化顺序，cleanup 按它的**逆序**执行：Cron 排在最后，所以最先停——
+// 定时任务可能用到这里的任何组件（DB / Redis / Consul / OTel / Milvus……），先停任务再关它们；
+// Logger 排在最前，所以最后才关，其它组件关闭期间日志一直可用。调整顺序前先想清楚关闭依赖。
 type Components struct {
 	Config *config.Config
+	Logger *logx.Manager
 	DbList map[string]*gorm.DB
 	Redis  *redisx.RedisClient
 	Http   *server.Server
-	Cron   *cron.CronManager
-	Logger *logx.Manager
 {{- if .Has.consul }}
 	Consul *consul.Client
 {{- end }}
@@ -78,6 +82,7 @@ type Components struct {
 {{- if .Has.milvus }}
 	Milvus milvus.Pool
 {{- end }}
+	Cron   *cron.CronManager
 }
 
 // envFileHint 环境变量文件不可用时统一追加的处理指引。
@@ -182,10 +187,11 @@ func ProvideDbComponent(cfg *config.Config) (map[string]*gorm.DB, func(), error)
 	}
 
 	log.Printf("%s🔗 -> Database all initialized successfully. %s\n", colorGreen, colorReset)
-	return db.DbList(), func() {
+	// sql.DB.Close 会等已经开始的查询结束，所以要限时
+	return db.DbList(), boundedCleanup("database", dbCleanupTimeout, func(context.Context) error {
 		db.CloseDB()
-		log.Printf("%s🔗 -> Clean up database components successfully. %s\n", colorGreen, colorReset)
-	}, nil
+		return nil
+	}), nil
 }
 
 // ProvideRedisComponent 注入 Redis 模块
@@ -241,10 +247,10 @@ func ProvideRedisComponent(cfg *config.Config) (*redisx.RedisClient, func(), err
 	}
 
 	log.Printf("%s🔗 -> Redis all initialized successfully. %s\n", colorGreen, colorReset)
-	return redisx.Redis, func() {
-		redisx.Redis.Close()
-		log.Printf("%s🔗 -> Clean up redis components successfully. %s\n", colorGreen, colorReset)
-	}, nil
+	client := redisx.Redis
+	return client, boundedCleanup("redis", redisCleanupTimeout, func(context.Context) error {
+		return client.Close()
+	}), nil
 }
 
 // ProvideHttpComponent 注入 HTTP 服务模块
@@ -284,10 +290,11 @@ func ProvideCronComponent(cfg *config.Config) (*cron.CronManager, func(), error)
 	cm := cron.New(cronOptions...)
 	log.Printf("%s🔗 -> Cron all initialized successfully. %s\n", colorGreen, colorReset)
 
-	return cm, func() {
-		cm.GracefulStop(time.Second * 3)
-		log.Printf("%s🔗 -> Clean up cron components successfully. %s\n", colorGreen, colorReset)
-	}, nil
+	// 停止调度并等正在执行的任务结束。GracefulStop 自带等待上限，比本步上限略短，
+	// 这样任务没跑完时记下的是它返回的超时错误（任务不会被终止，仍在运行）。
+	return cm, boundedCleanup("cron", cronCleanupTimeout, func(context.Context) error {
+		return cm.GracefulStop(cronCleanupTimeout - 100*time.Millisecond)
+	}), nil
 }
 
 // ProvideLoggerComponent 注入日志模块
@@ -324,15 +331,18 @@ func ProvideLoggerComponent(cfg *config.Config) (*logx.Manager, func(), error) {
 		log.Printf("%s🔗 -> Log all initialized successfully. %s\n", colorGreen, colorReset)
 	}
 
-	return manager, func() {
+	return manager, boundedCleanup("log", logCleanupTimeout, func(context.Context) error {
 		cleanup()
-		log.Printf("%s🔗 -> Clean up log components successfully. %s\n", colorGreen, colorReset)
-	}, err
+		return nil
+	}), err
 }
 {{- if .Has.consul }}
 
-// ProvideConsulComponent 注入 Consul 模块：建客户端并注册服务；
-// cleanup 时注销服务再关闭客户端。consul.enable=false 时返回 nil，不影响启动。
+// ProvideConsulComponent 注入 Consul 模块：建客户端并注册服务。consul.enable=false 时返回 nil，不影响启动。
+//
+// 正常退出时 app 在第一步就调用 DeregisterConsulService 注销（先摘流量，再关入口），
+// cleanup 只关闭客户端；没注销过（例如启动中途失败的回滚）才在 cleanup 里补一次注销。
+// 注销失败不影响 Close 执行。
 func ProvideConsulComponent(cfg *config.Config) (*consul.Client, func(), error) {
 	if !cfg.GetBool("consul.enable") {
 		return nil, func() {}, nil
@@ -416,21 +426,23 @@ func ProvideConsulComponent(cfg *config.Config) (*consul.Client, func(), error) 
 		return nil, func() {}, fmt.Errorf("consul.RegisterService: %v", err)
 	}
 
+	registration := &consulRegistration{client: client, id: serviceConfig.ID}
+	consulRegistered = registration
+
 	log.Printf("%s🔗 -> Consul all initialized successfully. %s\n", colorGreen, colorReset)
-	return client, func() {
-		if err := client.DeregisterService(serviceConfig.ID); err != nil {
-			log.Printf("%s🔗 -> Consul deregister service failed: %v. %s\n", colorRed, err, colorReset)
-		}
-		client.Close()
-		log.Printf("%s🔗 -> Clean up consul components successfully. %s\n", colorGreen, colorReset)
-	}, nil
+	return client, boundedCleanup("consul", consulCleanupTimeout, func(ctx context.Context) error {
+		defer client.Close()
+		return registration.deregister(ctx)
+	}), nil
 }
 {{- end }}
 {{- if .Has.opentelemetry }}
 
-// ProvideOtelComponent 注入 OpenTelemetry 模块。
-// cleanup 内部会先 flush 未上报的 span 再关闭 exporter。
-// otel.enable=false 时返回 nil，不影响启动。
+// ProvideOtelComponent 注入 OpenTelemetry 模块。otel.enable=false 时返回 nil，不影响启动。
+//
+// cleanup 显式调用 Shutdown(ctx)：先 flush 未上报的 span 再关闭 exporter，受 otelCleanupTimeout 限制，
+// 失败（collector 不可达、超时）记日志。不用组件返回的 cleanup：v0.1.0 里它用的是不限时的 ctx；
+// v0.2.0 起它自带上限（组件默认 5 秒），这里仍显式调用，让上限由 otelCleanupTimeout 决定并计入退出预算。
 func ProvideOtelComponent(cfg *config.Config) (*otelemetry.OTelProvider, func(), error) {
 	if !cfg.GetBool("otel.enable") {
 		return nil, func() {}, nil
@@ -449,7 +461,7 @@ func ProvideOtelComponent(cfg *config.Config) (*otelemetry.OTelProvider, func(),
 		return nil, func() {}, fmt.Errorf("otel.batch.export_timeout: %v", err)
 	}
 
-	provider, cleanup, err := otelemetry.NewOTelProvider(
+	provider, _, err := otelemetry.NewOTelProvider(
 		otelemetry.WithServiceName(cfg.GetString("otel.service.name")),
 		otelemetry.WithServiceVersion(cfg.GetString("otel.service.version")),
 		otelemetry.WithEnvironment(cfg.GetString("otel.service.environment")),
@@ -472,10 +484,7 @@ func ProvideOtelComponent(cfg *config.Config) (*otelemetry.OTelProvider, func(),
 	}
 
 	log.Printf("%s🔗 -> Otel all initialized successfully. %s\n", colorGreen, colorReset)
-	return provider, func() {
-		cleanup()
-		log.Printf("%s🔗 -> Clean up otel components successfully. %s\n", colorGreen, colorReset)
-	}, nil
+	return provider, boundedCleanup("otel", otelCleanupTimeout, provider.Shutdown), nil
 }
 {{- end }}
 {{- if .Has.tcp }}
@@ -483,7 +492,8 @@ func ProvideOtelComponent(cfg *config.Config) (*otelemetry.OTelProvider, func(),
 // ProvideTCPComponent 注入 TCP 服务模块。
 //
 // 这里只创建实例、不开始监听：TCP 占用独立端口，由 app/bootstrap.go 与
-// HTTP 一起启动、一起优雅关闭。tcp.enable=false 时返回 nil，bootstrap 会跳过启动。
+// HTTP 一起启动，退出时在入口阶段与 HTTP 同时关闭（ShutdownTCP）。tcp.enable=false 时返回 nil，
+// bootstrap 会跳过启动。cleanup 是兜底（重复关闭无害），同样有上限。
 func ProvideTCPComponent(cfg *config.Config) (*tcpserver.Server, func(), error) {
 	if !cfg.GetBool("tcp.enable") {
 		return nil, func() {}, nil
@@ -494,12 +504,14 @@ func ProvideTCPComponent(cfg *config.Config) (*tcpserver.Server, func(), error) 
 		return nil, func() {}, fmt.Errorf("tcp protocol: %v", err)
 	}
 
-	// GetHandler 在注册表里找不到名字时会回退到库自带的 defaultHandler（只打日志），
-	// 不会返回 nil。自定义处理器用 tcpserver.RegisterHandler(name, h) 在 init 里注册，
-	// 名字与 config/autoload/tcp/tcp.yaml 的 tcp.handler 对齐。
+	// handler 在这里（app 包 init 里的 BuildComponents）就解析好了，所以自定义处理器必须在
+	// 被 app 直接或间接导入的包（例如 app/hooks）的 init() 里用 tcpserver.RegisterHandler(name, h)
+	// 注册（Go 保证被导入的包先完成初始化），名字与 config/autoload/tcp/tcp.yaml 的 tcp.handler 对齐。
+	// app 包自己的 init、只被 main 导入的包、StartHook 都太晚。名字没注册时 GetHandler 不报错，
+	// 静默回退到库自带的 default 处理器（只打日志、不回复）。
 	handler := tcpserver.GetHandler(cfg.GetString("tcp.handler"))
 
-	srv, cleanup, err := tcpserver.NewServer(
+	srv, _, err := tcpserver.NewServer(
 		cfg.GetString("tcp.address"),
 		proto,
 		handler,
@@ -514,10 +526,9 @@ func ProvideTCPComponent(cfg *config.Config) (*tcpserver.Server, func(), error) 
 	}
 
 	log.Printf("%s🔗 -> Tcp all initialized successfully. %s\n", colorGreen, colorReset)
-	return srv, func() {
-		cleanup()
-		log.Printf("%s🔗 -> Clean up tcp components successfully. %s\n", colorGreen, colorReset)
-	}, nil
+	return srv, boundedCleanup("tcp", tcpCleanupTimeout, func(ctx context.Context) error {
+		return ShutdownTCP(ctx, srv, nil)
+	}), nil
 }
 {{- end }}
 {{- if .Has.grpc }}
@@ -525,7 +536,9 @@ func ProvideTCPComponent(cfg *config.Config) (*tcpserver.Server, func(), error) 
 // ProvideGRPCComponent 注入 gRPC 服务模块。
 //
 // 这里只创建实例、不开始监听：gRPC 占用独立端口，由 app/bootstrap.go 与
-// HTTP 一起启动、一起优雅关闭。grpc.enable=false 时返回 nil，bootstrap 会跳过启动。
+// HTTP 一起启动，退出时在入口阶段与 HTTP 同时关闭（ShutdownGRPC / ForceStopGRPC）。
+// grpc.enable=false 时返回 nil，bootstrap 会跳过启动。cleanup 是兜底：不用组件自带的
+// 不限时 GracefulStop，而是优雅关闭一半上限、到期强制关闭。
 func ProvideGRPCComponent(cfg *config.Config) (*grpcserver.Server, func(), error) {
 	if !cfg.GetBool("grpc.enable") {
 		return nil, func() {}, nil
@@ -571,16 +584,21 @@ func ProvideGRPCComponent(cfg *config.Config) (*grpcserver.Server, func(), error
 		}))
 	}
 
-	srv, cleanup, err := grpcserver.NewServer(options...)
+	srv, _, err := grpcserver.NewServer(options...)
 	if err != nil {
 		return nil, func() {}, err
 	}
 
 	log.Printf("%s🔗 -> Grpc all initialized successfully. %s\n", colorGreen, colorReset)
-	return srv, func() {
-		cleanup()
-		log.Printf("%s🔗 -> Clean up grpc components successfully. %s\n", colorGreen, colorReset)
-	}, nil
+	return srv, boundedCleanup("grpc", grpcCleanupTimeout, func(ctx context.Context) error {
+		graceful, cancel := context.WithTimeout(ctx, grpcCleanupTimeout/2)
+		defer cancel()
+		if err := ShutdownGRPC(graceful, srv); err != nil {
+			_ = ForceStopGRPC(srv)
+			return fmt.Errorf("优雅关闭未完成，已强制关闭: %w", err)
+		}
+		return nil
+	}), nil
 }
 {{- end }}
 {{- if .Has.milvus }}
@@ -664,9 +682,8 @@ func ProvideMilvusComponent(cfg *config.Config) (milvus.Pool, func(), error) {
 	}
 
 	log.Printf("%s🔗 -> Milvus all initialized successfully. %s\n", colorGreen, colorReset)
-	return pool, func() {
-		pool.Close()
-		log.Printf("%s🔗 -> Clean up milvus components successfully. %s\n", colorGreen, colorReset)
-	}, nil
+	return pool, boundedCleanup("milvus", milvusCleanupTimeout, func(context.Context) error {
+		return pool.Close()
+	}), nil
 }
 {{- end }}

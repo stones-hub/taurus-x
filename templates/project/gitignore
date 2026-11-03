@@ -20,3 +20,7 @@ backend/build/
 
 # 日志
 logs/
+
+# 运维产物：数据库备份（含业务数据，不进版本库）、SBOM 等生成物
+backups/
+artifacts/

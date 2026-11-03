@@ -1,0 +1,252 @@
+// 压测工具：对登录接口和后台列表接口做有限时长、有限并发的压测，输出请求数、
+// 各类失败、QPS 与 P50/P95/P99。用法与报告字段说明见同目录 README.md。
+//
+// 刻意做小：不是负载平台，没有分布式、没有爬坡曲线，只回答「这台机器、这份配置、
+// 这个并发下，登录 / 列表大概能跑多快、哪里开始出错」。
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"net/url"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+)
+
+// 退出码。
+const (
+	exitOK = 0
+	// exitFailed 跑完了，但错误率超过 -max-error-rate、没有完成任何请求、有会话没能登出，或被中断。
+	exitFailed = 1
+	// exitUsage 参数或环境变量不合法，没有发出任何请求。
+	exitUsage = 2
+	// exitSetup 准备阶段失败（list 场景的预登录没成功或被中断），没有进入压测。
+	exitSetup = 3
+)
+
+// 参数上限：防止手误把一次本机压测变成长时间、高并发的洪水。
+const (
+	maxDuration    = 10 * time.Minute
+	maxConcurrency = 64
+	maxTimeout     = 60 * time.Second
+	minBodyLimit   = 1 << 10
+	maxBodyLimit   = 8 << 20
+	maxPageSize    = 200
+)
+
+// 凭据只从环境变量读取：命令行参数会出现在 ps 输出和 shell 历史里。
+const (
+	envUsername = "LOADTEST_USERNAME"
+	envPassword = "LOADTEST_PASSWORD"
+)
+
+// listEndpoint 一个允许压测的只读列表接口，及其「不过滤」时的查询条件。
+type listEndpoint struct {
+	Path   string
+	Filter map[string]any
+}
+
+// listEndpoints 用白名单而不是任意路径：/admin/** 下同样是 POST 的还有新增、删除、改状态，
+// 一个拼错的路径就可能变成批量写操作。
+//
+// Filter 与前端列表页首次加载时发的条件一致（见 frontend/src/views/*/index.vue、views/log/*.vue）：
+// 状态类字段用 -1（QUERY_ALL）表示不过滤。漏掉它会按 0 处理，变成「只查禁用的」，
+// 量到的是一个几乎为空的查询，而不是用户打开页面时的那条。
+var listEndpoints = []listEndpoint{
+	{Path: "/admin/user/list", Filter: map[string]any{"username_mobile_email": "", "status": -1}},
+	{Path: "/admin/role/list", Filter: map[string]any{"role_name": "", "status": -1}},
+	{Path: "/admin/permission/list", Filter: map[string]any{"permission_name": "", "status": -1, "permission_type": -1}},
+	{Path: "/admin/dept/list", Filter: map[string]any{"dept_name": "", "status": -1}},
+	{Path: "/admin/login-log/list", Filter: map[string]any{"login_status": -1}},
+	{Path: "/admin/log/access/list", Filter: map[string]any{"method": "", "path": "", "ip": "", "status_code": 0}},
+	{Path: "/admin/log/operation/list", Filter: map[string]any{"method": "", "path": "", "action": "", "resource": ""}},
+}
+
+// listBody 列表请求体：该接口的「不过滤」条件 + 第 1 页、page_size 条。
+func listBody(path string, pageSize int) ([]byte, bool) {
+	for _, ep := range listEndpoints {
+		if ep.Path != path {
+			continue
+		}
+		body := map[string]any{"page_no": 1, "page_size": pageSize}
+		for k, v := range ep.Filter {
+			body[k] = v
+		}
+		data, err := json.Marshal(body)
+		return data, err == nil
+	}
+	return nil, false
+}
+
+type config struct {
+	Scenario     string
+	BaseURL      *url.URL
+	Duration     time.Duration
+	Concurrency  int
+	Timeout      time.Duration
+	MaxBody      int64
+	ListPath     string
+	PageSize     int
+	ListBody     []byte
+	MaxErrorRate float64
+	Logout       bool
+	JSONOut      string
+	Username     string
+	Password     string
+}
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	// 第一次 Ctrl+C：停止发起新请求，等在途请求结束后照常输出报告。
+	// 收到后立即恢复默认信号处理：再按一次 Ctrl+C 直接结束进程，不用等最长 -timeout 的在途请求。
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
+	os.Exit(run(ctx, os.Args[1:], os.Getenv, os.Stdout, os.Stderr))
+}
+
+// run 是可测试的入口：参数、环境变量、输出都由调用方给定。
+// ctx 取消（Ctrl+C）只让 worker 停止发起新请求，已发出的请求照常等到响应或超时。
+func run(ctx context.Context, args []string, getenv func(string) string, stdout, stderr io.Writer) int {
+	cfg, err := parseConfig(args, getenv, stderr)
+	if err != nil {
+		if !errors.Is(err, flag.ErrHelp) {
+			fmt.Fprintf(stderr, "参数错误: %v\n", err)
+		}
+		return exitUsage
+	}
+
+	rep, err := execute(ctx, cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "准备阶段失败，未开始压测: %v\n", err)
+		return exitSetup
+	}
+	rep.writeText(stdout)
+	if cfg.JSONOut != "" {
+		if err := rep.writeJSONFile(cfg.JSONOut); err != nil {
+			fmt.Fprintf(stderr, "写 JSON 报告失败: %v\n", err)
+			return exitFailed
+		}
+	}
+	return rep.exitCode(cfg.MaxErrorRate)
+}
+
+func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (*config, error) {
+	fs := flag.NewFlagSet("loadtest", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var (
+		cfg         config
+		baseURL     string
+		maxBody     int64
+		allowRemote bool
+	)
+	fs.StringVar(&cfg.Scenario, "scenario", "", "压测场景：login 或 list（必填）")
+	fs.StringVar(&baseURL, "base-url", "http://127.0.0.1:9080", "后端地址（scheme://host:port，不带路径）")
+	fs.BoolVar(&allowRemote, "allow-non-loopback", false, "允许压测非本机回环地址（只对你有权压测的测试环境使用）")
+	fs.DurationVar(&cfg.Duration, "duration", 10*time.Second, "压测时长（上限 10m）")
+	fs.IntVar(&cfg.Concurrency, "concurrency", 4, "并发 worker 数（上限 64）")
+	fs.DurationVar(&cfg.Timeout, "timeout", 5*time.Second, "单个请求超时（含读响应体，上限 60s）")
+	fs.Int64Var(&maxBody, "max-body", 1<<20, "单个响应体上限（字节，1KiB~8MiB），超出记为响应异常")
+	fs.StringVar(&cfg.ListPath, "list-path", "/admin/user/list", "list 场景的接口（只允许内置的只读列表接口）")
+	fs.IntVar(&cfg.PageSize, "page-size", 15, "list 场景的 page_size（1~200）")
+	fs.Float64Var(&cfg.MaxErrorRate, "max-error-rate", 0, "允许的错误率（0~1），超过则退出码为 1；429 计入错误")
+	fs.BoolVar(&cfg.Logout, "logout", true, "登录成功后调用 /auth/logout 吊销会话（关掉会在 Redis 里留下大量未过期会话）")
+	fs.StringVar(&cfg.JSONOut, "json", "", "另存一份 JSON 报告到该路径（权限 0600，先写临时文件再原子替换）")
+	fs.Usage = func() {
+		fmt.Fprintf(stderr, "用法: %s=... %s=... go run . -scenario login|list [参数]\n", envUsername, envPassword)
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
+	if fs.NArg() != 0 {
+		return nil, fmt.Errorf("不接受位置参数: %q", fs.Args())
+	}
+
+	switch cfg.Scenario {
+	case "login", "list":
+	default:
+		return nil, fmt.Errorf("-scenario 必须是 login 或 list")
+	}
+	u, err := parseBaseURL(baseURL, allowRemote)
+	if err != nil {
+		return nil, err
+	}
+	cfg.BaseURL = u
+	if cfg.Duration <= 0 || cfg.Duration > maxDuration {
+		return nil, fmt.Errorf("-duration 必须在 (0, %s] 内", maxDuration)
+	}
+	if cfg.Concurrency < 1 || cfg.Concurrency > maxConcurrency {
+		return nil, fmt.Errorf("-concurrency 必须在 [1, %d] 内", maxConcurrency)
+	}
+	if cfg.Timeout <= 0 || cfg.Timeout > maxTimeout {
+		return nil, fmt.Errorf("-timeout 必须在 (0, %s] 内", maxTimeout)
+	}
+	if maxBody < minBodyLimit || maxBody > maxBodyLimit {
+		return nil, fmt.Errorf("-max-body 必须在 [%d, %d] 字节内", minBodyLimit, maxBodyLimit)
+	}
+	cfg.MaxBody = maxBody
+	if cfg.PageSize < 1 || cfg.PageSize > maxPageSize {
+		return nil, fmt.Errorf("-page-size 必须在 [1, %d] 内", maxPageSize)
+	}
+	body, ok := listBody(cfg.ListPath, cfg.PageSize)
+	if !ok {
+		paths := make([]string, 0, len(listEndpoints))
+		for _, ep := range listEndpoints {
+			paths = append(paths, ep.Path)
+		}
+		return nil, fmt.Errorf("-list-path 只允许: %s", strings.Join(paths, ", "))
+	}
+	cfg.ListBody = body
+	if cfg.MaxErrorRate < 0 || cfg.MaxErrorRate > 1 {
+		return nil, fmt.Errorf("-max-error-rate 必须在 [0, 1] 内")
+	}
+
+	cfg.Username = getenv(envUsername)
+	cfg.Password = getenv(envPassword)
+	if cfg.Username == "" || cfg.Password == "" {
+		return nil, fmt.Errorf("必须通过环境变量 %s / %s 提供测试账号（不接受命令行传入）", envUsername, envPassword)
+	}
+	return &cfg, nil
+}
+
+// parseBaseURL 只接受 scheme://host[:port]。默认只允许回环地址：
+// 压测会产生大量登录日志、访问日志和会话写入，打错地址的代价由别人承担。
+func parseBaseURL(raw string, allowRemote bool) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("-base-url 无法解析")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("-base-url 只支持 http / https")
+	}
+	if u.User != nil {
+		return nil, fmt.Errorf("-base-url 不能带用户名或密码")
+	}
+	if u.Host == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("-base-url 只能是 scheme://host:port，不带路径、查询串")
+	}
+	if !allowRemote && !isLoopback(u.Hostname()) {
+		return nil, fmt.Errorf("-base-url 不是本机回环地址；确认是你有权压测的测试环境后再加 -allow-non-loopback")
+	}
+	return &url.URL{Scheme: u.Scheme, Host: u.Host}, nil
+}
+
+// isLoopback 只认字面量：localhost 与回环 IP。不做 DNS 解析，避免「解析到哪算哪」。
+func isLoopback(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}

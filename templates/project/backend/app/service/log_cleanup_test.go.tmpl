@@ -14,6 +14,7 @@ package service
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -130,7 +131,7 @@ func TestLogCleaner_DisabledDoesNothing(t *testing.T) {
 			t.Errorf("保留天数 %d 时不该启用清理", days)
 		}
 		if stop := cleaner.Start(); stop != nil {
-			stop()
+			_ = stop(context.Background())
 			t.Errorf("保留天数 %d 时 Start 不该启动后台任务", days)
 		}
 		// 不 panic 即说明没有碰数据库
@@ -140,9 +141,8 @@ func TestLogCleaner_DisabledDoesNothing(t *testing.T) {
 
 // TestLogCleaner_StartStopDoesNotLeak 启动再停止必须干净退出。
 //
-// Start 返回的停止函数会等 goroutine 真的退出才返回，所以这个测试本身
-// 就是在验证「进程退出时不会泄漏 goroutine」—— 如果 goroutine 不响应取消，
-// 这里会卡死直到测试超时。
+// 停止函数在 goroutine 真的退出后才返回 nil，所以这个测试本身就是在验证
+// 「进程退出时不会泄漏 goroutine」—— 如果 goroutine 不响应取消，这里会返回超时错误。
 func TestLogCleaner_StartStopDoesNotLeak(t *testing.T) {
 	cleaner := NewLogCleaner(nil, 180)
 	stop := cleaner.Start()
@@ -150,15 +150,58 @@ func TestLogCleaner_StartStopDoesNotLeak(t *testing.T) {
 		t.Fatal("启用时 Start 应返回停止函数")
 	}
 
-	done := make(chan struct{})
-	go func() {
-		stop()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("停止函数没有在 5 秒内返回：后台 goroutine 不响应取消，进程退出时会泄漏")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := stop(ctx); err != nil {
+		t.Fatalf("停止函数没有在 5 秒内确认退出：后台 goroutine 不响应取消，进程退出时会泄漏: %v", err)
+	}
+	// 重复调用：已经退出，即使 ctx 已经取消也返回 nil
+	cancel()
+	if err := stop(ctx); err != nil {
+		t.Fatalf("重复停止应直接返回 nil，实际 %v", err)
+	}
+}
+
+// TestLogCleaner_StopIsBoundedWhenRoundIgnoresCancel 一轮清理卡住且不响应取消时，
+// 停止函数在调用方给的期限到期时返回错误，不会把退出卡住；预先取消的 ctx 立即返回。
+func TestLogCleaner_StopIsBoundedWhenRoundIgnoresCancel(t *testing.T) {
+	cleaner := NewLogCleaner(nil, 180)
+	cleaner.firstDelay = func() time.Duration { return 0 }
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var gotCancel atomic.Bool
+	cleaner.runOnce = func(ctx context.Context) {
+		close(entered)
+		<-release // 不看 ctx
+		gotCancel.Store(ctx.Err() != nil)
+	}
+	stop := cleaner.Start()
+	<-entered
+
+	pre, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	if err := stop(pre); !errors.Is(err, context.Canceled) {
+		t.Fatalf("预先取消的 ctx 应立即返回 context.Canceled，实际 %v", err)
+	}
+	ctx, cancel2 := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel2()
+	if err := stop(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("卡住的清理应让停止函数在期限到时返回超时，实际 %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("停止函数等了 %v，没有遵守期限", elapsed)
+	}
+
+	// 放行后它看到的是已取消的 ctx，随后退出；再停一次确认已经干净退出
+	close(release)
+	wait, cancel3 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel3()
+	if err := stop(wait); err != nil {
+		t.Fatalf("放行后应能确认退出: %v", err)
+	}
+	if !gotCancel.Load() {
+		t.Fatal("第一次停止就应取消后台任务的 ctx")
 	}
 }
 

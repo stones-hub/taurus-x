@@ -1,0 +1,307 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// tally 单个 worker 的计数，worker 之间不共享，结束后再合并（不加锁）。
+type tally struct {
+	counts         [numOutcomes]int64
+	successLatency []time.Duration
+	bodyCodes      map[int]int64
+	httpStatuses   map[int]int64
+	transportKinds map[string]int64
+	retryAfter     map[string]int64
+	logoutFailures int64
+}
+
+func newTally() *tally {
+	return &tally{
+		bodyCodes:      map[int]int64{},
+		httpStatuses:   map[int]int64{},
+		transportKinds: map[string]int64{},
+		retryAfter:     map[string]int64{},
+	}
+}
+
+func (t *tally) add(r result) {
+	t.counts[r.outcome]++
+	switch r.outcome {
+	case outcomeSuccess:
+		t.successLatency = append(t.successLatency, r.latency)
+	case outcomeBusinessFailure:
+		t.bodyCodes[r.bodyCode]++
+	case outcomeRateLimited:
+		t.retryAfter[r.retryAfter]++
+	case outcomeHTTPError:
+		t.httpStatuses[r.httpStatus]++
+	case outcomeTransportError:
+		t.transportKinds[r.transport]++
+	}
+}
+
+func mergeTallies(list []*tally) *tally {
+	all := newTally()
+	for _, t := range list {
+		for i, n := range t.counts {
+			all.counts[i] += n
+		}
+		all.successLatency = append(all.successLatency, t.successLatency...)
+		for k, n := range t.bodyCodes {
+			all.bodyCodes[k] += n
+		}
+		for k, n := range t.httpStatuses {
+			all.httpStatuses[k] += n
+		}
+		for k, n := range t.transportKinds {
+			all.transportKinds[k] += n
+		}
+		for k, n := range t.retryAfter {
+			all.retryAfter[k] += n
+		}
+		all.logoutFailures += t.logoutFailures
+	}
+	return all
+}
+
+// latencySummary 成功请求的延迟分布（毫秒）。
+type latencySummary struct {
+	Samples int     `json:"samples"`
+	MinMs   float64 `json:"min_ms"`
+	P50Ms   float64 `json:"p50_ms"`
+	P95Ms   float64 `json:"p95_ms"`
+	P99Ms   float64 `json:"p99_ms"`
+	MaxMs   float64 `json:"max_ms"`
+}
+
+// report 压测报告。只含计数、耗时和配置，不含账号、密码、Cookie、令牌或响应体。
+type report struct {
+	Scenario          string           `json:"scenario"`
+	Target            string           `json:"target"`
+	Concurrency       int              `json:"concurrency"`
+	DurationSetting   string           `json:"duration_setting"`
+	Timeout           string           `json:"timeout"`
+	MaxBodyBytes      int64            `json:"max_body_bytes"`
+	StartedAt         time.Time        `json:"started_at"`
+	ElapsedSeconds    float64          `json:"elapsed_seconds"`
+	SetupSeconds      float64          `json:"setup_seconds"`
+	Interrupted       bool             `json:"interrupted"`
+	Total             int64            `json:"total"`
+	Success           int64            `json:"success"`
+	BusinessFailure   int64            `json:"business_failure"`
+	RateLimited       int64            `json:"rate_limited_429"`
+	HTTPError         int64            `json:"http_error"`
+	TransportError    int64            `json:"transport_error"`
+	InvalidResponse   int64            `json:"invalid_response"`
+	ErrorRate         *float64         `json:"error_rate"` // 无请求时为 null，不输出 NaN
+	QPS               float64          `json:"qps"`
+	SuccessQPS        float64          `json:"success_qps"`
+	Latency           *latencySummary  `json:"success_latency"` // 无成功样本时为 null
+	BusinessCodes     map[string]int64 `json:"business_codes,omitempty"`
+	HTTPStatuses      map[string]int64 `json:"http_statuses,omitempty"`
+	TransportKinds    map[string]int64 `json:"transport_kinds,omitempty"`
+	RetryAfter        map[string]int64 `json:"retry_after,omitempty"`
+	LogoutFailures    int64            `json:"logout_failures"`
+	PercentileMethod  string           `json:"percentile_method"`
+	ThroughputFormula string           `json:"throughput_formula"`
+}
+
+const (
+	percentileMethod  = "nearest-rank：样本升序排列，Pk 取第 ceil(k/100×N) 个（1 起算）；只统计成功请求"
+	throughputFormula = "QPS = 完成的请求数 / 实际测量时长（从压测开始到最后一个在途请求结束，不含准备阶段）"
+)
+
+func buildReport(cfg *config, t *tally, start time.Time, elapsed, setup time.Duration, interrupted bool) *report {
+	path := "/auth/login"
+	if cfg.Scenario == "list" {
+		path = cfg.ListPath
+	}
+	r := &report{
+		Scenario:          cfg.Scenario,
+		Target:            cfg.BaseURL.String() + path,
+		Concurrency:       cfg.Concurrency,
+		DurationSetting:   cfg.Duration.String(),
+		Timeout:           cfg.Timeout.String(),
+		MaxBodyBytes:      cfg.MaxBody,
+		StartedAt:         start,
+		ElapsedSeconds:    elapsed.Seconds(),
+		SetupSeconds:      setup.Seconds(),
+		Interrupted:       interrupted,
+		Success:           t.counts[outcomeSuccess],
+		BusinessFailure:   t.counts[outcomeBusinessFailure],
+		RateLimited:       t.counts[outcomeRateLimited],
+		HTTPError:         t.counts[outcomeHTTPError],
+		TransportError:    t.counts[outcomeTransportError],
+		InvalidResponse:   t.counts[outcomeInvalidResponse],
+		BusinessCodes:     intKeys(t.bodyCodes),
+		HTTPStatuses:      intKeys(t.httpStatuses),
+		TransportKinds:    t.transportKinds,
+		RetryAfter:        t.retryAfter,
+		LogoutFailures:    t.logoutFailures,
+		PercentileMethod:  percentileMethod,
+		ThroughputFormula: throughputFormula,
+	}
+	for _, n := range t.counts {
+		r.Total += n
+	}
+	if r.Total > 0 {
+		rate := float64(r.Total-r.Success) / float64(r.Total)
+		r.ErrorRate = &rate
+	}
+	if elapsed > 0 {
+		r.QPS = float64(r.Total) / elapsed.Seconds()
+		r.SuccessQPS = float64(r.Success) / elapsed.Seconds()
+	}
+	r.Latency = summarize(t.successLatency)
+	return r
+}
+
+// summarize 计算延迟分位。空样本返回 nil，由调用方显示「无成功样本」，不产出 0 或 NaN。
+func summarize(samples []time.Duration) *latencySummary {
+	if len(samples) == 0 {
+		return nil
+	}
+	sorted := append([]time.Duration(nil), samples...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	return &latencySummary{
+		Samples: len(sorted),
+		MinMs:   ms(sorted[0]),
+		P50Ms:   ms(percentile(sorted, 50)),
+		P95Ms:   ms(percentile(sorted, 95)),
+		P99Ms:   ms(percentile(sorted, 99)),
+		MaxMs:   ms(sorted[len(sorted)-1]),
+	}
+}
+
+// percentile nearest-rank 分位：rank = ceil(p×n/100)，用整数运算避免浮点误差
+// （0.95×100 这类乘法在浮点下可能得到 95.00000000000001，向上取整就错一位）。
+// 前置条件：sorted 已升序且非空，p 在 [1, 100]。
+func percentile(sorted []time.Duration, p int) time.Duration {
+	n := len(sorted)
+	rank := (p*n + 99) / 100
+	if rank < 1 {
+		rank = 1
+	}
+	if rank > n {
+		rank = n
+	}
+	return sorted[rank-1]
+}
+
+func ms(d time.Duration) float64 {
+	return float64(d.Microseconds()) / 1000
+}
+
+func intKeys(m map[int]int64) map[string]int64 {
+	out := make(map[string]int64, len(m))
+	for k, n := range m {
+		out[strconv.Itoa(k)] = n
+	}
+	return out
+}
+
+// exitCode 0 = 跑完、错误率不超过阈值、会话全部登出；其余情况都不算通过。
+// 登出失败意味着有会话留在服务端，压测本身没有收好尾，不能报成功。
+func (r *report) exitCode(maxErrorRate float64) int {
+	if r.Interrupted || r.Total == 0 || r.ErrorRate == nil || *r.ErrorRate > maxErrorRate || r.LogoutFailures > 0 {
+		return exitFailed
+	}
+	return exitOK
+}
+
+func (r *report) writeText(w io.Writer) {
+	fmt.Fprintf(w, "压测报告  scenario=%s\n", r.Scenario)
+	fmt.Fprintf(w, "目标          %s\n", r.Target)
+	fmt.Fprintf(w, "开始时间      %s\n", r.StartedAt.Format(time.RFC3339))
+	fmt.Fprintf(w, "并发 / 时长   %d / %s（实际测量 %.3fs，准备阶段 %.3fs 不计入）\n",
+		r.Concurrency, r.DurationSetting, r.ElapsedSeconds, r.SetupSeconds)
+	fmt.Fprintf(w, "超时 / 响应上限  %s / %d 字节\n", r.Timeout, r.MaxBodyBytes)
+	if r.Interrupted {
+		fmt.Fprintln(w, "状态          被中断（未跑满设定时长，结果不完整）")
+	}
+	fmt.Fprintf(w, "请求总数      %d\n", r.Total)
+	fmt.Fprintf(w, "  成功          %d\n", r.Success)
+	fmt.Fprintf(w, "  业务失败      %d%s\n", r.BusinessFailure, breakdown("body.code", r.BusinessCodes))
+	fmt.Fprintf(w, "  限流 429      %d%s\n", r.RateLimited, breakdown("Retry-After", r.RetryAfter))
+	fmt.Fprintf(w, "  HTTP 错误     %d%s\n", r.HTTPError, breakdown("status", r.HTTPStatuses))
+	fmt.Fprintf(w, "  传输错误      %d%s\n", r.TransportError, breakdown("kind", r.TransportKinds))
+	fmt.Fprintf(w, "  响应异常      %d\n", r.InvalidResponse)
+	if r.ErrorRate == nil {
+		fmt.Fprintln(w, "错误率        无请求，无法计算")
+	} else {
+		fmt.Fprintf(w, "错误率        %.2f%%（非成功 / 总数，429 计入）\n", *r.ErrorRate*100)
+	}
+	fmt.Fprintf(w, "QPS           %.2f（成功 %.2f）\n", r.QPS, r.SuccessQPS)
+	if r.Latency == nil {
+		fmt.Fprintln(w, "成功延迟      无成功样本，不计算分位")
+	} else {
+		l := r.Latency
+		fmt.Fprintf(w, "成功延迟 ms   P50 %.3f  P95 %.3f  P99 %.3f  min %.3f  max %.3f（样本 %d）\n",
+			l.P50Ms, l.P95Ms, l.P99Ms, l.MinMs, l.MaxMs, l.Samples)
+	}
+	fmt.Fprintf(w, "登出失败      %d\n", r.LogoutFailures)
+	if r.LogoutFailures > 0 {
+		fmt.Fprintln(w, "注意          有会话没能登出（留在 Redis 里直到过期），退出码为 1；常见原因：JWT_COOKIE_SECURE=true 时用 http 压测非回环地址")
+	}
+	fmt.Fprintf(w, "分位算法      %s\n", r.PercentileMethod)
+	fmt.Fprintf(w, "吞吐口径      %s\n", r.ThroughputFormula)
+	if r.RateLimited > 0 {
+		fmt.Fprintln(w, "注意          出现 429：量到的是限流器而不是服务容量，见 README「限流与结果解读」")
+	}
+}
+
+// breakdown 把细分计数按 key 排序输出，如「（body.code 401×3）」。
+func breakdown(label string, m map[string]int64) string {
+	if len(m) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if k == "" {
+			parts = append(parts, fmt.Sprintf("(空)×%d", m[k]))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s×%d", k, m[k]))
+	}
+	return "（" + label + " " + strings.Join(parts, " ") + "）"
+}
+
+// writeJSONFile 报告里有内网地址，文件只给当前用户读写（0600）。
+// 先在同目录写临时文件，再 rename 到目标路径：写到一半失败不会留下半份报告；
+// 目标路径若是符号链接，rename 替换的是链接本身，不会顺着链接改写别的文件。
+func (r *report) writeJSONFile(path string) error {
+	data, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".loadtest-report-*.json")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) // rename 成功后这里删的是不存在的文件，无副作用
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(append(data, '\n')); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
+}
