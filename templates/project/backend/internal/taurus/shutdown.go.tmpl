@@ -163,7 +163,7 @@ type serviceDeregisterer interface {
 	DeregisterService(serviceID string) error
 }
 
-// contextDeregisterer taurus-pro-consul v0.3.0（生成项目默认依赖的版本）增加的可取消注销：
+// contextDeregisterer taurus-pro-consul 自 v0.3.0 起提供的可取消注销（生成项目当前依赖 v0.3.1，同样具备）：
 // ctx 到期时底层 HTTP 请求随之中止。用类型断言探测，降级到旧版本照常编译、回落到限时等待。
 type contextDeregisterer interface {
 	DeregisterServiceContext(ctx context.Context, serviceID string) error

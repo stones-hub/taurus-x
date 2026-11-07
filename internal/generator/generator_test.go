@@ -107,6 +107,9 @@ func TestGenerate_Combinations(t *testing.T) {
 			assertCookieOnlyAuthAndLogQueue(t, outDir)
 			assertShutdownOrchestration(t, outDir, result.Components)
 			assertOpsTooling(t, outDir)
+			assertCredentialNormalization(t, outDir, result.Components)
+			assertMilvusFailFast(t, outDir, result.Components)
+			assertComposeOptionalServices(t, outDir, result.Components)
 
 			backend := filepath.Join(outDir, "backend")
 			runGo(t, backend, "build", "./...")

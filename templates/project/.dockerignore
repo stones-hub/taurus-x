@@ -22,3 +22,16 @@ scripts/sql
 # 其它
 *.md
 .DS_Store
+
+# 运行秘密不进构建上下文（Docker 的规则只按路径从上下文根匹配，所以都带 **/ 覆盖各层目录）
+# 各层 .env 系列：根目录 compose 的 .env、backend/.env、backend/.env.example（只是示例，镜像不用）等
+**/.env*
+# 各层本机私有覆盖：.env.local、.env.production.local 等
+**/*.local
+# 账号 / 浏览器登录凭据文件
+**/*account*.txt
+**/browser-credentials.json
+# 例外：前端生产构建（Vite）要读的两份可进版本库的非敏感配置，只逐个放行这两个文件，
+# 不放行 frontend/.env*；本机覆盖（.env.local、.env.production.local）仍按上面的规则排除
+!frontend/.env
+!frontend/.env.production

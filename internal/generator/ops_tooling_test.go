@@ -223,7 +223,7 @@ func assertOpsTooling(t *testing.T, outDir string) {
 		}
 	}
 	manual := readFile(t, filepath.Join(outDir, "docs", "运维手册.md"))
-	for _, want := range []string{"GO-2026-5932", "Fixed in: N/A", "不等于没有漏洞", "Symbol Results", "--single-transaction",
+	for _, want := range []string{"GO-2026-5932", "不等于没有漏洞", "Symbol Results", "--single-transaction",
 		"备份期间不要做 DDL", "非事务表", "目标库非空一律拒绝", "人工删测试库", "登录验证", "不支持 `docker exec`",
 		"cyclonedx-npm", "MYSQL_OPS_PASSWORD",
 		// P2：恢复的信任边界与客户端命令
@@ -235,9 +235,25 @@ func assertOpsTooling(t *testing.T, outDir string) {
 		"protocol=TCP", "server_uuid", "证明不了", "`~/.mylogin.cnf` 会覆盖 `--defaults-file`", "MYSQL_TEST_LOGIN_FILE",
 		"--local-infile=0", "不会停下来等你确认", "只在脚本新建时", "kill -- -<PGID>", "没有在真库上确认过",
 		// SBOM / vuln
-		"scripts/sbomcheck", "npm_config_ignore_scripts=true", "传递依赖", "exit status 3", "make 立即停止"} {
+		"scripts/sbomcheck", "npm_config_ignore_scripts=true", "传递依赖", "exit status 3", "make 立即停止",
+		// govulncheck 结果层级与退出码：JSON 输出有 finding 也返回 0
+		"trace 只有 `module` / `version`", "trace 里有 `package`、没有 `function`", "Package / Module 层**不是零风险证明**",
+		"**exit 0 不等于没有 finding**",
+		// GO-2026-5932：历史离线扫描记录，不是当前结论；有修复元数据但不能盲升伪版本
+		"**历史记录**，不是当前结论", "之后没有联网重扫或复核", "漏洞库、公告和依赖版本都会变化",
+		`"fixed_version": "v0.58.1-0.20261009181718-2f1f834330b2"`, `{ "module": "golang.org/x/crypto", "version": "v0.58.0" }`,
+		"**不是 bcrypt 的漏洞**", "Module 层不等于零风险，也不等于永远不可达", "**伪版本**",
+		"**有修复元数据不等于已有\n  可以直接升级的、受支持的正式版本。**", "**不要盲目把 `go.mod` 改成伪版本**",
+		"https://pkg.go.dev/vuln/GO-2026-5932", "go list -m -versions golang.org/x/crypto", "与项目其它依赖兼容的版本"} {
 		if !strings.Contains(manual, want) {
 			t.Errorf("docs/运维手册.md 应说明 %q", want)
+		}
+	}
+	// GO-2026-5932 旧文案：「没有修复版本 / 无法升级 / 不需要处理 / 保持不可达」及未复核的示例输出都已过时。
+	for _, bad := range []string{"Fixed in: N/A", "没有修复版本", "无法通过升级", "不需要处理", "保持不可达", "待独立复核",
+		"实现时用 govulncheck", "This scan also found 0 vulnerabilities in packages you import and 1"} {
+		if strings.Contains(manual, bad) {
+			t.Errorf("docs/运维手册.md 不应再有 GO-2026-5932 的过时说法 %q", bad)
 		}
 	}
 	// 事先核对身份的命令：一行、显式 TCP / 主机 / 端口 / 账号 / -p、不读 login 文件。

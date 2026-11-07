@@ -1,0 +1,72 @@
+package taurus
+{{- if and .Has.consul .Has.milvus }}
+
+import (
+	"strings"
+	"testing"
+)
+
+// TestBuildComponents_MilvusFailureRollsBackConsul 经 wire 生成的 buildComponents 走完整启动：
+// Consul 已经注册（排在 Milvus 之前初始化），Milvus 握手失败后启动失败，wire 的回滚
+// 按逆序执行到 Consul 的 cleanup，真实发出注销请求。同时确认真实 consul.yaml 下
+// Basic Auth 凭据原样到达、空白 token 不发出。
+func TestBuildComponents_MilvusFailureRollsBackConsul(t *testing.T) {
+	const user, pass, milvusSecret = " ops ", "  c0n sul  ", "M1lvus-S3cret"
+	consulFake := newFakeConsul(t)
+	denied := startFakeMilvus(t, true)
+
+	clearEnv(t, milvusEnvKeys...)
+	clearEnv(t, "CONSUL_ENABLE", "CONSUL_ADDRESS", "CONSUL_TOKEN", "CONSUL_USERNAME", "CONSUL_PASSWORD",
+		"CONSUL_SCHEME", "CONSUL_DATACENTER", "CONSUL_SERVICE_ID", "CONSUL_SERVICE_ADDRESS", "SERVER_PORT")
+	t.Setenv("CONSUL_ENABLE", "true")
+	t.Setenv("CONSUL_ADDRESS", consulFake.addr())
+	t.Setenv("CONSUL_USERNAME", user)
+	t.Setenv("CONSUL_PASSWORD", pass)
+	t.Setenv("CONSUL_SERVICE_ID", "rollback-probe-1")
+	t.Setenv("MILVUS_ENABLE", "true")
+	t.Setenv("MILVUS_ADDRESS", denied.addr)
+	t.Setenv("MILVUS_PASSWORD", milvusSecret)
+
+	dir := loadConfigDir(t, []string{"logger/logger.yaml", "consul/consul.yaml", "milvus/milvus.yaml"}, disabledStorageConfig)
+	t.Chdir(t.TempDir())
+	t.Cleanup(func() { consulRegistered = nil })
+	logs := captureLog(t)
+
+	components, cleanup, err := buildComponents(&ConfigOptions{ConfigPath: dir})
+	if err == nil {
+		cleanup()
+		t.Fatal("Milvus 握手失败时 buildComponents 应返回错误")
+	}
+	if components != nil {
+		t.Error("失败时不应返回组件容器")
+	}
+	if strings.Contains(err.Error(), milvusSecret) || strings.Contains(logs.String(), milvusSecret) {
+		t.Error("错误或日志带出了 Milvus 密码")
+	}
+
+	var registered, deregistered bool
+	for _, r := range consulFake.snapshot() {
+		if r.token != "" {
+			t.Errorf("CONSUL_TOKEN 未配置，%s 却带了 token", r.path)
+		}
+		if !r.hasBasic || r.basicUser != user || r.basicPass != pass {
+			t.Errorf("%s 的 Basic Auth 用户名/密码被改写或丢失", r.path)
+		}
+		switch r.path {
+		case "/v1/agent/service/register":
+			registered = true
+		case "/v1/agent/service/deregister/rollback-probe-1":
+			if !registered {
+				t.Error("注销出现在注册之前")
+			}
+			deregistered = true
+		}
+	}
+	if !registered {
+		t.Fatal("Consul 应先完成注册（前置条件不成立）")
+	}
+	if !deregistered {
+		t.Error("Milvus 失败后 wire 回滚应注销已注册的 Consul 服务")
+	}
+}
+{{- end }}

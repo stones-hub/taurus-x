@@ -42,16 +42,25 @@ services:
     restart: unless-stopped
     command: ["agent", "-dev", "-client=0.0.0.0", "-ui"]
     ports:
-      # 8500 = HTTP API + Web UI
-      - "8500:8500"
+      # 8500 = HTTP API + Web UI。dev 模式没有 ACL，只绑本机回环；app 在容器网络里用 consul:8500 访问
+      - "127.0.0.1:8500:8500"
+    healthcheck:
+      # 镜像自带的 consul CLI 经本机 HTTP API 查询成员，agent 能应答才算就绪
+      test: ["CMD", "consul", "members"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
     networks:
       - {{ .ProjectName }}-net
 {{- end }}
 {{- if .Has.milvus }}
 
-  # ---- Milvus standalone 需要 etcd（元数据）+ minio（对象存储）两个依赖 ----
+  # ---- Milvus standalone 需要 etcd（元数据）+ 外置 S3 对象存储两个独立依赖 ----
+  # 镜像版本对齐 Milvus 官方 v2.6.5 的 milvus-standalone-docker-compose.yml（etcd v3.5.18、milvus v2.6.5）。
+  # 对象存储不再内置 MinIO：必须接你们自己有人维护的外置 S3（公共 CA 签发证书的 HTTPS 端点），见部署文档。
   etcd:
-    image: quay.io/coreos/etcd:v3.5.14
+    image: quay.io/coreos/etcd:v3.5.18
     container_name: {{ .ProjectName }}-etcd
     restart: unless-stopped
     environment:
@@ -74,45 +83,61 @@ services:
     networks:
       - {{ .ProjectName }}-net
 
-  minio:
-    image: minio/minio:RELEASE.2024-08-17T01-24-54Z
-    container_name: {{ .ProjectName }}-minio
-    restart: unless-stopped
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-me-minio}
-    command: ["minio", "server", "/minio_data", "--console-address", ":9001"]
-    volumes:
-      - minio-data:/minio_data
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-    networks:
-      - {{ .ProjectName }}-net
-
   milvus:
-    image: milvusdb/milvus:v2.4.9
+    image: milvusdb/milvus:v2.6.5
     container_name: {{ .ProjectName }}-milvus
     restart: unless-stopped
     command: ["milvus", "run", "standalone"]
+    # 与官方 v2.6.5 编排一致
+    security_opt:
+      - seccomp:unconfined
     environment:
       ETCD_ENDPOINTS: etcd:2379
-      MINIO_ADDRESS: minio:9000
-      MINIO_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-change-me-minio}
+      MQ_TYPE: woodpecker
+      # 外置 S3（Milvus v2.6.5 用 MINIO_* 这组环境变量接任何 S3 兼容服务，不要求对端是 MinIO）。
+      # 下面 6 项必须在 .env 里显式设置，缺任何一项 compose 直接拒绝启动；不提供默认值，避免静默用上
+      # 镜像自带配置里的默认凭据、默认桶或默认前缀。
+      # 地址只写 host 或 host:port，不带 http(s)://；不写端口时按下面固定的 443。
+      MINIO_ADDRESS: ${MILVUS_S3_ADDRESS:?MILVUS_S3_ADDRESS 必须在 .env 里显式设置（外置 S3 的 host 或 host:port）}
+      MINIO_PORT: "443"
+      MINIO_ACCESS_KEY_ID: ${MILVUS_S3_ACCESS_KEY_ID:?MILVUS_S3_ACCESS_KEY_ID 必须在 .env 里显式设置}
+      MINIO_SECRET_ACCESS_KEY: ${MILVUS_S3_SECRET_ACCESS_KEY:?MILVUS_S3_SECRET_ACCESS_KEY 必须在 .env 里显式设置}
+      MINIO_BUCKET_NAME: ${MILVUS_S3_BUCKET:?MILVUS_S3_BUCKET 必须在 .env 里显式设置}
+      # 对象键前缀，不要以 / 开头；Milvus 有数据后不能再改（改了读不到旧数据）
+      MINIO_ROOT_PATH: ${MILVUS_S3_ROOT_PATH:?MILVUS_S3_ROOT_PATH 必须在 .env 里显式设置（例如 {{ .ProjectName }}/milvus）}
+      # 必须与桶所在区域一致：C++ 侧只在非空时才设置签名区域，留空会落到 SDK 默认值，签名对不上
+      MINIO_REGION: ${MILVUS_S3_REGION:?MILVUS_S3_REGION 必须在 .env 里显式设置（桶所在区域）}
+      # false 时 Go 侧按端点自动选择寻址方式、C++ 侧固定 path-style；服务商只支持 virtual-host 时改 true
+      MINIO_USE_VIRTUAL_HOST: ${MILVUS_S3_USE_VIRTUAL_HOST:-false}
+      # 只作用于 C++ 侧（存储 V2 再按整秒取整）：写 1000 的整数倍，不要低于 1000
+      MINIO_REQUEST_TIMEOUT_MS: ${MILVUS_S3_REQUEST_TIMEOUT_MS:-10000}
+      # 以下为固定的安全设置，不要改成从 .env 读取：
+      # - 只走 HTTPS，并且 CA 必须显式置空。v2.6.5 的 C++ 对象存储客户端在 CA 非空时会关闭证书与主机名校验，
+      #   镜像自带配置里的 CA 占位值又是非空的，所以只开 HTTPS 不置空 CA 并不安全；置空后走系统信任库校验，
+      #   因此只支持公共 CA 签发的证书，不支持私有 CA / 自签证书。
+      # - 固定 aws（SigV4）+ 静态密钥，不用 IAM；存储类型固定 remote（Milvus 存储 V2 只认 remote）。
+      MINIO_USE_SSL: "true"
+      MINIO_SSL_TLSCACERT: ""
+      MINIO_CLOUD_PROVIDER: aws
+      MINIO_USE_IAM: "false"
+      COMMON_STORAGETYPE: remote
     volumes:
       - milvus-data:/var/lib/milvus
     depends_on:
       etcd:
         condition: service_healthy
-      minio:
-        condition: service_healthy
+    healthcheck:
+      # 与官方 v2.6.5 编排一致：9091/healthz 返回 200 才算就绪（首次启动较慢，给 90 秒启动期）
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 90s
     ports:
-      # 19530 = gRPC（SDK 连这个），9091 = metrics / health
-      - "19530:19530"
-      - "9091:9091"
+      # 19530 = gRPC（SDK 连这个），9091 = metrics / health。compose 里的 Milvus 不开认证，只绑本机回环；
+      # app 在容器网络里用 milvus:19530 访问。生产请接外部 Milvus 并开启认证 / TLS。
+      - "127.0.0.1:19530:19530"
+      - "127.0.0.1:9091:9091"
     networks:
       - {{ .ProjectName }}-net
 {{- end }}
@@ -134,11 +159,11 @@ services:
         condition: service_started
 {{- if .Has.consul }}
       consul:
-        condition: service_started
+        condition: service_healthy
 {{- end }}
 {{- if .Has.milvus }}
       milvus:
-        condition: service_started
+        condition: service_healthy
 {{- end }}
     # 非 root 运行，uid/gid 与镜像内一致（1000）；bind mount 目录需 chown 1000:1000
     user: "1000:1000"
@@ -157,8 +182,8 @@ services:
       REDIS_PORT: 6379
       # jwt（生产务必改成随机长串：openssl rand -hex 32）
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET 必须在 .env 里显式设置}
-      JWT_COOKIE_SECURE: ${JWT_COOKIE_SECURE:false}
-      AUTH_TRUSTED_ORIGINS: ${AUTH_TRUSTED_ORIGINS:none}
+      JWT_COOKIE_SECURE: ${JWT_COOKIE_SECURE:-false}
+      AUTH_TRUSTED_ORIGINS: ${AUTH_TRUSTED_ORIGINS:-none}
 {{- if .Has.consul }}
       # consul（服务注册发现）
       CONSUL_ENABLE: "true"
@@ -210,6 +235,5 @@ volumes:
   redis-data:
 {{- if .Has.milvus }}
   etcd-data:
-  minio-data:
   milvus-data:
 {{- end }}

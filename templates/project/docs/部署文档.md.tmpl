@@ -1,6 +1,6 @@
 # {{ .ProjectName }} 部署文档
 
-认证加固配置：HTTPS反向代理终止TLS时须显式设置`AUTH_TRUSTED_ORIGINS=https://实际后台域名`及`JWT_COOKIE_SECURE=true`，Compose已透传；不采信任意客户端转发头。认证接口仅POST并校验来源，刷新始终校验CSRF；退出在本地JWT有效时严格校验CSRF并吊销，缺失/过期/无效签名JWT可安全清Cookie，不将Redis故障当成过期。详见`商用加固一期说明.md`。下文历史部署验证不能代替模板修改后本候选的真库、HTTPS及浏览器验收。
+认证加固配置：HTTPS反向代理终止TLS时须显式设置`AUTH_TRUSTED_ORIGINS=https://实际后台域名`及`JWT_COOKIE_SECURE=true`，Compose已透传；不采信任意客户端转发头。认证接口仅POST并校验来源，刷新始终校验CSRF；退出在本地JWT有效时严格校验CSRF并吊销，缺失/过期/无效签名JWT可安全清Cookie，不将Redis故障当成过期。详见`商用加固一期说明.md`。下文历史部署验证不能代替模板修改后的真库、HTTPS及浏览器验收。
 
 > 前端是纯静态文件，由 Go 后端托管（含 SPA history 回退），**运行时不需要 Node**，一个端口同时提供页面和接口。
 >
@@ -15,7 +15,8 @@
 > 三种方式**默认都不含 nginx**（Go 直接对外 `9080`）。需要 `80/443`、HTTPS 或域名入口时，再按第七节加一层 nginx。
 >
 > **验证状态**：脚手架维护方实测过：Docker 方式（基础组件，arm64）；Ubuntu 裸机方式 A、B（Ubuntu 22.04 arm64 容器，含 supervisor 非 root 运行、更新与回滚）；nginx + `TRUSTED_PROXIES`；macOS 原生编译运行与 MySQL 8.4。以上均完成真实登录。
-> **未实测**：带 systemd 的真实 Ubuntu 服务器（容器内用 `service` 代替了 `systemctl`）、amd64 机器上实际运行（只核对过交叉编译产物格式）、macOS 的 Homebrew 安装与 launchd 开机自启。
+> 脚手架 v0.6.0 发布前另在 linux/amd64 的隔离 Docker 测试环境验证过：全选组件生成的后端二进制直接在测试容器里运行，真实登录与权限页面通过，全部组件同时启用时就绪、收到 SIGTERM 后正常退出；原 `Dockerfile` 用 BuildKit 三阶段构建成功并核对过镜像内容，但这个镜像**没有启动**做业务验证。
+> **未实测**：带 systemd 的真实 Ubuntu 服务器（容器内用 `service` 代替了 `systemctl`）、在 amd64 服务器上按本文任一方式完整部署（上面的 amd64 验证是测试容器直接运行后端，不是本文的部署流程）、macOS 的 Homebrew 安装与 launchd 开机自启。
 > 上线前请在你的目标机器上完整走一遍。
 >
 > 上线后的数据库备份 / 恢复、压测、SBOM 与漏洞扫描见 [`运维手册.md`](运维手册.md)。**Docker 方式**的 mysql 服务默认不映射端口，备份脚本只支持宿主机上的 MySQL 8.x 客户端，具体做法见运维手册 1.2 节。
@@ -75,10 +76,11 @@ Go 编译出的程序只能在**对应的系统和 CPU 架构**上运行。这�
 | Docker | 容器编排（仅 Docker 方式） | - | |
 | nginx | 反向代理（**可选**） | 80/443 | 三种方式都可加 |
 {{- if .Has.consul }}
-| Consul | 服务注册发现 | 8500 | 已选组件，compose 内置 `consul` 服务（dev 模式，生产请换集群部署） |
+| Consul | 服务注册发现 | 8500 | 已选组件，compose 内置 `consul` 服务（dev 模式、无 ACL，宿主端口只绑 127.0.0.1；生产请换集群部署） |
 {{- end }}
 {{- if .Has.milvus }}
-| Milvus | 向量库 | 19530 / 9091 | 已选组件，compose 内置 standalone + 依赖的 etcd / minio |
+| Milvus | 向量库 | 19530 / 9091 | 已选组件，compose 内置 standalone v2.6.5 + 独立的 etcd v3.5.18；对象存储**必须接外置 S3**（见下）；宿主端口只绑 127.0.0.1 |
+| 外置 S3 | Milvus 对象存储 | 443 | **生产前置条件**：你们自己有人维护的 S3 兼容服务，公共 CA 签发证书的 HTTPS 端点；compose 不再内置对象存储 |
 {{- end }}
 {{- if .Has.opentelemetry }}
 | OpenTelemetry Collector | 链路追踪上报 | 4317 | 已选组件，**不在 compose 内**；自备 collector 后在 `config/autoload/otel/` 填地址并打开开关 |
@@ -97,12 +99,63 @@ Go 编译出的程序只能在**对应的系统和 CPU 架构**上运行。这�
 {{- end }}
 {{- if .Has.milvus }}
 
-> ⚠️ **已知阻塞（未解决）**：Docker 方式下，Milvus standalone 依赖的 `minio/minio:RELEASE.2024-08-17T01-24-54Z`
-> 在 Docker Hub 与 Quay 的匿名 manifest 请求均返回 401，没有已确认可用的拉取来源，
-> 因此**完整的 `docker compose up` 目前会在拉 minio 镜像这一步失败**。
-> 处置前先自行确认一个可信来源与版本（不要随手换成 `latest` 或来源不明的第三方镜像），
-> 或暂时不启用 compose 里的 milvus / etcd / minio 三个服务（app 本身不依赖它们启动：
-> `milvus.enable` 关掉即可，连不上时也只打日志、不阻断启动）。
+> ⚠️ **Milvus 的对象存储必须接外置 S3（生产前置条件）**。compose 里 Milvus 的拓扑是 milvus standalone v2.6.5 +
+> 独立 etcd v3.5.18 + **外置 S3**：不再内置 MinIO 服务（社区版 MinIO 已停止维护，且没有经本项目验证可拉取的公开固定镜像），
+> etcd 有健康检查，milvus 等 etcd 健康后才启动，app 等 milvus 健康后才启动。外置 S3 由你们自己有人维护的服务提供
+> （组织已有的 S3 兼容存储，或另行批准的托管 S3），本项目**没有对任何真实外置端点做过兼容验收**，上线前必须自己验收（见本节末尾）。
+>
+> 在 compose 的 `.env`（见 6.3）里填写下面这些变量，**必填项缺任何一项 `docker compose up` 直接报错拒绝启动**：
+>
+> | 变量 | 必填 | 说明 |
+> |---|---|---|
+> | `MILVUS_S3_ADDRESS` | 是 | 端点 `host` 或 `host:port`，**不带** `http://` / `https://`；不写端口时按 443 |
+> | `MILVUS_S3_ACCESS_KEY_ID` / `MILVUS_S3_SECRET_ACCESS_KEY` | 是 | 静态访问密钥；只放在 `.env`，按最小权限只授该桶（及前缀）的读写列删 |
+> | `MILVUS_S3_BUCKET` | 是 | 桶名，建议预先建好并专用；桶不存在时 Milvus 会尝试自己建桶（需要建桶权限） |
+> | `MILVUS_S3_ROOT_PATH` | 是 | 对象键前缀，不要以 `/` 开头，例如 `{{ .ProjectName }}/milvus`；**有数据后不能再改**（改了读不到旧数据），不要与其它服务共用 |
+> | `MILVUS_S3_REGION` | 是 | 桶所在区域，必须写对：Milvus 的 C++ 存储客户端只在非空时才设置签名区域 |
+> | `MILVUS_S3_USE_VIRTUAL_HOST` | 否，默认 `false` | `false` 时 Milvus 的 Go 客户端按端点自动选择寻址方式、C++ 客户端固定 path-style；服务商只支持 virtual-host 寻址时改 `true` |
+> | `MILVUS_S3_REQUEST_TIMEOUT_MS` | 否，默认 `10000` | 只作用于 C++ 客户端（存储 V2 再按整秒取整），写 1000 的整数倍、不低于 1000；Go 客户端的超时由 SDK 固定 |
+>
+> **固定的安全设置（compose 里写死，不要改）**：只走 HTTPS（`MINIO_USE_SSL: "true"`），并且 **CA 必须显式置空**
+> （`MINIO_SSL_TLSCACERT: ""`）；`MINIO_CLOUD_PROVIDER: aws`（SigV4）、`MINIO_USE_IAM: "false"`、`COMMON_STORAGETYPE: remote`。原因：
+> Milvus v2.6.5 的 C++ 对象存储客户端（含存储 V2）在 CA 路径非空时会**关闭证书和主机名校验**，而镜像自带配置里的 CA 占位值是非空的，
+> 只打开 HTTPS 而不置空 CA 反而不安全。CA 置空后 Go 与 C++ 两侧都用镜像系统信任库校验证书，因此：
+>
+> - **只支持公共 CA 签发证书的 HTTPS 端点**；**不支持私有 CA / 自签证书**，也**不支持 HTTP 明文**。不要为了连上而改这几项。
+> - 不要从别的配置来源改这些值。Milvus v2.6.5 的配置优先级是 **etcd > 环境变量 > 配置文件**：
+>   - etcd 的优先级高于环境变量，能直接盖掉 compose 里写死的值。**不要在 etcd 里写 Milvus 的
+>     `minio.*` / `common.storageType` 配置**。
+>   - `user.yaml` 和 `MILVUSCONF`（改配置目录）属于配置文件层，优先级低于环境变量，按源码盖不掉 compose 里写死的值。
+>     不要挂载 `user.yaml`、不要设置 `MILVUSCONF`，是防御性约束（免得以后环境变量被删时它们悄悄生效），不是因为它们优先级更高。
+>   - `MILVUS_CONF_MINIO_*` 这类 `MILVUS_CONF_*` 前缀变量与普通环境变量同属环境变量层，是同一配置项的别名。
+>     和 compose 里的同名设置同时存在时，谁生效取决于进程环境变量的遍历顺序，不能保证谁赢，所以也不要设置。
+> - 生效时机分两种：
+>   - **静态环境变量**：compose 里的环境变量（含 `.env` 插值后的值）只在 Milvus 进程启动时读取，
+>     改完要重建 milvus 容器（`docker compose up -d milvus`）才生效。
+>   - **etcd 覆盖**：etcd 里的覆盖在运行中就会生效，不需要重启。Milvus 运行时会定期刷新 etcd 里的配置，
+>     写入后，之后新发起的索引构建、统计、分析、导入、压缩（compaction）任务拿到的存储配置（StorageConfig）都会跟着变。
+> - **etcd 里一旦出现过非空的 CA 路径**（`minio.ssl.tlsCACert`）：C++ 存储客户端可能对之后的任务关闭证书和主机名校验，
+>   存储 V2 还会把 CA 写进进程级状态，只删掉 etcd 里的覆盖不能保证恢复校验。
+>   处置：先删掉 etcd 里的这条覆盖，再重启整个 Milvus 进程（例如 `docker compose restart milvus`），然后按本节末尾重新验收。
+> - 防范边界：compose 里写死这些环境变量，防的是 `.env` 误配和镜像自带配置里的默认值，防不了能写 etcd 的人，
+>   也防不了同一容器网络里已被攻破的容器。compose 里的 etcd 没有开认证，与 app 等服务在同一个容器网络里；本项目没有改这部分网络和认证配置。
+> - 以上 etcd 运行时覆盖、非空 CA 的影响只按 v2.6.5 源码分析，没有做动态验证（NOT_RUN）。
+>
+> **上线前自己验收（本项目未做，状态 NOT_RUN）**：用生成项目实际写入向量 → flush / 建索引 / load → 检索结果正确，并在桶里看到对象；
+> 同卷重启 Milvus 后检索仍正确；错误密钥、错误区域、证书主机名不匹配的端点都应被拒绝。已有数据换端点、桶或前缀不是改配置就行，
+> 需要停写后对 etcd 元数据和对象一致备份 / 迁移，另行计划。
+>
+> **Milvus 启用后连不上会让启动失败**（`MILVUS_ENABLE=true` 时逐个建连并握手，配置不对或握手失败直接退出，
+> 不再只打日志）。compose 里 app 的 `MILVUS_ENABLE` 是 `true`。Docker 方式暂时不用 Milvus 时，三步要一起做：
+>
+> 1. 把 app 的 `MILVUS_ENABLE` 改成 `"false"`；
+> 2. 删掉 app 的 `depends_on` 里的 `milvus` 一项；
+> 3. 删除（或整段注释掉）`milvus`、`etcd` 两个服务，顶层 `volumes` 里的 `etcd-data`、`milvus-data` 可一并删除。
+>
+> 只做前两步不够：这两个服务仍在 compose 里，`docker compose up` 仍会创建它们，并且仍要求填写上面的外置 S3 必填变量。
+> 裸机 / macOS 方式默认 `MILVUS_ENABLE=false`，不涉及这些服务。
+> 其它约束（每个客户端 10 秒建连上限、调用必须带 deadline、Close 是终态、只支持单向 TLS、
+> `max_retry` 当前不生效、不允许 `disable_conn=true`）见 `backend/config/autoload/milvus/milvus.yaml` 开头的注释。
 {{- end }}
 
 ---
@@ -693,12 +746,24 @@ MYSQL_PASSWORD=改强密码
 AUTHORIZATION=改随机串
 JWT_SECRET=改随机长串
 DB_DSN={{ .DBName }}:改强密码@tcp(mysql:3306)/{{ .DBName }}?charset=utf8mb4&parseTime=True&loc=Local
+{{- if .Has.milvus }}
+# Milvus 外置 S3（含义见第二节的变量表）
+MILVUS_S3_ADDRESS=改成外置S3端点host
+MILVUS_S3_ACCESS_KEY_ID=改成该桶专用访问密钥ID
+MILVUS_S3_SECRET_ACCESS_KEY=改成该桶专用访问密钥
+MILVUS_S3_BUCKET=改成预先建好的桶名
+MILVUS_S3_ROOT_PATH={{ .ProjectName }}/milvus
+MILVUS_S3_REGION=改成桶所在区域
+{{- end }}
 EOF
 chmod 600 .env
 ```
 
 > compose `environment` 里 `${VAR:-默认值}` / `${VAR:?...}` 的取值都从本 `.env` 读取；
 > 改完 `docker compose up -d` 重建容器生效。`JWT_SECRET` 没设置时 compose 会直接报错拒绝启动（故意如此）。
+{{- if .Has.milvus }}
+> `MILVUS_S3_*` 的六个必填项同样如此，缺任何一项都会报错拒绝启动；示例里的中文占位必须换成真实值。
+{{- end }}
 > `MYSQL_PASSWORD` 与 `DB_DSN` 里的密码必须一致；`DB_DSN` 的主机是容器名 `mysql`，不是 `127.0.0.1`。
 > 注意这些值会被**原样**代入 `config/` 下的配置文件，**不要加引号**、不要在值里写 `}` 或换行。
 
@@ -715,6 +780,10 @@ docker compose ps
 - bind mount 的 `docker-data/logs` 必须先按 6.2 建好并 `chown 1000:1000`：app 容器以非 root
   （uid=1000）运行，日志目录不可写会导致日志模块初始化失败、容器直接退出。
 - 前面要加 nginx 时，把 `docker-compose.yml` 里 app 的端口改成 `"127.0.0.1:9080:9080"`，只让本机的 nginx 访问，并按第七节设置 `TRUSTED_PROXIES`。
+- 构建上下文是整个项目目录，不要把运行秘密放进去。`.dockerignore` 已排除各层的 `.env*`（只放行前端构建要用的
+  `frontend/.env`、`frontend/.env.production` 两个非敏感配置）、`*.local` 本机覆盖、`*account*.txt` 和
+  `browser-credentials.json`；自己另起名字的秘密文件（密钥、证书、导出数据等）不在这些规则里，要放在项目目录外，
+  或自行加进 `.dockerignore`。这些规则只排除列出的路径，不能保证构建上下文里没有任何秘密。
 
 #### 6.4.1 构建架构（跨平台）
 
@@ -733,8 +802,9 @@ docker buildx build --platform linux/amd64 -t <你的镜像仓库>/{{ .ProjectNa
 
 > 注意：交叉构建出来的镜像**不能在本机运行验证**（除非开 QEMU 模拟，那不等于目标机行为）。
 > 跨架构交付时，「构建通过」和「容器真能起来」是两件事，必须在目标架构的机器上实际启动验证。
-> 另外 `DOCKER_BUILDKIT=0` 时 `TARGETARCH` 为空，等价于按构建机原生架构编译（结果仍正确，
-> 但无法交叉出包）。
+> 另外这个 `Dockerfile` 必须用 BuildKit 构建：没有 BuildKit 的旧版构建器（`DOCKER_BUILDKIT=0`，或 Docker 没装 buildx 插件）
+> 不会注入 `BUILDPLATFORM`，实测在第一条 `FROM --platform=$BUILDPLATFORM` 就报 `"" is an invalid OS component` 失败，
+> 用 `--build-arg` 补传这几个变量也不行。
 
 #### 6.4.2 国内网络：Go 依赖代理
 

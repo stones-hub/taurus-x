@@ -24,7 +24,7 @@ var All = []Component{
 	{
 		Name:        "common",
 		Package:     "github.com/stones-hub/taurus-pro-common",
-		Version:     "v0.3.0",
+		Version:     "v0.4.0",
 		Required:    true,
 		Description: "通用能力：日志 logx、定时任务 cron、panic recovery",
 	},
@@ -45,20 +45,20 @@ var All = []Component{
 	{
 		Name:        "storage",
 		Package:     "github.com/stones-hub/taurus-pro-storage",
-		Version:     "v0.2.0",
+		Version:     "v0.3.0",
 		Required:    true,
 		Description: "存储：GORM 多库 + Redis（后台底座依赖）",
 	},
 	{
 		Name:        "consul",
 		Package:     "github.com/stones-hub/taurus-pro-consul",
-		Version:     "v0.3.0",
+		Version:     "v0.3.1",
 		Description: "Consul：服务注册/注销 + 配置监听",
 	},
 	{
 		Name:        "opentelemetry",
 		Package:     "github.com/stones-hub/taurus-pro-opentelemetry",
-		Version:     "v0.2.0",
+		Version:     "v0.2.1",
 		Description: "OpenTelemetry：Tracer Provider，关闭时 flush",
 	},
 	{
@@ -76,7 +76,7 @@ var All = []Component{
 	{
 		Name:        "milvus",
 		Package:     "github.com/stones-hub/taurus-pro-milvus",
-		Version:     "v0.1.0",
+		Version:     "v0.3.0",
 		Description: "Milvus 向量数据库客户端池",
 	},
 }

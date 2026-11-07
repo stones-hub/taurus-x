@@ -204,7 +204,9 @@ mysql -uroot -p {{ .DBName }} -e "UPDATE admin_user_logins SET login_credential=
 | `make vuln` | govulncheck 依赖漏洞扫描（已知的 x/crypto/openpgp 模块告警及判定见运维手册） |
 {{- if .Has.milvus }}
 
-> ⚠️ 本项目勾选了 milvus：Docker 方式当前会在拉取 minio 镜像时失败，详见部署文档第二节的已知阻塞说明；app 自身不依赖 Milvus 启动。
+> ⚠️ 本项目勾选了 milvus：compose 不再内置对象存储，Docker 方式必须接你们自己有人维护的**外置 S3**（只支持公共 CA 签发证书的 HTTPS 端点，
+> 不支持私有 CA / 自签证书 / HTTP），并在 compose 的 `.env` 里填好 `MILVUS_S3_*` 必填项，缺一项 compose 即拒绝启动；变量表、
+> 固定的安全设置和上线前验收见部署文档第二节。本项目未对任何真实外置端点做过兼容验收。`MILVUS_ENABLE=true` 时 Milvus 连不上会让启动失败；不用 Milvus 时保持 `false`。
 {{- end }}
 
 ---
@@ -257,9 +259,9 @@ mysql -uroot -p {{ .DBName }} -e "UPDATE admin_user_logins SET login_credential=
 
 - Go 无法终止忽略 ctx 的协程。任何一步「超时」都只代表不再等它：它在后台继续运行，进程随后退出，
   所以仍可能有迟到的 handler / 定时任务 / TCP 回调去访问已经关闭的连接池（日志里会看到对应步骤的超时告警）。
-- 依赖的组件版本决定能做到什么程度（`backend/go.mod` 默认 taurus-pro-consul v0.3.0、taurus-pro-tcp v0.2.0、
-  taurus-pro-opentelemetry v0.2.0；新 API 都靠类型断言探测，降级到旧版本照常编译，回落到下面写的旧版行为）：
-  - taurus-pro-consul v0.3.0 提供 `DeregisterServiceContext`（启动日志 `consul=context-deregister`），到期时注销请求被真正取消。
+- 依赖的组件版本决定能做到什么程度（`backend/go.mod` 默认 taurus-pro-consul v0.3.1、taurus-pro-tcp v0.2.0、
+  taurus-pro-opentelemetry v0.2.1；新 API 都靠类型断言探测，降级到旧版本照常编译，回落到下面写的旧版行为）：
+  - taurus-pro-consul 自 v0.3.0 起提供 `DeregisterServiceContext`（启动日志 `consul=context-deregister`），到期时注销请求被真正取消。
     旧版 v0.2.0 及以前的注销不接收 ctx（`consul=legacy-wait-only`），到期只能放弃等待，那个 HTTP 请求取消不了。
   - taurus-pro-tcp v0.2.0 提供 `StopContext`（启动日志 `tcp=stop-context`）：先关全部 socket、不调用回调，再限时等
     `OnMessage` / `OnClose` 返回；回调卡住时到期放弃等待，回调本身不会被终止。
@@ -468,6 +470,33 @@ mysql -uroot -p {{ .DBName }} -e "UPDATE admin_user_logins SET login_credential=
 - 初始管理员密码每次生成随机，且不写进本仓库任何文件。
 - 删掉了未挂路由的自助注册流程（controller / service / DTO / 前端类型）：
   本底座的建号入口只有「管理员新增用户」。
+- **凭据占位符只把纯空白当「没配」**（`internal/taurus/conv.go` 的 `emptyIfBlank`）：配置占位符默认值不能为空串，
+  模板用一个空格占位；Redis 密码{{ if .Has.consul }}、Consul token / Basic Auth{{ end }}{{ if .Has.milvus }}、Milvus 用户名 / 密码 / API key{{ end }}
+  只有空白时按没配处理（不发认证信息），非空白的值不会被代码去掉首尾空格。受配置库限制（先文本替换再解析
+  YAML/TOML，值里含引号、反斜线、`}`、换行会被改写或导致解析失败），不保证任意字符都能原样传递；首尾空格保留
+  只验证过由进程环境变量直接提供的普通值，经 `.env.local` 等文件提供时未验证。
+- **Redis 日志默认 warn**（`config/autoload/redis/redis.toml`）：info 会把每条成功命令连同参数（会话键等）写进
+  `logs/redis.log`；warn 下只记失败命令（仍带参数），排查时再临时调成 info / debug。
+{{- if .Has.consul }}
+- **Consul Basic Auth 必须用户名和密码同时配置**，只配一个启动报错，不再静默忽略。
+{{- end }}
+{{- if .Has.milvus }}
+- **Milvus 启用后严格校验、连不上就启动失败**（`internal/taurus/components.go` 的 `ProvideMilvusComponent`）：
+  `milvus.list` 缺失 / 为空 / 条目格式不对、name 为空或带首尾空白或重复、address 为空、字段类型不对、
+  `disable_conn=true`（会跳过握手、不校验认证）、建连或握手失败都直接返回错误；已建好的连接先关闭，
+  再由 wire 回滚已初始化的组件{{ if .Has.consul }}（例如注销 Consul 注册）{{ end }}。错误信息不含密码、API key 和地址。
+  这些路径有离线单元测试（进程内 fake Milvus{{ if .Has.consul }} / fake Consul{{ end }}），**真实 Milvus 服务上的联调不在单元测试范围内**。
+- **Milvus 查询失败只写脱敏日志、恢复由请求驱动**：Search / Query 用组件默认启用的只读恢复，只在本次请求内
+  按 5 秒间隔重建重试（5 秒是失败后的等待间隔，不保证每 5 秒都拨号一次，拨号和 SDK 内部重试也占同一预算），
+  单次最多 60 秒，调用方 ctx 期限更短时以调用方为准；请求结束后组件包装层没有后台重连或重放
+  （SDK / gRPC 对已建连接的既有维护不在此列），前一次失败不会永久关闭客户端，显式调用的连接池 Close 才是终态；
+  写操作不在恢复范围内，组件包装层不重试（不代表 SDK 内部不重试）。最终失败时往默认日志（模板默认 `logs/app.log`）写一条
+  `milvus_read_failed` ERROR，只有操作名、错误分类、执行次数（不含 SDK 内部重试，也不保证每次都发到服务端）和耗时；
+  只覆盖按 `milvus.list` 创建的客户端，运行时自己 `pool.Add` 的客户端不自动记录。
+  Close 会取消在途的 Search / Query 和恢复，`GetClient()` 的裸 SDK 句柄不能与 Search / Query 的恢复、
+  Close、UseDatabase 并发，组件不承诺裸 SDK 透明恢复。字段含义、日志配置与这些边界见 `docs/运维手册.md` 第六节。
+  这些行为来自 `go.mod` 依赖的已发布 taurus-pro-milvus v0.3.0（只读恢复与观察回调接口），模板不带 replace。
+{{- end }}
 
 ### 其它
 

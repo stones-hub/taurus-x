@@ -1,18 +1,44 @@
 milvus:
   # 默认关闭：选了 milvus 组件只代表代码和依赖就绪，
   # 确认 Milvus 可达后把 MILVUS_ENABLE 设为 true。
+  #
+  # 设为 true 后启动时逐个建连并握手，任何一项不对都让进程启动失败（不再跳过、只打日志）：
+  # list 缺失或为空、条目格式不对、name 为空 / 只有空白 / 带首尾空白 / 重复、address 为空、
+  # 字段类型不对、disable_conn=true、连不上或握手被拒。失败时已建好的连接会先关闭，
+  # 已初始化的其它组件（例如 Consul 注册）随启动失败一起回滚。错误信息不含密码、API key 和地址。
+  #
+  # 使用约束（go.mod 依赖已发布的 taurus-pro-milvus v0.3.0 / SDK v2.6.5）：
+  #   - 每个客户端建连 + 握手的上限是组件默认的 10 秒（milvus.DefaultCreateTimeout），这里不可配；
+  #   - 业务调用要给 ctx 设 deadline：v0.3.0 只给 Search / Query 加了从调用开始计的 60 秒兜底
+  #     （调用方 ctx 期限更短时取更短的），其它业务调用仍要自己设 deadline；
+  #   - 错误判断：gRPC 状态可用 status.Code(err)；Milvus 业务错误（merr，例如集合未加载、错误码 503）不能只靠
+  #     status.Code 区分，要用 errors.Is 对照固定的 merr 哨兵错误白名单分类，白名单以外按未知处理；
+  #   - 连接池 Close 是终态：关闭后不能再 Add / Get。v0.3.0 默认启用 Search / Query 的只读恢复，
+  #     Close 会直接取消在途的 Search / Query 和恢复等待，其它调用仍按原有语义等它结束，
+  #     所以退出时可能多出 final_class=other 的失败日志（other 也包含其它原因，不能一律当成 Close 引起的）；
+  #   - GetClient() 拿到的原生 SDK 句柄不受组件的并发保护，不要与 Close / UseDatabase 并发使用；
+  #     Search / Query 恢复时会替换并关闭这个句柄，所以它也不能与 Search / Query 并发，重新 GetClient 也保护不了
+  #     已经拿着旧句柄的在途调用。需要裸 SDK 时，另建一个显式 mclient.WithReadRecovery(false) 的客户端专用，
+  #     或保证它与上述调用串行；组件不承诺裸 SDK 调用的透明恢复；
+  #   - TLS 只支持单向（校验服务端证书，用系统信任库），不支持 mTLS 和自定义 CA。
   enable: ${MILVUS_ENABLE:false}
 
   list:
-    - name: "default"                              # 连接标识，代码里用 taurus.Container.Milvus.Get("default")
+    - name: "default"                              # 连接标识，代码里用 taurus.Container.Milvus.Get("default")，按原样精确匹配
 
       address: "${MILVUS_ADDRESS:127.0.0.1:19530}"
+      # 凭据：占位符默认值不能为空串，用一个空格占位；只有空白的值按「没配」处理，非空白的值不会被代码去掉首尾空格。
+      # 限制：占位符在 YAML 解析之前做文本替换，值里含引号、反斜线、右花括号或换行时会被改写或导致解析失败，
+      # 不保证任意字符都能原样传递；首尾空格保留只验证过由进程环境变量直接提供的普通值，经 .env 类文件提供时未验证。
+      # 配了 api_key 就用它，忽略用户名密码；否则配了密码才带用户名 + 密码认证（只有用户名不发认证信息）。
       username: "${MILVUS_USERNAME:root}"
-      password: "${MILVUS_PASSWORD: }"             # 占位符默认值不能为空串，用一个空格占位
+      password: "${MILVUS_PASSWORD: }"
+      api_key: "${MILVUS_API_KEY: }"
       db_name: "${MILVUS_DB:default}"
-      enable_tls_auth: false
-      api_key: "${MILVUS_API_KEY: }"               # 配了 api_key 就优先用它，忽略用户名密码
+      enable_tls_auth: ${MILVUS_TLS:false}         # true / false，不加引号；单向 TLS，见上方约束
 
+      # 当前 SDK v2.6.5 不应用这两项（组件照传，实际重试次数和退避不受影响）。
+      # SDK 自身对 Unavailable / ResourceExhausted 有固定重试；控制耗时请用调用方 ctx 的 deadline。
       max_retry: 3
       max_retry_backoff: "30s"
 
@@ -24,7 +50,8 @@ milvus:
       multiplier: 1.6
       jitter: 0.2
       max_delay: "120s"
-      min_connect_timeout: "20s"
-      max_recv_msg_size: 0                         # 0 表示用默认值
+      min_connect_timeout: "10s"                   # 单次拨号的最短等待；整体仍受上面 10 秒建连上限约束
+      max_recv_msg_size: 0                         # 0 表示用默认值（2GB-1）
 
+      # 必须为 false。true 会跳过建连握手（不校验认证和库名），启用 Milvus 时启动直接报错。
       disable_conn: false

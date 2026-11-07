@@ -61,7 +61,7 @@
 | `opentelemetry` | 否 | 链路追踪、指标上报；需另备 collector |
 | `tcp` | 否 | TCP 服务基础设施；需自己注册业务 handler |
 | `grpc` | 否 | gRPC 服务基础设施；需自己注册业务 service |
-| `milvus` | 否 | 向量数据库客户端；当前有已知阻塞，见[已知限制](#12-已知限制与安全提醒)，第一次使用不建议勾选 |
+| `milvus` | 否 | 向量数据库客户端池；启用后连不上即启动失败。Docker 编排不内置对象存储，必须接自己维护的外置 S3（公共 CA 的 HTTPS 端点），见[已知限制](#12-已知限制与安全提醒)，第一次使用不建议勾选 |
 
 必选组件即使取消，也会被生成器补回。未选的可选组件会从依赖、配置、组件注册和 Docker 编排中裁掉，不只是把开关关闭。
 
@@ -217,7 +217,7 @@ go install github.com/stones-hub/taurus-x@latest
 也可以安装指定版本，所有版本见 GitHub 的 [Releases](https://github.com/stones-hub/taurus-x/releases) 页面：
 
 ```bash
-go install github.com/stones-hub/taurus-x@v0.5.0
+go install github.com/stones-hub/taurus-x@v0.6.0
 ```
 
 安装后命令通常位于 `$(go env GOPATH)/bin`，需要该目录在 `PATH` 中。如果提示找不到命令，先检查安装目录，不必重复安装。
@@ -654,12 +654,47 @@ v0.4.0 同时补上：访问日志 / 操作日志改为有界队列 + 固定 wor
 
 v0.5.0：退出改为 摘除（Consul 注销）→ 入口（HTTP / gRPC / TCP 并行、共用预算、到期强制关闭）→ 日志排空 → 资源关闭（每步有名字、单独限时，卡住一步不阻塞后续）四段，最坏总耗时全选组件约 37.7 秒，部署停止等待统一改为 45 秒并在启动时校验；Consul 可取消注销、TCP `StopContext` 通过类型断言自动启用，生成项目默认依赖 taurus-pro-consul v0.3.0、taurus-pro-tcp v0.2.0、taurus-pro-opentelemetry v0.2.0 以走这些新路径（降级到 consul v0.2.0 / tcp v0.1.0 时回落到限时等待，限制见生成项目 README）。Go 无法终止忽略 ctx 的代码，超时只代表不再等待。
 
+### v0.6.0 版本说明
+
+组件依赖升级为 taurus-pro-common v0.4.0、storage v0.3.0、consul v0.3.1、opentelemetry v0.2.1、milvus v0.3.0（config / http / tcp / grpc 不变），均为已公开发布的版本，生成项目的 `go.mod` 不放 replace。前端用 pnpm override 把 Axios 依赖的 follow-redirects 锁到 1.16.2（1.16.0–1.16.1 在 GHSA-mrwp-f3q8-3g9p 影响范围内）。
+
+Redis / Consul / Milvus 的占位凭据只把纯空白当「没配」，非空白的值不再被代码去掉首尾空格（受配置库「先文本替换再解析 YAML/TOML」的限制，值里含引号、反斜线、`}`、换行会被改写或导致解析失败，不保证任意字符都能原样传递；首尾空格保留只验证过由进程环境变量直接提供的普通值，经 .env 类文件提供时未验证）；Consul Basic Auth 只配一半时启动报错；Milvus 启用后严格校验配置、拒绝 `disable_conn=true`、连不上即启动失败并关闭已建连接、由 wire 回滚已初始化组件；Redis 日志默认 warn；compose 的 Milvus 升到 v2.6.5、etcd v3.5.18（对齐官方 v2.6.5 编排；保留独立 etcd，对象存储改为必须接外置 S3、不再内置 MinIO），加健康检查与 `service_healthy` 依赖，Milvus / Consul 宿主端口只绑 127.0.0.1。
+
+common v0.4.0 兼容提醒：邮件改为严格 STARTTLS、校验证书并设总 deadline，文件存储增加 HTTPS、超时与路径校验；业务若自行调用这些能力且依赖明文、跳过校验或无限等待，需按 taurus-pro-common v0.4.0 的组件文档调整。真实 SMTP 服务与各云存储的兼容性均未认证。生成项目模板只用 common 的日志、定时任务、recovery 和工具库，不调用邮件或云存储。
+
+Milvus 查询失败日志与只读恢复：生成项目的 Milvus provider 改为接收已初始化的日志组件，给 `milvus.list` 里配置的每个客户端挂只读恢复观察回调（业务运行时自己 `pool.Add` 的客户端不自动挂，需要时由业务自行接安全日志）；Search / Query 走组件默认启用的请求内只读恢复（失败后等 5 秒再重建重试，不保证每 5 秒拨号一次，拨号与 SDK 内部重试同占单次 60 秒预算，调用方期限更短时以调用方为准；请求结束后组件包装层无后台重连或重放，SDK / gRPC 自身的连接维护和 SDK 内部重试不在此列；写操作组件包装层不恢复、不重试，不代表 SDK 内部不重试），最终失败时往默认日志（模板默认 `logs/app.log`）写一条只含操作名、错误分类、执行次数（越过恢复门禁的执行次数，不是服务端 RPC 次数，不含 SDK 内部重试）和耗时的 ERROR，不记客户端名、地址、集合名、表达式、向量、凭据和错误原文。Close 会取消在途的 Search / Query 和恢复，`GetClient()` 的裸 SDK 句柄不能与 Search / Query 的恢复、Close、UseDatabase 并发，组件不承诺裸 SDK 透明恢复（详见生成项目 `docs/运维手册.md` 第六节）。这些只读恢复 / 观察回调接口来自已公开发布的 taurus-pro-milvus v0.3.0。
+
+生成项目的 `.dockerignore` 补充排除各层运行用 `.env*`、`*.local`、账号与浏览器凭据文件（规则与限制见下方列表）。
+
+### v0.6.0 已验证与未验证边界
+
+以下是 v0.6.0 发布前在隔离的 linux/amd64 Docker 测试环境里实际做过的验收，测试依赖、合成秘密和端口都是测试专用的，**不等于你的生产环境已经验证**：
+
+| 已验证 | 范围说明 |
+| --- | --- |
+| 真实 CLI 交互生成全选组件项目 | 前端构建、后端构建通过；`go.mod` 为公开的 common v0.4.0、milvus v0.3.0，无 replace。生成器测试另对只选必选、典型组合、全选三种组合跑通生成、`go mod tidy`、Wire、后端 build / vet / test |
+| 真实 MySQL / Redis 下的浏览器业务 | 管理员登录；角色、权限的新增 / 改名 / 删除，用户新增 / 编辑 / 软删除，部门新增及成员增删，并重新打开确认持久化；无角色账号看不到管理菜单，直接调列表接口被拒绝（业务 code 403）。经本机隧道走 HTTP，**不是 HTTPS 验收** |
+| 角色授权→撤权闭环 | 管理员给新角色授「用户管理」子树并绑定新用户 → 该用户只看到授权菜单、能实际查询 → 管理员撤掉角色后，该用户**不刷新的旧页面**再查询即被服务端拒绝（业务 code 403），刷新后菜单与按钮隐藏。只覆盖这一种权限组合，不代表所有角色组合和所有增改删都验证过 |
+| Consul ACL | 测试环境另起的 Consul（ACL 默认拒绝），只授本服务 write 的窄 token 能注册；不带 token 启动在 1 秒内失败退出、不残留注册；Consul 停掉时启动失败；Consul 恢复后**重新启动应用**即就绪并注册。不是失败的进程会自己恢复；compose 内置的 Consul 仍是 dev 模式、没有 ACL |
+| OpenTelemetry 真实导出 | 用生成项目的 OTel provider 发出一个采样 span 并立即 cleanup，collector 收到同一 trace ID 和 span 名。只证明这个短 span 场景 |
+| 全组件同时启用的就绪与退出 | 同一个正式后端同时启用 HTTP / DB / Redis / Logger / Cron / Consul / OTel / TCP / gRPC / Milvus：`/health`、`/login` 正常，Consul 已注册；SIGTERM 后约 10.7 秒以 0 退出，Consul 注销、HTTP / TCP / gRPC 监听关闭、已建立的连接被断开。Milvus 用的是测试环境自己的对象存储，不是外置生产 S3；Cron 是测试时临时打开的。只证明进程、端口、注册这些外部边界，不证明内部连接池逐个关闭 |
+| 原 Dockerfile 三阶段构建 | 用 BuildKit 原样构建成功；从未启动的容器导出文件系统核对：后端二进制、`config`、`dist` 齐全，没有 Node / node_modules / npm / pnpm / Go 工具链。没有 BuildKit 的旧版构建器（legacy builder）实测在第一条 `FROM --platform=$BUILDPLATFORM` 就失败，构建需要 BuildKit / buildx |
+
+**仍未验证或未认证**：
+
+- 构建出的 Docker 镜像本身没有启动做业务运行验收；部署文档里的「验证状态」照旧适用。
+- 日志队列满载时的排空与丢失数量、退出时仍在执行的 Cron 任务本轮都没有证明（测试中 Cron 没有注册任务，文件日志为空）。
+- 真实 SMTP、各云存储、Milvus 外置生产 S3、HTTPS 部署、高可用与容量都没有认证。
+- 依赖安全只核对过历史报告列出的 14 项 Axios / Vite / follow-redirects 公告，当前锁定版本均不在受影响范围内；这**不是全生态审计，不代表零漏洞**。
+
+### 其他限制与安全提醒
+
 仍保留可选组件生产运行、其他权限并发窗口、许可证/SBOM、Go漏洞审计、备份恢复与容量验收等风险；日志队列在退出超时或进程被强杀时仍可能丢失少量日志。
 
 **当前不是“所有场景均已验证的生产成品”。**
 
-- 历史版本仅必选组合曾实测初始化、登录、基础页面、改密与角色禁用；模板修改后的本候选必须重新独立复审和真库/HTTPS浏览器验收，不能沿用旧通过结论。
-- 勾选 `milvus` 后，生成项目的 Docker 编排依赖的 MinIO 镜像当前拉取失败，没有确认可用的替代版本；Consul、Milvus、OTEL 的真实连接未完成整体验收。
+- 每次修改模板后都要重新独立复审，并在真实数据库和 HTTPS 下做浏览器验收，不能沿用旧版本的通过结论。
+- 勾选 `milvus` 后，生成项目的 Docker 编排**不再内置 MinIO**，Milvus 的对象存储必须接使用者自己有人维护的外置 S3：compose 的 `.env` 里 `MILVUS_S3_*` 必填项缺一项即拒绝启动；只支持公共 CA 签发证书的 HTTPS 端点，CA 固定显式置空（Milvus v2.6.5 的 C++ 存储客户端在 CA 非空时会关闭证书与主机名校验），不支持私有 CA / 自签证书 / HTTP。本项目没有对任何真实外置 S3 端点做过兼容验收（BLOCKED / NOT_RUN）；上面的全组件验收用的是测试环境的对象存储，不能替代这项验收。
 - 各部署方式已实测和未实测的环境，见生成项目 `docs/部署文档.md` 开头的验证状态说明。
 - OTEL 默认关闭，需要你配置并启动 collector；TCP/gRPC 也不是选中后就自动带业务服务。
 - 真实 MySQL 并发交错、完整安全故障矩阵等仍有未验证边界；普通功能通过不代表这些边界已通过。
@@ -669,6 +704,7 @@ v0.5.0：退出改为 摘除（Consul 注销）→ 入口（HTTP / gRPC / TCP �
 - 生成项目 README 还列有其他安全与功能待办，上生产前必须逐项评估。
 - Redis 会话白名单缺失或故障会拒绝认证；改密等操作会吊销旧会话。这些现象不能简单理解为“登录偶尔不稳定”。
 - 初始密码、JWT 密钥、数据库密码、Token、Cookie 不进 Git、不写入公开问题报告。
+- 生成项目的 Docker 构建上下文是整个项目目录：`.dockerignore` 排除各层 `.env*`（只放行 `frontend/.env`、`frontend/.env.production` 两个非敏感前端构建配置）、`*.local`、`*account*.txt` 和 `browser-credentials.json`，自己另起名字的秘密文件需放到项目目录外或自行加进 `.dockerignore`；这些规则不能保证构建上下文里没有任何秘密。
 - 本机测试时服务尽量只监听 `127.0.0.1`；不要把临时数据库、缓存和测试后台暴露到公网。
 
 进一步阅读：生成项目自带的 `README.md`（含「已知风险与待办」）和 `docs/` 下的文档。

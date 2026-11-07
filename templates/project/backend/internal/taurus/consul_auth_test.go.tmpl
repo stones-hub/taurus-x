@@ -1,0 +1,140 @@
+package taurus
+{{- if .Has.consul }}
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stones-hub/taurus-pro-consul/pkg/consul"
+)
+
+// consulRequest fakeConsul 收到的一次请求及其认证信息。
+type consulRequest struct {
+	method    string
+	path      string
+	token     string
+	hasBasic  bool
+	basicUser string
+	basicPass string
+}
+
+// fakeConsul 只实现生成项目用到的 Consul HTTP 接口（连通探测、注册、注销），记录每次请求带的认证信息。
+type fakeConsul struct {
+	srv      *httptest.Server
+	mu       sync.Mutex
+	requests []consulRequest
+}
+
+func newFakeConsul(t *testing.T) *fakeConsul {
+	t.Helper()
+	f := &fakeConsul{}
+	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		f.mu.Lock()
+		f.requests = append(f.requests, consulRequest{
+			method: r.Method, path: r.URL.Path, token: r.Header.Get("X-Consul-Token"),
+			hasBasic: ok, basicUser: user, basicPass: pass,
+		})
+		f.mu.Unlock()
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/v1/health/state/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte("[]"))
+		case r.URL.Path == "/v1/agent/service/register",
+			strings.HasPrefix(r.URL.Path, "/v1/agent/service/deregister/"):
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+func (f *fakeConsul) addr() string { return strings.TrimPrefix(f.srv.URL, "http://") }
+
+func (f *fakeConsul) snapshot() []consulRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]consulRequest(nil), f.requests...)
+}
+
+// connectFakeConsul 用 consulAuthOptions 的结果走组件公开的 consul.NewClient，
+// 它建客户端时会真实发一次连通探测请求，返回 fakeConsul 看到的请求。
+func connectFakeConsul(t *testing.T, opts []consul.Option) []consulRequest {
+	t.Helper()
+	f := newFakeConsul(t)
+	all := append(append([]consul.Option(nil), opts...),
+		consul.WithAddress(f.addr()), consul.WithMaxRetries(0), consul.WithTimeout(2*time.Second))
+	client, err := consul.NewClient(all...)
+	if err != nil {
+		t.Fatalf("consul.NewClient 失败: %v", err)
+	}
+	client.Close()
+	reqs := f.snapshot()
+	if len(reqs) == 0 {
+		t.Fatal("fake Consul 没收到请求")
+	}
+	return reqs
+}
+
+// TestConsulAuthOptions_BlankPlaceholdersSendNothing 不配或只配空白（模板占位）时，
+// 请求里既没有 X-Consul-Token，也没有 Basic Auth。
+func TestConsulAuthOptions_BlankPlaceholdersSendNothing(t *testing.T) {
+	for _, blank := range []string{"", " ", " \t "} {
+		opts, err := consulAuthOptions(blank, blank, blank)
+		if err != nil {
+			t.Fatalf("空白凭据不应报错: %v", err)
+		}
+		if len(opts) != 0 {
+			t.Errorf("空白凭据 %q 不应产生任何认证选项，实际 %d 个", blank, len(opts))
+		}
+		for _, r := range connectFakeConsul(t, opts) {
+			if r.token != "" || r.hasBasic {
+				t.Errorf("空白凭据 %q 仍发出了认证信息: %s %s", blank, r.method, r.path)
+			}
+		}
+	}
+}
+
+// TestConsulAuthOptions_RealValuesSentVerbatim 真实凭据原样发出：Basic Auth 的用户名和密码
+// 首尾空格都保留（base64 编码后经 HTTP 原样到达）。token 走请求头，HTTP 会去掉头部值的首尾空白，
+// 这里用中间带空格的 token 确认没被改写；首尾空格的保留由 TestEmptyIfBlank 覆盖。
+func TestConsulAuthOptions_RealValuesSentVerbatim(t *testing.T) {
+	const token, user, pass = "tok en-1", " ops ", "  c0n sul  "
+	opts, err := consulAuthOptions(token, user, pass)
+	if err != nil {
+		t.Fatalf("合法凭据不应报错: %v", err)
+	}
+	for _, r := range connectFakeConsul(t, opts) {
+		if r.token != token {
+			t.Errorf("%s 的 X-Consul-Token 被改写了", r.path)
+		}
+		if !r.hasBasic || r.basicUser != user || r.basicPass != pass {
+			t.Errorf("%s 的 Basic Auth 用户名/密码被改写或丢失", r.path)
+		}
+	}
+}
+
+// TestConsulAuthOptions_HalfBasicAuthRejected Basic Auth 只配了用户名或密码之一时报错，
+// 不静默丢掉；错误里不带任何值。
+func TestConsulAuthOptions_HalfBasicAuthRejected(t *testing.T) {
+	const secret = "half-S3cret"
+	for _, c := range []struct{ user, pass string }{
+		{user: secret, pass: " "},
+		{user: "", pass: secret},
+	} {
+		_, err := consulAuthOptions(" ", c.user, c.pass)
+		if err == nil {
+			t.Fatalf("只配了一半的 Basic Auth 应报错（username=%t password=%t）", c.user != "", c.pass != "")
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Error("错误信息带出了凭据值")
+		}
+	}
+}
+{{- end }}

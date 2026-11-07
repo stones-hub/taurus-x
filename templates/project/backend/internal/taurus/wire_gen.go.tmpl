@@ -88,7 +88,7 @@ func buildComponents(opts *ConfigOptions) (*Components, func(), error) {
 {{- end }}
 {{- if .Has.milvus }}
 
-	milvusPool, milvusCleanup, err := ProvideMilvusComponent(cfg)
+	milvusPool, milvusCleanup, err := ProvideMilvusComponent(cfg, logManager)
 	if err != nil {
 		unwind()
 		return nil, nil, err

@@ -2,6 +2,10 @@
 
 本手册覆盖四件事：MySQL 备份与恢复、压测、SBOM（软件物料清单）、依赖漏洞扫描。
 都是「一条命令 + 一份说明」，没有额外的页面或配置平台。
+{{- if .Has.milvus }}
+另附 Milvus 外置 S3 的运维要点（第五节）。
+Milvus 查询失败、恢复与失败日志见第六节。
+{{- end }}
 
 | 命令 | 做什么 | 依赖 | 联网 | 产物 |
 |------|--------|------|------|------|
@@ -314,17 +318,21 @@ make vuln
 （版本固定在根目录 `Makefile` 的 `GOVULNCHECK_VERSION`），不改 `go.mod` / `go.sum`。
 **任何一个没通过，make 立即停止，后面的 module 不会被扫描**；修好前面的再重跑，或单独执行后面那条命令。
 
-**怎么读结果**：govulncheck 区分两层——
+**怎么读结果**：每条 finding 的 trace 只写到它被确认的那一层——
 
-- **Symbol Results（代码可达）**：你的代码实际调用到的有漏洞的函数。这才是要修的。
-- **Module / Package Results**：依赖的模块或导入的包里有漏洞，但代码没有调用到。默认输出只给一个汇总数字，
-  `-show verbose` 才列出明细。
+- **Symbol 层（Symbol Results，代码可达）**：trace 里有 `function`，找到了从你的代码到有漏洞函数的调用路径。优先处理。
+- **Package 层**：trace 里有 `package`、没有 `function`：导入了受影响的包，但没找到调用漏洞函数的路径。
+- **Module 层**：trace 只有 `module` / `version`：依赖的模块版本落在公告影响范围内，但这次构建没有导入公告列出的包。
+
+Package / Module 层**不是零风险证明**：结论只对这次的代码、构建配置（GOOS/GOARCH、build tags）和当时的漏洞库成立，
+代码或依赖一变、公告一更新，层级都可能变化。默认输出只给 Package / Module 层的汇总数字，`-show verbose` 才列出明细，
+`-format json` 能看到每条 finding 的完整 trace 和 `fixed_version`。
 
 **退出码**：Makefile 里没有 `|| true`、没有用 `grep` 过滤输出，失败一定是非 0。govulncheck 自己的退出码是：
 
 | govulncheck 自身退出码 | 含义 |
 |------|------|
-| `0` | 代码可达的漏洞为 0（模块层面的告警不影响退出码） |
+| `0` | 默认文本输出：代码可达（Symbol 层）的漏洞为 0，Package / Module 层的 finding 不影响退出码。`-format json` 等结构化输出有 finding 也返回 0——**exit 0 不等于没有 finding** |
 | `3` | 发现代码可达的漏洞 |
 | 其它非 0（如 `1`） | **工具本身出错**（网络拉不到漏洞库、编译失败等）——**不等于没有漏洞** |
 
@@ -336,29 +344,126 @@ make vuln
 所以 `make vuln` 只能区分**通过（0）/ 没通过（非 0）**。没通过时看输出：有 `Your code is affected by N vulnerabilities`
 且上面打印了 `exit status 3`，是发现了代码可达的漏洞；否则是工具出错，要先排除错误再重扫，**不能当成没有漏洞**。
 
-### 已知告警：golang.org/x/crypto/openpgp（GO-2026-5932）
+### 历史扫描记录：golang.org/x/crypto 模块层 finding（GO-2026-5932）
 
-实现时用 govulncheck v1.9.0 扫描生成项目得到的输出（示例，**待独立复核**；漏洞库会更新，以你自己执行时的输出为准）：
+下面是**历史记录**，不是当前结论：模板 T10 阶段对一次全组件生成的后端做离线 source / symbol 级扫描（`-format json`），
+用的是当时准备好的本地漏洞库快照（最后修改于 2026 年 11 月），之后没有联网重扫或复核；它也不是 `make vuln` 的原样输出。
+漏洞库、公告和依赖版本都会变化，你的项目以自己执行时的实际输出和公告为准。
 
+那次扫描的 JSON 输出里只有一条 finding（JSON 输出时 govulncheck 照样返回 0，finding 要从输出里逐条解出来）：
+
+```json
+{
+  "finding": {
+    "osv": "GO-2026-5932",
+    "fixed_version": "v0.58.1-0.20261009181718-2f1f834330b2",
+    "trace": [
+      { "module": "golang.org/x/crypto", "version": "v0.58.0" }
+    ]
+  }
+}
 ```
-=== Symbol Results ===
 
-No vulnerabilities found.
+怎么理解这条记录：
 
-Your code is affected by 0 vulnerabilities.
-This scan also found 0 vulnerabilities in packages you import and 1
-vulnerability in modules you require, but your code doesn't appear to call these
-vulnerabilities.
-Use '-show verbose' for more details.
-```
+- 公告内容：`golang.org/x/crypto/openpgp` 及其子包已停止维护、设计上不安全；影响范围按 `golang.org/x/crypto`
+  模块版本标出，公告列出的受影响导入路径都是 `golang.org/x/crypto/openpgp` 及其子包。
+- trace 只有 `module` / `version`，没有 `package` / `function`：这是 **Module 层** finding——依赖的
+  `golang.org/x/crypto v0.58.0` 落在影响范围内，但那次构建没有导入公告列出的包。生成项目用这个模块是为了
+  `bcrypt`（`app/helper`），`bcrypt` 不在公告列出的包里，所以这条**不是 bcrypt 的漏洞**。
+- Module 层不等于零风险，也不等于永远不可达：结论只对那次的代码、构建配置和漏洞库成立；代码或依赖一旦导入
+  `openpgp`，层级就会升到 Package / Symbol。
+- 那次的 `fixed_version` 有值，但它是**伪版本**（未打 tag 的提交），不是正式发布版本。**有修复元数据不等于已有
+  可以直接升级的、受支持的正式版本。**
 
-`-show verbose` 的 Module Results 里那一条是 **GO-2026-5932**：`golang.org/x/crypto/openpgp` 包已停止维护、
-设计上不安全，**没有修复版本（Fixed in: N/A）**。判定依据：
+处理方式（**不要盲目把 `go.mod` 改成伪版本**）：
 
-- 它是**模块层面**的告警：项目依赖 `golang.org/x/crypto` 是为了 `bcrypt`（`go mod why -m golang.org/x/crypto`
-  → `app/helper` → `golang.org/x/crypto/bcrypt`），`x/crypto` 模块里恰好也带着 `openpgp` 这个包；
-- 项目**没有导入** `openpgp`：`cd backend && go list -deps ./... | grep openpgp` 没有输出；
-- **代码可达结果为 0**，退出码 0。
+1. 用 `-format json`（或 `-show verbose`）看你自己这次扫描的 trace 层级和 `fixed_version`，再到公告页
+   `https://pkg.go.dev/vuln/GO-2026-5932` 核对当前的影响范围和修复说明；
+2. 自查是否导入：`cd backend && go list -deps ./... | grep openpgp`（没有输出只说明当前构建配置下没有导入）；
+3. 查 `golang.org/x/crypto` 已发布的正式版本（`go list -m -versions golang.org/x/crypto`）里有没有包含修复、
+   并且与项目其它依赖兼容的版本：有就按正常依赖升级流程升级并跑完整测试；没有就记为已知 finding 持续跟踪，
+   每次升级依赖或漏洞库更新后重扫；
+4. 确实需要 OpenPGP 时不要用 `x/crypto/openpgp`，公告建议改用仍在维护的 `github.com/ProtonMail/go-crypto/openpgp`。
 
-所以这条无法通过升级「修复」，也不需要处理；只要不在代码里引入 `golang.org/x/crypto/openpgp` 就保持不可达。
-漏洞库会更新，以后的扫描结果以当时实际输出为准；出现新的 Symbol Results 时按提示升级对应依赖。
+出现 Symbol 层 finding 时优先处理：按公告核对修复版本和兼容性后再升级对应依赖。
+{{- if .Has.milvus }}
+
+## 五、Milvus 外置 S3
+
+compose 不内置对象存储，Milvus 的数据对象放在外置 S3 上，连接参数来自 compose 的 `.env` 里的 `MILVUS_S3_*`
+（变量表和固定的安全设置见部署文档第二节）。日常运维只记住下面几条：
+
+- **改 `.env` 要重建容器**：静态环境变量——compose 里的环境变量（含 `.env` 插值后的值）只在 Milvus 进程启动时读取。
+  改完 `.env` 后执行 `docker compose up -d milvus`，再看 `docker compose ps` 里 milvus 恢复 healthy、app 正常。
+- **etcd 覆盖不一样**：etcd 里的覆盖在运行中就会生效，不需要重启。Milvus 运行时会定期刷新 etcd 里的配置，
+  之后新发起的索引构建、统计、分析、导入、压缩（compaction）任务拿到的存储配置（StorageConfig）都会跟着变。
+  etcd 里一旦出现过非空的 CA 路径（`minio.ssl.tlsCACert`），C++ 存储客户端可能对之后的任务关闭证书和主机名校验，
+  存储 V2 还会把 CA 写进进程级状态，只删掉 etcd 里的覆盖不能保证恢复校验。
+  处置：先删掉 etcd 里的这条覆盖，再重启整个 Milvus 进程（例如 `docker compose restart milvus`），并按部署文档第二节末尾重新验收。
+  以上只按 v2.6.5 源码分析，没有做动态验证（NOT_RUN）。
+- **轮换访问密钥**：先在 S3 服务端为该桶签发新密钥并授同样的最小权限 → 改 `.env` 的
+  `MILVUS_S3_ACCESS_KEY_ID` / `MILVUS_S3_SECRET_ACCESS_KEY` → 重建 milvus 并确认检索正常 → 再吊销旧密钥。
+  密钥只放在 `.env`（`chmod 600`），不要写进 compose、日志或工单。
+- **不要动这几项**：`MINIO_USE_SSL: "true"`、`MINIO_SSL_TLSCACERT: ""`、`MINIO_CLOUD_PROVIDER: aws`、`MINIO_USE_IAM: "false"`、
+  `COMMON_STORAGETYPE: remote`。Milvus v2.6.5 的 C++ 存储客户端在 CA 路径非空时会关闭证书和主机名校验，
+  所以**不支持私有 CA / 自签证书**；端点证书换成私有 CA 签发时 Milvus 会连接失败，这是预期行为，不要为了连上而改配置。
+  也不要从别的配置来源改它们。配置优先级是 **etcd > 环境变量 > 配置文件**：
+  - etcd 的优先级高于环境变量，能直接盖掉 compose 里写死的值：etcd 里不写 Milvus 的 `minio.*` / `common.storageType` 配置。
+  - `user.yaml` 和 `MILVUSCONF`（改配置目录）属于配置文件层，优先级低于环境变量，按源码盖不掉这几项；
+    不挂载 `user.yaml`、不设置 `MILVUSCONF` 是防御性约束，不是因为它们优先级更高。
+  - `MILVUS_CONF_MINIO_*` 这类 `MILVUS_CONF_*` 前缀变量与普通环境变量同属环境变量层，是同一配置项的别名，
+    同时存在时谁生效取决于进程环境变量的遍历顺序，不能保证谁赢，所以也不设置。
+  - 防范边界：compose 里写死这些值防不了能写 etcd 的人，也防不了同一容器网络里已被攻破的容器
+    （compose 里的 etcd 没有开认证）；本项目没有改这部分网络和认证配置。
+- **不要改桶和前缀**：`MILVUS_S3_BUCKET` / `MILVUS_S3_ROOT_PATH` 有数据后改了就读不到旧数据。
+  换端点、桶或前缀属于数据迁移：停写后把 etcd 元数据（`etcd-data` 卷）和对象存储前缀一起做一致备份 / 迁移，
+  保留旧端点可回退，另行计划，不在本手册范围内。
+- **备份**：Milvus 的数据 = etcd 元数据 + 对象存储里该前缀下的对象，两者要按同一时间点备份才能恢复；
+  只备份其中一边不能恢复检索。本项目没有提供 Milvus 备份脚本，也没有对真实外置端点做过备份恢复验证。
+
+## 六、Milvus 查询失败日志
+
+- **恢复由请求驱动**：Search / Query 用组件默认启用的只读恢复，生成代码不显式开关。首次遇到确认过的暂时性故障
+  （gRPC Unavailable、Milvus 错误码 1 / 2 / 503 / 505）时，只在**本次请求内**每隔 5 秒重建连接后重试；
+  单次调用最多 60 秒，调用方 ctx 的期限更短时以调用方为准（60 秒从调用开始计；业务调用仍要给 ctx 设 deadline）。
+  5 秒是每次失败后的等待间隔，不保证每 5 秒都有一次拨号：服务端完全连不上时，重建拨号会一直等到连上或预算用完；
+  gRPC Unavailable 也要先经过 SDK 内部的重试才轮到组件包装层。拨号和 SDK 重试的耗时都算在同一个 60 秒预算里。
+  权限、认证、参数、集合未加载等其他错误立即原样返回，组件包装层不重试。
+- **没有后台恢复**：这里只指组件包装层的恢复——请求结束（成功、失败、超时或取消）后，组件包装层没有后台重连、健康轮询或自动重放。
+  SDK / gRPC 对已建连接自身的既有维护（例如 keepalive、底层连接的重连退避）不属于这里说的恢复，按 SDK / gRPC 原有行为进行。
+  前一次失败不会把客户端关掉，下一个请求照常重新尝试（需要时再重建连接）。连接池 Close 是显式调用后的终态：
+  不论是进程退出时的清理还是业务代码主动调用，关闭后都不能再 Add / Get。
+- **Close 与在途查询**：Close 会直接取消在途的 Search / Query 和恢复等待，其它调用仍按原有语义等它结束。
+  所以退出时可能多出 `final_class=other` 的失败日志；但 `other` 也包含其它原因，不能一律当成 Close 引起的。
+- **`GetClient()` 的裸 SDK 句柄**：默认启用恢复后，Search / Query 恢复时会替换并关闭这个句柄，所以它不能与
+  Search / Query 的恢复、Close、UseDatabase 并发使用；重新调用 `GetClient()` 取到新指针，也保护不了已经拿着旧句柄的在途调用。
+  需要裸 SDK 时，另建一个显式 `mclient.WithReadRecovery(false)` 的客户端专用，或保证它与上述调用串行；组件不承诺裸 SDK 调用的透明恢复。
+- **写操作没有包装层重试**：写操作（插入、删除、建删集合等）不在恢复范围内，组件包装层不做恢复或重试，失败后是否重试由调用方决定。
+  这不代表 SDK 内部不重试：SDK 自身的重试行为（`milvus.yaml` 注释里有说明）不受这里影响，本项目也不对它作承诺。
+- **最终失败写一条 ERROR**：Search / Query 最终失败时往默认日志写一条（`config/autoload/logger/logger.yaml` 里
+  name 为 `default` 的那项，模板默认 `logs/app.log`；改了这项就按改后的配置写：删掉这项时日志组件可能回退到控制台，
+  这项的级别配得比 ERROR 高时这条会被过滤），例如：
+
+  ```text
+  milvus_read_failed op=Search first_class=channel_not_available final_class=deadline_exceeded attempts=1 elapsed_ms=300
+  ```
+
+  首次直接成功、经恢复后成功都不写。字段只有这几个：`op`（`Search` / `Query` / `unknown`）、`first_class`（首次错误）、
+  `final_class`（最终原因，进入恢复后失败时按最终原因分，不按首次错误）、`attempts`（越过恢复门禁、执行查询函数的次数：
+  包含在本地构建请求阶段就失败的执行，不保证每次都发到了服务端，也不含 SDK 内部的重试，所以不等于服务端收到的 RPC 次数；
+  0 表示还没越过门禁就失败）、`elapsed_ms`（本次调用耗时）。
+  只有按 `milvus.list` 创建的客户端会写这条日志；业务代码运行时自己 `pool.Add` 的客户端不会自动挂上，需要时由业务自行接入同样脱敏的日志。
+- **分类取固定值**：`recovery_exhausted`（60 秒用完）、`database_changed`（恢复期间当前库被切换）、`canceled`、
+  `deadline_exceeded`、`service_not_ready`（1）、`service_unavailable`（2）、`channel_not_available`（503）、
+  `channel_tsafe_stalled`（505）、`grpc_unavailable`、`grpc_unauthenticated`、`grpc_permission_denied`、
+  `grpc_invalid_argument`、`grpc_not_found`、`grpc_failed_precondition`、`grpc_resource_exhausted`、
+  `grpc_unimplemented`、`grpc_internal`，其余一律 `other`（含客户端已关闭、未列出的 Milvus 业务错误）。
+- **刻意不记**：客户端名、地址、集合名、过滤表达式、向量、凭据和服务端 / SDK 的错误原文（错误原文可能回显这些内容）。
+  需要定位到具体请求时，由业务代码按自己定义的安全标识记录；错误本身仍原样返回给调用方。
+- **日志边界**：沿用现有的同步文件日志组件，不排队、不重试；磁盘满或写入失败时这条日志可能丢失，也不承诺严格实时。
+  它只用于排查，不是失败请求的补偿或重放记录。退出时连接池的限时清理到期后，不保证迟到的日志回调都已结束；
+  关闭连接池也不等于失败日志已经刷盘。
+- **依赖与验证边界**：以上行为来自 `go.mod` 依赖的已发布 taurus-pro-milvus v0.3.0（只读恢复与观察回调接口），模板不带 replace。
+  离线单元测试用进程内 fake Milvus；本节的恢复和日志行为不代表已在你们的真实 Milvus 环境里验证过，上线前按自己的环境验收。
+{{- end }}

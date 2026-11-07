@@ -1,0 +1,807 @@
+package taurus
+{{- if .Has.milvus }}
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/client/v2/entity"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/stones-hub/taurus-pro-common/pkg/logx"
+	mclient "github.com/stones-hub/taurus-pro-milvus/pkg/milvus/client"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+// 本文件验证 Milvus Search / Query 最终失败时写的脱敏日志：用真实日志组件写临时目录里的文件，
+// 用真实 provider + 组件客户端连进程内的 fake gRPC 服务端，不连外部服务。
+
+// 敏感标记：集合名、客户端名、假密码、过滤表达式、向量取值和服务端回显的错误原文都不得出现在日志里。
+const (
+	leakCollection = "tenant_7f3a_coll"
+	leakEntryName  = "vec-tenant-7f3a"
+	leakSecret     = "Pw-7f3a-NOT-REAL"
+	leakExpr       = `owner == "alice-7f3a"`
+	leakForged     = "forged_7f3a"
+	// leakServerText 服务端错误原文：回显凭据、集合、表达式和向量，并试图伪造一条日志行
+	leakServerText = "auth rejected for root:" + leakSecret + " on " + leakCollection + " where " + leakExpr +
+		" vec=[0.31415927 0.27182817]\n[ERROR] milvus_read_failed op=Query first_class=" + leakForged
+)
+
+var leakVector = []float32{0.31415927, 0.27182817}
+
+// milvusLeakMarkers 每条日志都要检查的敏感标记（向量取值只取前几位，避免与时间戳的毫秒重合）。
+var milvusLeakMarkers = []string{leakCollection, leakEntryName, leakSecret, leakExpr, "alice-7f3a", leakForged, "auth rejected", "0.3141", "0.2718"}
+
+// milvusReadFailedLine 一条失败日志的完整形态（logx 的 default 格式）：[时间] [文件:行] [ERROR] 之后只有固定字段，整行匹配。
+var milvusReadFailedLine = regexp.MustCompile(`^\[[0-9:. -]+\] \[[^\]]+:[0-9]+\] \[ERROR\] milvus_read_failed op=(Search|Query|unknown) first_class=([a-z_]+) final_class=([a-z_]+) attempts=([0-9]+) elapsed_ms=([0-9]+)$`)
+
+// milvusTestLog 测试用的真实日志组件和它的默认日志文件。exclusive=true 表示文件只给本测试用，不应有其他内容。
+type milvusTestLog struct {
+	manager   *logx.Manager
+	path      string
+	exclusive bool
+}
+
+// newMilvusTestLog 建一个只有 default 日志的真实日志组件，文件输出到临时目录的 app.log（与 logger.yaml 的默认项同为 default 格式），
+// 不读任何真实配置。
+func newMilvusTestLog(t *testing.T) *milvusTestLog {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "app.log")
+	manager, cleanup, err := logx.BuildManager(logx.LoggerOptions{
+		Name: "default", Level: logx.Info, Output: logx.File, FilePath: path, MaxSize: 10, Formatter: "default",
+	})
+	if err != nil {
+		t.Fatalf("创建测试日志失败: %v", err)
+	}
+	t.Cleanup(cleanup)
+	return &milvusTestLog{manager: manager, path: path, exclusive: true}
+}
+
+// lines 日志文件里的全部非空行；还没写过（文件不存在）时为空。
+func (l *milvusTestLog) lines(t *testing.T) []string {
+	t.Helper()
+	data, err := os.ReadFile(l.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// milvusReadFailure 解析出的一条失败日志。
+type milvusReadFailure struct {
+	op, first, final string
+	attempts         int
+	elapsedMS        int64
+}
+
+// readFailures 解析日志里全部的 Milvus 查询失败记录：每条都必须整行符合固定格式；整个文件不得含敏感标记（leaks 为额外的标记）；
+// exclusive 的日志里不得有其他行。
+func readFailures(t *testing.T, l *milvusTestLog, leaks ...string) []milvusReadFailure {
+	t.Helper()
+	lines := l.lines(t)
+	for i, leak := range append(append([]string{}, milvusLeakMarkers...), leaks...) {
+		for _, line := range lines {
+			if strings.Contains(line, leak) {
+				t.Errorf("日志带出了不该记录的内容（第 %d 个敏感标记）", i)
+				break
+			}
+		}
+	}
+	var out []milvusReadFailure
+	for _, line := range lines {
+		if !strings.Contains(line, "milvus_read_failed") {
+			if l.exclusive {
+				t.Errorf("日志里不应有失败记录以外的内容: %q", line)
+			}
+			continue
+		}
+		m := milvusReadFailedLine.FindStringSubmatch(line)
+		if m == nil {
+			t.Errorf("失败日志不是固定格式: %q", line)
+			continue
+		}
+		attempts, _ := strconv.Atoi(m[4])
+		elapsed, _ := strconv.ParseInt(m[5], 10, 64)
+		out = append(out, milvusReadFailure{op: m[1], first: m[2], final: m[3], attempts: attempts, elapsedMS: elapsed})
+	}
+	return out
+}
+
+// requireOneReadFailure 日志里恰好一条失败记录，并且字段与期望一致。
+func requireOneReadFailure(t *testing.T, l *milvusTestLog, op, first, final string, attempts int, leaks ...string) milvusReadFailure {
+	t.Helper()
+	got := readFailures(t, l, leaks...)
+	if len(got) != 1 {
+		t.Fatalf("应恰好写一条失败日志，实际 %d 条", len(got))
+	}
+	if got[0].op != op || got[0].first != first || got[0].final != final || got[0].attempts != attempts {
+		t.Errorf("失败日志字段不符：实际 %+v，期望 op=%s first_class=%s final_class=%s attempts=%d", got[0], op, first, final, attempts)
+	}
+	return got[0]
+}
+
+// panicOnError 调用 Error() 就 panic：用来确认分类和写日志都不格式化错误。
+type panicOnError struct{}
+
+func (panicOnError) Error() string { panic("不应调用 Error()") }
+
+// nilStatusError GRPCStatus 返回 nil 的错误（Error() 同样会 panic）。
+type nilStatusError struct{ panicOnError }
+
+func (nilStatusError) GRPCStatus() *status.Status { return nil }
+
+// asServer 服务端业务错误经 SDK 还原后的形态。
+func asServer(err error) error { return merr.Error(merr.Status(err)) }
+
+// recovered 进入恢复后失败时组件返回的错误。
+func recovered(first, last error) error {
+	return &mclient.ReadRecoveryError{Op: "Search", Collection: leakCollection, First: first, Last: last, Attempts: 2}
+}
+
+// TestMilvusReadErrorClass 分类只取固定词表：恢复错误按最终原因 Last（不按首次的可恢复错误）；
+// 组件终止原因、ctx、Milvus 白名单错误码优先，gRPC 状态码兜底，其余为 other；不调用 Error()。
+func TestMilvusReadErrorClass(t *testing.T) {
+	notServiceable := asServer(merr.WrapErrChannelNotAvailable(leakCollection, leakServerText))
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"恢复预算耗尽", recovered(notServiceable, mclient.ErrReadRecoveryExhausted), "recovery_exhausted"},
+		{"恢复中切库", recovered(notServiceable, mclient.ErrReadRecoveryDatabaseChanged), "database_changed"},
+		{"恢复中调用方超时", recovered(notServiceable, context.DeadlineExceeded), "deadline_exceeded"},
+		{"恢复中调用方取消", recovered(notServiceable, context.Canceled), "canceled"},
+		{"恢复中遇权限错误", recovered(notServiceable, status.Error(codes.PermissionDenied, leakServerText)), "grpc_permission_denied"},
+		{"恢复中遇未列出的业务错误", recovered(notServiceable, asServer(merr.WrapErrCollectionNotLoaded(leakCollection))), "other"},
+		{"组件终止原因本身", mclient.ErrReadRecoveryExhausted, "recovery_exhausted"},
+		{"ctx 超时", context.DeadlineExceeded, "deadline_exceeded"},
+		{"包装后的 ctx 取消", fmt.Errorf("search: %w", context.Canceled), "canceled"},
+		{"gRPC Canceled", status.Error(codes.Canceled, leakServerText), "canceled"},
+		{"gRPC DeadlineExceeded", status.Error(codes.DeadlineExceeded, leakServerText), "deadline_exceeded"},
+		{"merr 1", asServer(merr.WrapErrServiceNotReady("proxy", 1, "Initializing")), "service_not_ready"},
+		{"merr 2", asServer(merr.WrapErrServiceUnavailable(leakServerText)), "service_unavailable"},
+		{"merr 503", notServiceable, "channel_not_available"},
+		{"merr 505", asServer(merr.WrapErrChannelTSafeStalled(leakCollection, leakServerText)), "channel_tsafe_stalled"},
+		{"包装后的 merr 505", fmt.Errorf("search: %w", asServer(merr.WrapErrChannelTSafeStalled("ch", "lag"))), "channel_tsafe_stalled"},
+		{"gRPC Unavailable", status.Error(codes.Unavailable, leakServerText), "grpc_unavailable"},
+		{"gRPC Unauthenticated", status.Error(codes.Unauthenticated, leakServerText), "grpc_unauthenticated"},
+		{"gRPC PermissionDenied", status.Error(codes.PermissionDenied, leakServerText), "grpc_permission_denied"},
+		{"gRPC InvalidArgument", status.Error(codes.InvalidArgument, leakServerText), "grpc_invalid_argument"},
+		{"gRPC NotFound", status.Error(codes.NotFound, leakServerText), "grpc_not_found"},
+		{"gRPC FailedPrecondition", status.Error(codes.FailedPrecondition, leakServerText), "grpc_failed_precondition"},
+		{"gRPC ResourceExhausted", status.Error(codes.ResourceExhausted, leakServerText), "grpc_resource_exhausted"},
+		{"gRPC Unimplemented", status.Error(codes.Unimplemented, leakServerText), "grpc_unimplemented"},
+		{"gRPC Internal", status.Error(codes.Internal, leakServerText), "grpc_internal"},
+		{"包装后的 gRPC 状态", fmt.Errorf("query: %w", status.Error(codes.PermissionDenied, leakServerText)), "grpc_permission_denied"},
+		{"gRPC Unknown", status.Error(codes.Unknown, leakServerText), "other"},
+		{"未列出的 gRPC 状态码", status.Error(codes.DataLoss, leakServerText), "other"},
+		{"未列出的 Milvus 业务错误", asServer(merr.WrapErrCollectionNotLoaded(leakCollection, leakServerText)), "other"},
+		{"普通错误", errors.New(leakServerText), "other"},
+		{"nil", nil, "other"},
+		{"Error() 会 panic", panicOnError{}, "other"},
+		{"GRPCStatus 为 nil", nilStatusError{}, "other"},
+		{"恢复错误的 First / Last 都会 panic", recovered(panicOnError{}, panicOnError{}), "other"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := milvusReadErrorClass(c.err); got != c.want {
+				t.Errorf("分类为 %q，应为 %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestMilvusReadOp 操作名只保留 Search / Query，其余一律 unknown。
+func TestMilvusReadOp(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"Search", "Search"}, {"Query", "Query"}, {"search", "unknown"}, {"Delete", "unknown"}, {"", "unknown"},
+		{"Search\n[ERROR] " + leakForged, "unknown"},
+	}
+	for _, c := range cases {
+		if got := milvusReadOp(c.in); got != c.want {
+			t.Errorf("milvusReadOp(%q) = %q，应为 %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestMilvusReadFailureObserver_FinalFailureOnly 直接调用观察回调：恢复成功（Err 为 nil）不写；
+// 每个最终失败恰好写一条 ERROR，只有固定字段，集合名（含伪造日志行的换行）、错误原文都不出现；Error() 会 panic 的错误也不触发 panic。
+func TestMilvusReadFailureObserver_FinalFailureOnly(t *testing.T) {
+	notServiceable := asServer(merr.WrapErrChannelNotAvailable(leakCollection, leakServerText))
+	forgedCollection := leakCollection + "\n[ERROR] milvus_read_failed op=Query first_class=" + leakForged
+
+	t.Run("恢复成功不写日志", func(t *testing.T) {
+		log := newMilvusTestLog(t)
+		milvusReadFailureObserver(log.manager)(mclient.ReadRecoveryEvent{
+			Op: "Search", Collection: forgedCollection, FirstErr: notServiceable, Attempts: 2, Elapsed: 5 * time.Second,
+		})
+		if n := len(log.lines(t)); n != 0 {
+			t.Errorf("恢复成功不应写日志，实际 %d 行", n)
+		}
+	})
+
+	event := func(op string, first, err error, attempts int, elapsed time.Duration) mclient.ReadRecoveryEvent {
+		return mclient.ReadRecoveryEvent{Op: op, Collection: forgedCollection, FirstErr: first, Err: err, Attempts: attempts, Elapsed: elapsed}
+	}
+	permission := status.Error(codes.PermissionDenied, leakServerText)
+	plain := errors.New(leakServerText)
+	cases := []struct {
+		name             string
+		ev               mclient.ReadRecoveryEvent
+		op, first, final string
+		attempts         int
+		elapsedMS        int64
+	}{
+		{"进入恢复后预算耗尽", event("Search", notServiceable, recovered(notServiceable, mclient.ErrReadRecoveryExhausted), 3, 60*time.Second),
+			"Search", "channel_not_available", "recovery_exhausted", 3, 60000},
+		{"首次门禁等待被预算截断", event("Query", context.DeadlineExceeded, recovered(context.DeadlineExceeded, mclient.ErrReadRecoveryExhausted), 0, 1500*time.Millisecond),
+			"Query", "deadline_exceeded", "recovery_exhausted", 0, 1500},
+		{"首次即不可恢复（原样返回）", event("Query", permission, permission, 1, 20*time.Millisecond),
+			"Query", "grpc_permission_denied", "grpc_permission_denied", 1, 20},
+		{"未知操作名", event("Search\n"+leakForged, plain, plain, 1, 0),
+			"unknown", "other", "other", 1, 0},
+		{"错误的 Error() 会 panic", event("Search", panicOnError{}, recovered(panicOnError{}, panicOnError{}), 2, 7*time.Millisecond),
+			"Search", "other", "other", 2, 7},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			log := newMilvusTestLog(t)
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Fatal("观察回调不应 panic（不得格式化错误）")
+					}
+				}()
+				milvusReadFailureObserver(log.manager)(c.ev)
+			}()
+			got := requireOneReadFailure(t, log, c.op, c.first, c.final, c.attempts)
+			if got.elapsedMS != c.elapsedMS {
+				t.Errorf("elapsed_ms=%d，应为 %d", got.elapsedMS, c.elapsedMS)
+			}
+		})
+	}
+}
+
+// TestMilvusReadFailureObserver_Concurrent 回调被并发调用时每次失败恰好一行、行与行不交错。
+func TestMilvusReadFailureObserver_Concurrent(t *testing.T) {
+	log := newMilvusTestLog(t)
+	observe := milvusReadFailureObserver(log.manager)
+	const workers, perWorker = 16, 25
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				err := status.Error(codes.PermissionDenied, leakServerText)
+				observe(mclient.ReadRecoveryEvent{Op: "Query", Collection: leakCollection, FirstErr: err, Err: err, Attempts: 1})
+				// 恢复成功的事件混在其中，不应写日志
+				observe(mclient.ReadRecoveryEvent{Op: "Search", Collection: leakCollection, FirstErr: err, Attempts: 2})
+			}
+		}()
+	}
+	wg.Wait()
+	got := readFailures(t, log)
+	if len(got) != workers*perWorker {
+		t.Fatalf("应写 %d 条失败日志，实际 %d 条", workers*perWorker, len(got))
+	}
+	for _, f := range got {
+		if f.op != "Query" || f.first != "grpc_permission_denied" || f.final != "grpc_permission_denied" || f.attempts != 1 {
+			t.Fatalf("失败日志字段不符: %+v", f)
+		}
+	}
+}
+
+// TestProvideMilvusComponent_EnabledRequiresLogger 启用时没有日志组件直接报错：不建池、不握手；未启用时不需要日志组件。
+func TestProvideMilvusComponent_EnabledRequiresLogger(t *testing.T) {
+	fake := startFakeMilvus(t, false)
+	pools := capturePools(t)
+
+	pool, _, err := ProvideMilvusComponent(loadConfig(t, nil, map[string]string{"milvus/milvus.yaml": milvusListYAML("", "default", fake.addr)}), nil)
+	if err == nil || pool != nil {
+		t.Fatalf("启用时 logger 为 nil 应返回错误，实际 pool=%v err=%v", pool, err)
+	}
+	if len(*pools) != 0 || len(fake.handshakes()) != 0 {
+		t.Error("没有日志组件时不应建池或握手")
+	}
+
+	clearEnv(t, milvusEnvKeys...)
+	pool, cleanup, err := ProvideMilvusComponent(loadConfig(t, []string{"milvus/milvus.yaml"}, nil), nil)
+	if err != nil || pool != nil {
+		t.Fatalf("未启用时应返回 nil, nil，实际 pool=%v err=%v", pool, err)
+	}
+	cleanup()
+}
+
+// readFake 进程内的 Milvus gRPC 服务端：实现握手、集合描述、Search、Query 和加载状态，供真实 provider + 组件客户端查询。
+// search / query 为 nil 时返回固定的正确结果（id=42）；否则按其返回值回复：gRPC 状态错误按传输层返回，其余按 Milvus 业务状态返回。
+type readFake struct {
+	milvuspb.UnimplementedMilvusServiceServer
+
+	addr string
+
+	mu            sync.Mutex
+	search, query func(ctx context.Context) error
+
+	connects, searches, queries atomic.Int32
+}
+
+func startReadFake(t *testing.T) *readFake {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &readFake{addr: lis.Addr().String()}
+	srv := grpc.NewServer()
+	milvuspb.RegisterMilvusServiceServer(srv, f)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+	return f
+}
+
+// set 换掉某个方法的行为（fn 为 nil 表示恢复正常）。
+func (f *readFake) set(which *func(context.Context) error, fn func(context.Context) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	*which = fn
+}
+
+func (f *readFake) call(ctx context.Context, which *func(context.Context) error) (*commonpb.Status, error) {
+	f.mu.Lock()
+	fn := *which
+	f.mu.Unlock()
+	if fn == nil {
+		return &commonpb.Status{}, nil
+	}
+	err := fn(ctx)
+	if err == nil {
+		return &commonpb.Status{}, nil
+	}
+	if _, ok := status.FromError(err); ok {
+		return nil, err
+	}
+	return merr.Status(err), nil
+}
+
+func (f *readFake) Connect(context.Context, *milvuspb.ConnectRequest) (*milvuspb.ConnectResponse, error) {
+	f.connects.Add(1)
+	return &milvuspb.ConnectResponse{Status: &commonpb.Status{}, Identifier: 1}, nil
+}
+
+func (f *readFake) DescribeCollection(_ context.Context, req *milvuspb.DescribeCollectionRequest) (*milvuspb.DescribeCollectionResponse, error) {
+	return &milvuspb.DescribeCollectionResponse{
+		Status:         &commonpb.Status{},
+		CollectionName: req.GetCollectionName(),
+		Schema: &schemapb.CollectionSchema{
+			Name: req.GetCollectionName(),
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "id", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+				{FieldID: 101, Name: "vec", DataType: schemapb.DataType_FloatVector, TypeParams: []*commonpb.KeyValuePair{
+					{Key: "dim", Value: "2"},
+				}},
+			},
+		},
+	}, nil
+}
+
+func (f *readFake) Search(ctx context.Context, _ *milvuspb.SearchRequest) (*milvuspb.SearchResults, error) {
+	f.searches.Add(1)
+	st, err := f.call(ctx, &f.search)
+	if err != nil {
+		return nil, err
+	}
+	if st.GetCode() != 0 {
+		return &milvuspb.SearchResults{Status: st}, nil
+	}
+	return &milvuspb.SearchResults{Status: st, Results: &schemapb.SearchResultData{
+		NumQueries: 1, TopK: 1, Topks: []int64{1}, Scores: []float32{0},
+		Ids: &schemapb.IDs{IdField: &schemapb.IDs_IntId{IntId: &schemapb.LongArray{Data: []int64{42}}}},
+	}}, nil
+}
+
+func (f *readFake) Query(ctx context.Context, _ *milvuspb.QueryRequest) (*milvuspb.QueryResults, error) {
+	f.queries.Add(1)
+	st, err := f.call(ctx, &f.query)
+	if err != nil {
+		return nil, err
+	}
+	if st.GetCode() != 0 {
+		return &milvuspb.QueryResults{Status: st}, nil
+	}
+	return &milvuspb.QueryResults{
+		Status:       st,
+		OutputFields: []string{"id"},
+		FieldsData: []*schemapb.FieldData{
+			{
+				Type: schemapb.DataType_Int64, FieldName: "id", FieldId: 100,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: []int64{42}}}}},
+			},
+		},
+	}, nil
+}
+
+func (f *readFake) GetLoadState(context.Context, *milvuspb.GetLoadStateRequest) (*milvuspb.GetLoadStateResponse, error) {
+	return &milvuspb.GetLoadStateResponse{Status: &commonpb.Status{}, State: commonpb.LoadState_LoadStateLoaded}, nil
+}
+
+// failWith 每次都返回 err。
+func failWith(err error) func(context.Context) error {
+	return func(context.Context) error { return err }
+}
+
+// blockUntilDone 挂起到请求 ctx 结束（客户端超时或取消），模拟服务端不响应；entered 非 nil 时先通知请求已到达。
+func blockUntilDone(entered chan<- struct{}) func(context.Context) error {
+	return func(ctx context.Context) error {
+		if entered != nil {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+		}
+		<-ctx.Done()
+		return status.FromContextError(ctx.Err()).Err()
+	}
+}
+
+// channelNotServiceable 真实重启后首次查询的服务端错误（merr 503），消息里带集合名和服务端原文。
+func channelNotServiceable() error {
+	return merr.WrapErrChannelNotAvailable(leakCollection, leakServerText)
+}
+
+// doSearch / doQuery 用敏感的集合名、表达式和向量发起查询；成功时同时校验返回的数据为 id=42。
+func doSearch(ctx context.Context, cli mclient.Client) error {
+	results, err := cli.Search(ctx, leakCollection, nil, nil, []entity.Vector{entity.FloatVector(leakVector)}, "vec", entity.L2, 1, leakExpr, nil)
+	if err != nil {
+		return err
+	}
+	if len(results) != 1 || results[0].ResultCount != 1 {
+		return fmt.Errorf("search 结果集不符：%d 个", len(results))
+	}
+	if id, err := results[0].IDs.GetAsInt64(0); err != nil || id != 42 {
+		return fmt.Errorf("search 结果应为 id=42，实际 %d（%v）", id, err)
+	}
+	return nil
+}
+
+func doQuery(ctx context.Context, cli mclient.Client) error {
+	cols, err := cli.Query(ctx, leakCollection, nil, leakExpr, []string{"id"})
+	if err != nil {
+		return err
+	}
+	if len(cols) != 1 || cols[0].Len() != 1 {
+		return fmt.Errorf("query 结果列不符：%d 列", len(cols))
+	}
+	if id, err := cols[0].GetAsInt64(0); err != nil || id != 42 {
+		return fmt.Errorf("query 结果应为 id=42，实际 %d（%v）", id, err)
+	}
+	return nil
+}
+
+// milvusReadOps Search / Query 两种只读调用。
+var milvusReadOps = []struct {
+	name  string
+	set   func(f *readFake, fn func(context.Context) error)
+	calls func(f *readFake) int32
+	do    func(ctx context.Context, cli mclient.Client) error
+}{
+	{"Search", func(f *readFake, fn func(context.Context) error) { f.set(&f.search, fn) }, func(f *readFake) int32 { return f.searches.Load() }, doSearch},
+	{"Query", func(f *readFake, fn func(context.Context) error) { f.set(&f.query, fn) }, func(f *readFake) int32 { return f.queries.Load() }, doQuery},
+}
+
+// newReadFixture 启动 fake，用 provider 按 milvus.list（客户端名与密码都是敏感标记）连上它，返回 fake、日志和池里的客户端。
+// 恢复用组件默认配置，不显式开关。
+func newReadFixture(t *testing.T) (*readFake, *milvusTestLog, mclient.Client) {
+	t.Helper()
+	fake := startReadFake(t)
+	appLog := newMilvusTestLog(t)
+	extra := "      username: \"root\"\n      password: \"" + leakSecret + "\"\n"
+	cfg := loadConfig(t, nil, map[string]string{"milvus/milvus.yaml": milvusListYAML(extra, leakEntryName, fake.addr)})
+	pool, cleanup, err := ProvideMilvusComponent(cfg, appLog.manager)
+	if err != nil {
+		t.Fatalf("应连接成功: %v", err)
+	}
+	t.Cleanup(cleanup)
+	cli, err := pool.Get(leakEntryName)
+	if err != nil {
+		t.Fatalf("应能取到客户端: %v", err)
+	}
+	return fake, appLog, cli
+}
+
+// requireUnwrapped 首次即失败、未进入恢复的错误原样返回，不是组件的恢复错误。
+func requireUnwrapped(t *testing.T, err error) {
+	t.Helper()
+	var recoveryErr *mclient.ReadRecoveryError
+	if err == nil {
+		t.Fatal("应返回错误")
+	}
+	if errors.As(err, &recoveryErr) {
+		t.Fatalf("首次即失败应原样返回，不应包装成恢复错误（最终分类 %s）", milvusReadErrorClass(err))
+	}
+}
+
+// TestMilvusReadFailureLog_FirstAttempt 首次查询直接成功不写日志；首次调用方超时、取消或不可恢复错误原样返回，
+// 恰好写一条日志，首次与最终分类相同、attempts=1；日志里没有地址、客户端名、集合名、表达式、向量、凭据和服务端原文。
+func TestMilvusReadFailureLog_FirstAttempt(t *testing.T) {
+	for _, op := range milvusReadOps {
+		t.Run(op.name+"/首次直接成功", func(t *testing.T) {
+			_, appLog, cli := newReadFixture(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := op.do(ctx, cli); err != nil {
+				t.Fatalf("应成功且数据正确，实际分类 %s", milvusReadErrorClass(err))
+			}
+			if n := len(appLog.lines(t)); n != 0 {
+				t.Errorf("首次直接成功不应写日志，实际 %d 行", n)
+			}
+		})
+
+		t.Run(op.name+"/调用方超时", func(t *testing.T) {
+			fake, appLog, cli := newReadFixture(t)
+			op.set(fake, blockUntilDone(nil))
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			defer cancel()
+			err := op.do(ctx, cli)
+			requireUnwrapped(t, err)
+			if !errors.Is(err, context.DeadlineExceeded) && status.Code(err) != codes.DeadlineExceeded {
+				t.Errorf("应返回超时错误，实际 gRPC 状态 %s", status.Code(err))
+			}
+			requireOneReadFailure(t, appLog, op.name, "deadline_exceeded", "deadline_exceeded", 1, fake.addr)
+		})
+
+		t.Run(op.name+"/调用方取消", func(t *testing.T) {
+			fake, appLog, cli := newReadFixture(t)
+			entered := make(chan struct{}, 1)
+			op.set(fake, blockUntilDone(entered))
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- op.do(ctx, cli) }()
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("查询没有到达 fake 服务端")
+			}
+			cancel()
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("取消后查询应及时返回")
+			}
+			requireUnwrapped(t, err)
+			if !errors.Is(err, context.Canceled) && status.Code(err) != codes.Canceled {
+				t.Errorf("应返回取消错误，实际 gRPC 状态 %s", status.Code(err))
+			}
+			requireOneReadFailure(t, appLog, op.name, "canceled", "canceled", 1, fake.addr)
+		})
+
+		t.Run(op.name+"/权限错误", func(t *testing.T) {
+			fake, appLog, cli := newReadFixture(t)
+			op.set(fake, failWith(status.Error(codes.PermissionDenied, leakServerText)))
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := op.do(ctx, cli)
+			requireUnwrapped(t, err)
+			if status.Code(err) != codes.PermissionDenied {
+				t.Errorf("应返回 PermissionDenied，实际 %s", status.Code(err))
+			}
+			requireOneReadFailure(t, appLog, op.name, "grpc_permission_denied", "grpc_permission_denied", 1, fake.addr)
+			if n := op.calls(fake); n != 1 {
+				t.Errorf("不可恢复错误不应重试，实际查询 %d 次", n)
+			}
+		})
+
+		t.Run(op.name+"/集合未加载", func(t *testing.T) {
+			fake, appLog, cli := newReadFixture(t)
+			op.set(fake, failWith(merr.WrapErrCollectionNotLoaded(leakCollection, leakServerText)))
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := op.do(ctx, cli)
+			requireUnwrapped(t, err)
+			if !errors.Is(err, merr.ErrCollectionNotLoaded) {
+				t.Errorf("应原样返回集合未加载错误，实际分类 %s", milvusReadErrorClass(err))
+			}
+			requireOneReadFailure(t, appLog, op.name, "other", "other", 1, fake.addr)
+			if n := op.calls(fake); n != 1 {
+				t.Errorf("不可恢复错误不应重试，实际查询 %d 次", n)
+			}
+		})
+	}
+}
+
+// TestMilvusReadFailureLog_RecoveryCutShortByCaller 首次遇恢复白名单错误进入恢复，调用方期限（300ms）在 5 秒等待间隔内先到：
+// 返回组件的恢复错误（最终原因为调用方超时，gRPC 状态 DeadlineExceeded），及时返回、没有重建；
+// 恰好写一条日志，首次分类为白名单错误、最终分类为超时（不把首次的可恢复错误当成最终原因）。
+func TestMilvusReadFailureLog_RecoveryCutShortByCaller(t *testing.T) {
+	cases := []struct {
+		op        int
+		first     func() error
+		sentinel  error
+		wantFirst string
+	}{
+		{0, channelNotServiceable, merr.ErrChannelNotAvailable, "channel_not_available"},
+		{1, func() error { return merr.WrapErrChannelTSafeStalled(leakCollection, leakServerText) }, merr.ErrChannelTSafeStalled, "channel_tsafe_stalled"},
+		{0, func() error { return merr.WrapErrServiceNotReady("proxy", 1, leakServerText) }, merr.ErrServiceNotReady, "service_not_ready"},
+		{1, func() error { return merr.WrapErrServiceUnavailable(leakServerText) }, merr.ErrServiceUnavailable, "service_unavailable"},
+	}
+	for _, c := range cases {
+		op := milvusReadOps[c.op]
+		t.Run(op.name+"/"+c.wantFirst, func(t *testing.T) {
+			fake, appLog, cli := newReadFixture(t)
+			op.set(fake, failWith(c.first()))
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			defer cancel()
+			start := time.Now()
+			err := op.do(ctx, cli)
+			if elapsed := time.Since(start); elapsed >= mclient.ReadRecoveryInterval {
+				t.Errorf("调用方期限到了应及时返回，实际 %v", elapsed)
+			}
+			var recoveryErr *mclient.ReadRecoveryError
+			if !errors.As(err, &recoveryErr) {
+				t.Fatalf("应进入恢复后失败，实际分类 %s", milvusReadErrorClass(err))
+			}
+			if !errors.Is(err, context.DeadlineExceeded) || status.Code(err) != codes.DeadlineExceeded {
+				t.Errorf("最终原因应为调用方超时，实际 gRPC 状态 %s", status.Code(err))
+			}
+			if !errors.Is(recoveryErr.First, c.sentinel) || recoveryErr.Attempts != 1 {
+				t.Errorf("首次错误应为白名单错误、只查询一次，实际 attempts=%d", recoveryErr.Attempts)
+			}
+			if n := fake.connects.Load(); n != 1 {
+				t.Errorf("等待间隔内被截断不应重建连接，实际握手 %d 次", n)
+			}
+			requireOneReadFailure(t, appLog, op.name, c.wantFirst, "deadline_exceeded", 1, fake.addr)
+		})
+	}
+}
+
+// TestMilvusReadFailureLog_ConcurrentRequests 同一客户端上并发的失败请求各写一条完整的日志。
+func TestMilvusReadFailureLog_ConcurrentRequests(t *testing.T) {
+	fake, appLog, cli := newReadFixture(t)
+	fake.set(&fake.search, failWith(status.Error(codes.PermissionDenied, leakServerText)))
+	fake.set(&fake.query, failWith(status.Error(codes.InvalidArgument, leakServerText)))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, 2*n)
+	for i := 0; i < n; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			errs <- doSearch(ctx, cli)
+		}()
+		go func() {
+			defer wg.Done()
+			errs <- doQuery(ctx, cli)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if code := status.Code(err); code != codes.PermissionDenied && code != codes.InvalidArgument {
+			t.Errorf("应原样返回服务端错误，实际 %s", code)
+		}
+	}
+
+	counts := map[string]int{}
+	for _, f := range readFailures(t, appLog, fake.addr) {
+		counts[f.op+"/"+f.first+"/"+f.final]++
+	}
+	if counts["Search/grpc_permission_denied/grpc_permission_denied"] != n || counts["Query/grpc_invalid_argument/grpc_invalid_argument"] != n || len(counts) != 2 {
+		t.Errorf("每个失败请求应各写一条日志，实际 %v", counts)
+	}
+}
+
+// TestBuildComponents_MilvusNextRequestAfterFailure 经 wire 生成的 buildComponents 走完整启动（真实 logger.yaml / milvus.yaml，
+// 失败日志落在默认的 logs/app.log），始终用同一个池里的同一个客户端，恢复用组件默认配置：
+//   - 请求 A 首次遇 503 进入恢复，调用方 300ms 期限先到而失败：返回恢复错误，写一条失败日志；
+//   - 随后空闲 1 秒：这 1 秒内没有后台重连或自动重放（握手、查询次数不变），不写日志。只观察 1 秒，
+//     不能单独证明 5 秒级延迟后也没有后台恢复（B 的重建计数也发现不了：代际已变时 B 会跳过自己的重建），
+//     完整间隔下「无后台恢复」由组件自身的测试覆盖；
+//   - 请求 B 首次仍遇 503，按组件真实的 5 秒间隔重建一次后成功、数据正确，不写失败日志（客户端没有因 A 失败被关闭）；
+//   - 请求 C（Query）首次直接成功，不写日志。
+func TestBuildComponents_MilvusNextRequestAfterFailure(t *testing.T) {
+	fake := startReadFake(t)
+	clearEnv(t, milvusEnvKeys...)
+	t.Setenv("MILVUS_ENABLE", "true")
+	t.Setenv("MILVUS_ADDRESS", fake.addr)
+	t.Setenv("MILVUS_PASSWORD", leakSecret)
+	dir := loadConfigDir(t, []string{"logger/logger.yaml", "milvus/milvus.yaml"}, disabledStorageConfig)
+	workDir := t.TempDir()
+	t.Chdir(workDir) // 日志组件把 logs/ 写在当前目录
+
+	components, cleanup, err := buildComponents(&ConfigOptions{ConfigPath: dir})
+	if err != nil {
+		t.Fatalf("buildComponents 应成功: %v", err)
+	}
+	t.Cleanup(cleanup)
+	appLog := &milvusTestLog{manager: components.Logger, path: filepath.Join(workDir, "logs", "app.log")}
+	cli, err := components.Milvus.Get("default")
+	if err != nil {
+		t.Fatalf("应能取到 default 客户端: %v", err)
+	}
+
+	// 请求 A
+	fake.set(&fake.search, failWith(channelNotServiceable()))
+	ctxA, cancelA := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancelA()
+	errA := doSearch(ctxA, cli)
+	var recoveryErr *mclient.ReadRecoveryError
+	if !errors.As(errA, &recoveryErr) || !errors.Is(errA, context.DeadlineExceeded) {
+		t.Fatalf("A 应在恢复中因调用方期限失败，实际分类 %s", milvusReadErrorClass(errA))
+	}
+	requireOneReadFailure(t, appLog, "Search", "channel_not_available", "deadline_exceeded", 1, fake.addr)
+
+	// 空闲 1 秒（只覆盖这 1 秒，见函数注释）
+	connects, searches := fake.connects.Load(), fake.searches.Load()
+	time.Sleep(time.Second)
+	if fake.connects.Load() != connects || fake.searches.Load() != searches {
+		t.Error("A 失败后不应有后台重连或自动重放")
+	}
+
+	// 请求 B：第一次查询仍遇 503，之后恢复正常
+	var remaining atomic.Int32
+	remaining.Store(1)
+	fake.set(&fake.search, func(context.Context) error {
+		if remaining.Add(-1) >= 0 {
+			return channelNotServiceable()
+		}
+		return nil
+	})
+	ctxB, cancelB := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelB()
+	start := time.Now()
+	if err := doSearch(ctxB, cli); err != nil {
+		t.Fatalf("B 应经恢复成功且数据正确，实际分类 %s", milvusReadErrorClass(err))
+	}
+	if elapsed := time.Since(start); elapsed < mclient.ReadRecoveryInterval {
+		t.Errorf("B 应按组件默认的恢复间隔等待后重试，实际 %v", elapsed)
+	}
+	if got := fake.connects.Load(); got != connects+1 {
+		t.Errorf("B 应恰好重建一次连接，实际新增握手 %d 次", got-connects)
+	}
+	if got := fake.searches.Load(); got != searches+2 {
+		t.Errorf("B 应先遇 503 再成功（共 2 次查询），实际 %d 次", got-searches)
+	}
+
+	// 请求 C
+	ctxC, cancelC := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelC()
+	if err := doQuery(ctxC, cli); err != nil {
+		t.Fatalf("C 应直接成功且数据正确，实际分类 %s", milvusReadErrorClass(err))
+	}
+
+	if again, err := components.Milvus.Get("default"); err != nil || again != cli {
+		t.Error("整个过程应始终是池里同一个客户端")
+	}
+	requireOneReadFailure(t, appLog, "Search", "channel_not_available", "deadline_exceeded", 1, fake.addr)
+}
+{{- end }}

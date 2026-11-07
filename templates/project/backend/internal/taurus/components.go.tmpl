@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/stones-hub/taurus-pro-common/pkg/cron"
@@ -39,10 +38,15 @@ import (
 {{- end }}
 {{- if .Has.milvus }}
 
+	"errors"
 	"math"
+	"strings"
 
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/stones-hub/taurus-pro-milvus/pkg/milvus"
 	mclient "github.com/stones-hub/taurus-pro-milvus/pkg/milvus/client"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 {{- end }}
 )
 
@@ -200,17 +204,7 @@ func ProvideRedisComponent(cfg *config.Config) (*redisx.RedisClient, func(), err
 		return nil, func() {}, nil
 	}
 
-	level := redisx.LogLevelInfo
-	switch cfg.GetString("redis.logger_level") {
-	case "debug":
-		level = redisx.LogLevelDebug
-	case "info":
-		level = redisx.LogLevelInfo
-	case "warn":
-		level = redisx.LogLevelWarn
-	case "error":
-		level = redisx.LogLevelError
-	}
+	level := redisLogLevel(cfg.GetString("redis.logger_level"))
 
 	formatter := redisx.DefaultLogFormatter
 	if cfg.GetString("redis.logger_fomatter") == "json" {
@@ -231,8 +225,8 @@ func ProvideRedisComponent(cfg *config.Config) (*redisx.RedisClient, func(), err
 
 	if err := redisx.InitRedis(
 		redisx.WithAddrs(cfg.GetStringSlice("redis.address")...),
-		// 占位符默认值用了一个空格（配置库不允许空默认值），这里统一 TrimSpace
-		redisx.WithPassword(strings.TrimSpace(cfg.GetString("redis.password"))),
+		// 占位符默认值用了一个空格（配置库不允许空默认值）：只有空白算没配，真实密码原样传（见 emptyIfBlank）
+		redisx.WithPassword(emptyIfBlank(cfg.GetString("redis.password"))),
 		redisx.WithDB(cfg.GetInt("redis.db")),
 		redisx.WithPoolSize(cfg.GetInt("redis.pool_size")),
 		redisx.WithMinIdleConns(cfg.GetInt("redis.min_idle_conns")),
@@ -251,6 +245,23 @@ func ProvideRedisComponent(cfg *config.Config) (*redisx.RedisClient, func(), err
 	return client, boundedCleanup("redis", redisCleanupTimeout, func(context.Context) error {
 		return client.Close()
 	}), nil
+}
+
+// redisLogLevel 把 redis.logger_level 转成组件日志级别；没配或写错时用 warn。
+//
+// 不默认 info：组件在 info 级别会把每条命令连同参数写进日志（例如会话键 auth:jti:*、
+// 用户的认证版本号），这些不该常态落盘；排查问题时再临时调成 info / debug。
+func redisLogLevel(name string) redisx.LogLevel {
+	switch name {
+	case "debug":
+		return redisx.LogLevelDebug
+	case "info":
+		return redisx.LogLevelInfo
+	case "error":
+		return redisx.LogLevelError
+	default:
+		return redisx.LogLevelWarn
+	}
 }
 
 // ProvideHttpComponent 注入 HTTP 服务模块
@@ -357,12 +368,15 @@ func ProvideConsulComponent(cfg *config.Config) (*consul.Client, func(), error) 
 		consul.WithRetryTime(time.Duration(cfg.GetInt("consul.client.retry_time")) * time.Second),
 		consul.WithMaxRetries(cfg.GetInt("consul.client.max_retrys")),
 	}
-	if token := cfg.GetString("consul.client.token"); token != "" {
-		options = append(options, consul.WithToken(token))
+	authOptions, err := consulAuthOptions(
+		cfg.GetString("consul.client.token"),
+		cfg.GetString("consul.client.http_basic_auth.username"),
+		cfg.GetString("consul.client.http_basic_auth.password"),
+	)
+	if err != nil {
+		return nil, func() {}, err
 	}
-	if user, pass := cfg.GetString("consul.client.http_basic_auth.username"), cfg.GetString("consul.client.http_basic_auth.password"); user != "" && pass != "" {
-		options = append(options, consul.WithBasicAuth(user, pass))
-	}
+	options = append(options, authOptions...)
 
 	client, err := consul.NewClient(options...)
 	if err != nil {
@@ -435,6 +449,28 @@ func ProvideConsulComponent(cfg *config.Config) (*consul.Client, func(), error) 
 		return registration.deregister(ctx)
 	}), nil
 }
+
+// consulAuthOptions 把配置里的 ACL token 和 HTTP Basic Auth 转成客户端选项。
+//
+// 三个值都先过 emptyIfBlank：只有空白（模板占位用的一个空格）算没配，不发出请求头；
+// 真实值原样传给组件，首尾空格也保留。token 没配就不带 X-Consul-Token。
+// Basic Auth 必须用户名和密码都配才生效；只配了一半直接报错，不静默丢掉——
+// 否则开了 basic auth 的 Consul 会以 401 拒绝，排查时很难想到是配置被忽略了。
+// 错误里只有字段名，不带任何值。
+func consulAuthOptions(token, username, password string) ([]consul.Option, error) {
+	var options []consul.Option
+	if token = emptyIfBlank(token); token != "" {
+		options = append(options, consul.WithToken(token))
+	}
+	username, password = emptyIfBlank(username), emptyIfBlank(password)
+	switch {
+	case username != "" && password != "":
+		options = append(options, consul.WithBasicAuth(username, password))
+	case username != "" || password != "":
+		return nil, fmt.Errorf("consul.client.http_basic_auth 的 username 和 password 必须同时配置（CONSUL_USERNAME / CONSUL_PASSWORD）")
+	}
+	return options, nil
+}
 {{- end }}
 {{- if .Has.opentelemetry }}
 
@@ -442,7 +478,8 @@ func ProvideConsulComponent(cfg *config.Config) (*consul.Client, func(), error) 
 //
 // cleanup 显式调用 Shutdown(ctx)：先 flush 未上报的 span 再关闭 exporter，受 otelCleanupTimeout 限制，
 // 失败（collector 不可达、超时）记日志。不用组件返回的 cleanup：v0.1.0 里它用的是不限时的 ctx；
-// v0.2.0 起它自带上限（组件默认 5 秒），这里仍显式调用，让上限由 otelCleanupTimeout 决定并计入退出预算。
+// 自 v0.2.0 起它自带上限（组件默认 5 秒，生成项目当前依赖的 v0.2.1 沿用这一行为），这里仍显式调用，
+// 让上限由 otelCleanupTimeout 决定并计入退出预算。
 func ProvideOtelComponent(cfg *config.Config) (*otelemetry.OTelProvider, func(), error) {
 	if !cfg.GetBool("otel.enable") {
 		return nil, func() {}, nil
@@ -603,87 +640,346 @@ func ProvideGRPCComponent(cfg *config.Config) (*grpcserver.Server, func(), error
 {{- end }}
 {{- if .Has.milvus }}
 
-// ProvideMilvusComponent 注入 Milvus 客户端池。
-// milvus.enable=false 或 milvus.list 为空时返回 nil，不影响启动。
-func ProvideMilvusComponent(cfg *config.Config) (milvus.Pool, func(), error) {
+// newMilvusPool 创建 Milvus 客户端池。测试替换它，用公开的 Pool 接口确认失败路径确实关闭了池。
+var newMilvusPool = milvus.NewPool
+
+// ProvideMilvusComponent 注入 Milvus 客户端池。milvus.enable=false 时返回 nil，不影响启动。
+//
+// milvus.enable=true 时严格校验、连不上就让启动失败（与 Consul 一致），不再「跳过 + 打日志」：
+// 带着缺客户端的池启动，问题要到业务第一次 Get 才暴露。具体拒绝的情形见 milvusEntries；
+// 每个客户端用组件默认的建连上限（milvus.DefaultCreateTimeout，v0.3.0 为 10 秒，含握手）。
+// 任何一步失败都先关闭已经建好的池（不泄漏连接），再返回错误，由 wire 生成的回滚
+// 按逆序清理此前已初始化的组件（例如注销 Consul 注册）。错误信息不含密码、API key 和地址。
+//
+// Search / Query 使用组件默认启用的只读恢复（这里不显式开关），每个客户端挂上 milvusReadFailureObserver：
+// 调用最终失败时往 logger 的默认日志写一条脱敏的 ERROR（见该函数）。logger 由 wire 传入已初始化的日志组件；
+// 启用时为 nil 直接报错，不静默丢掉失败日志。
+func ProvideMilvusComponent(cfg *config.Config, logger *logx.Manager) (milvus.Pool, func(), error) {
 	if !cfg.GetBool("milvus.enable") {
 		return nil, func() {}, nil
 	}
-
-	rawList, ok := cfg.Get("milvus.list").([]interface{})
-	if !ok || len(rawList) == 0 {
-		return nil, func() {}, nil
+	if logger == nil {
+		return nil, func() {}, fmt.Errorf("milvus.enable=true，但没有传入日志组件（Search/Query 的失败日志无处记录）")
 	}
 
-	pool := milvus.NewPool()
-	for _, raw := range rawList {
-		item, ok := raw.(map[string]interface{})
-		if !ok {
-			continue
-		}
+	entries, err := milvusEntries(cfg.Get("milvus.list"))
+	if err != nil {
+		return nil, func() {}, err
+	}
 
-		name := asString(item["name"])
-		if name == "" {
-			log.Printf("%s🔗 -> Milvus client name is empty, skipped. %s\n", colorRed, colorReset)
-			continue
-		}
-
-		opts := make([]mclient.Option, 0, 8)
-		if address := asString(item["address"]); address != "" {
-			opts = append(opts, mclient.WithAddress(address))
-		}
-		if apiKey := asString(item["api_key"]); apiKey != "" {
-			opts = append(opts, mclient.WithAPIKey(apiKey))
-		} else if username, password := asString(item["username"]), asString(item["password"]); username != "" || password != "" {
-			opts = append(opts, mclient.WithAuth(username, password))
-		}
-		if dbName := asString(item["db_name"]); dbName != "" {
-			opts = append(opts, mclient.WithDatabase(dbName))
-		}
-		if asBool(item["enable_tls_auth"]) {
-			opts = append(opts, mclient.WithTLS())
-		}
-
-		maxRetry := uint(3)
-		if retry := asInt(item["max_retry"]); retry > 0 {
-			maxRetry = uint(retry)
-		}
-		opts = append(opts, mclient.WithRetry(maxRetry, asDuration(item["max_retry_backoff"], 30*time.Second)))
-
-		maxRecvMsgSize := math.MaxInt32
-		if size := asInt(item["max_recv_msg_size"]); size > 0 {
-			maxRecvMsgSize = size
-		}
-
-		permitWithoutStream := true
-		if v, ok := item["permit_without_stream"].(bool); ok {
-			permitWithoutStream = v
-		}
-
-		opts = append(opts, mclient.WithGrpcOpts(
-			asDuration(item["keepalive_time"], 30*time.Second),
-			asDuration(item["keepalive_timeout"], 10*time.Second),
-			permitWithoutStream,
-			asDuration(item["base_delay"], time.Second),
-			asFloat(item["multiplier"], 1.6),
-			asFloat(item["jitter"], 0.2),
-			asDuration(item["max_delay"], 120*time.Second),
-			asDuration(item["min_connect_timeout"], 20*time.Second),
-			maxRecvMsgSize,
-		))
-
-		if asBool(item["disable_conn"]) {
-			opts = append(opts, mclient.WithDisableConn(true))
-		}
-
-		if err := pool.Add(name, opts...); err != nil {
-			log.Printf("%s🔗 -> Milvus add client %q failed: %v. %s\n", colorRed, name, err, colorReset)
+	observer := milvusReadFailureObserver(logger)
+	pool := newMilvusPool()
+	// Close 是终态；v0.3.0 会直接取消在途的 Search / Query 和恢复等待，其它调用仍按原有语义等它结束（见 milvus.yaml）。
+	// 限时，与正常退出用同一个上限
+	closePool := boundedCleanup("milvus", milvusCleanupTimeout, func(context.Context) error {
+		return pool.Close()
+	})
+	for _, entry := range entries {
+		entry.opts = append(entry.opts, mclient.WithReadRecoveryObserver(observer))
+		if err := pool.Add(entry.name, entry.opts...); err != nil {
+			closePool()
+			// 不拼原始错误：SDK / 服务端的错误文本可能带地址等配置，只给分类
+			return nil, func() {}, fmt.Errorf("milvus.list[%d]（name=%q）连接失败：%s", entry.index, entry.name, milvusConnectFailure(err))
 		}
 	}
 
 	log.Printf("%s🔗 -> Milvus all initialized successfully. %s\n", colorGreen, colorReset)
-	return pool, boundedCleanup("milvus", milvusCleanupTimeout, func(context.Context) error {
-		return pool.Close()
-	}), nil
+	return pool, closePool, nil
+}
+
+// milvusEntry milvus.list 中校验通过的一项。
+type milvusEntry struct {
+	index int
+	name  string
+	opts  []mclient.Option
+}
+
+// milvusEntries 校验 milvus.list 并转成建连选项，全部通过才开始连接。以下情形一律返回错误：
+//   - milvus.list 缺失、不是列表或为空；条目不是映射；
+//   - name 不是字符串、为空或只有空白、带首尾空白（Get 时按原样精确匹配，带空白的名字几乎一定是写错了）；
+//   - name 重复：按原样逐字比较，区分大小写（上一条已拒绝首尾空白，"a" 与 " a" 不会同时通过）；
+//   - address 为空；字段类型不对（见 milvusClientOptions）；disable_conn=true。
+//
+// 错误信息只含下标、name 和字段名，不含字段值（可能是密码 / API key）。
+func milvusEntries(raw interface{}) ([]milvusEntry, error) {
+	list, ok := raw.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("milvus.enable=true，但 milvus.list 缺失或不是列表")
+	}
+	if len(list) == 0 {
+		return nil, fmt.Errorf("milvus.enable=true，但 milvus.list 为空")
+	}
+
+	entries := make([]milvusEntry, 0, len(list))
+	seen := make(map[string]bool, len(list))
+	for i, rawItem := range list {
+		item, ok := rawItem.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("milvus.list[%d] 格式不对：应为包含 name、address 等字段的映射", i)
+		}
+		name, ok := item["name"].(string)
+		if !ok || strings.TrimSpace(name) == "" {
+			return nil, fmt.Errorf("milvus.list[%d] 的 name 为空或不是字符串", i)
+		}
+		if strings.TrimSpace(name) != name {
+			return nil, fmt.Errorf("milvus.list[%d] 的 name %q 带首尾空白", i, name)
+		}
+		if seen[name] {
+			return nil, fmt.Errorf("milvus.list[%d] 的 name %q 与前面的条目重复", i, name)
+		}
+		seen[name] = true
+
+		opts, err := milvusClientOptions(item)
+		if err != nil {
+			return nil, fmt.Errorf("milvus.list[%d]（name=%q）%v", i, name, err)
+		}
+		entries = append(entries, milvusEntry{index: i, name: name, opts: opts})
+	}
+	return entries, nil
+}
+
+// milvusClientOptions 把一个 milvus.list 条目转成客户端选项。
+//
+// 认证（凭据先过 emptyIfBlank：只有空白算没配，真实值原样传，首尾空格也保留）：
+//   - 配了 api_key：用 API key，忽略用户名密码（组件的 WithAPIKey 会清掉它们）；
+//   - 否则配了 password：用户名 + 密码，此时 username 不能为空；
+//   - 都没配：不带认证头。只有用户名（例如默认的 root）不算配置了认证——Milvus 认证必须有密码。
+//
+// disable_conn=true 会让 SDK 跳过建连握手（ConnectRequest），认证、库名都不再在启动时校验，
+// 启用时一律拒绝。enable_tls_auth 只开单向 TLS（系统信任库，组件公开选项不支持 mTLS / 自定义 CA）。
+// max_retry / max_retry_backoff 照传，但当前 SDK v2.6.5 不应用它们（见 milvus.yaml 注释）。
+func milvusClientOptions(item map[string]interface{}) ([]mclient.Option, error) {
+	address, err := milvusString(item, "address")
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(address) == "" {
+		return nil, fmt.Errorf("address 为空")
+	}
+	opts := []mclient.Option{mclient.WithAddress(address)}
+
+	var creds [3]string
+	for i, key := range []string{"api_key", "username", "password"} {
+		v, err := milvusString(item, key)
+		if err != nil {
+			return nil, err
+		}
+		creds[i] = emptyIfBlank(v)
+	}
+	apiKey, username, password := creds[0], creds[1], creds[2]
+	switch {
+	case apiKey != "":
+		opts = append(opts, mclient.WithAPIKey(apiKey))
+	case password != "":
+		if username == "" {
+			return nil, fmt.Errorf("配置了 password 但 username 为空")
+		}
+		opts = append(opts, mclient.WithAuth(username, password))
+	}
+
+	dbName, err := milvusString(item, "db_name")
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(dbName) != "" {
+		opts = append(opts, mclient.WithDatabase(dbName))
+	}
+
+	tlsOn, err := milvusBool(item, "enable_tls_auth", false)
+	if err != nil {
+		return nil, err
+	}
+	if tlsOn {
+		opts = append(opts, mclient.WithTLS())
+	}
+
+	disableConn, err := milvusBool(item, "disable_conn", false)
+	if err != nil {
+		return nil, err
+	}
+	if disableConn {
+		return nil, fmt.Errorf("disable_conn=true 会跳过建连握手（不校验认证和库名），启用 Milvus 时不允许")
+	}
+
+	maxRetry := uint(3)
+	if retry := asInt(item["max_retry"]); retry > 0 {
+		maxRetry = uint(retry)
+	}
+	opts = append(opts, mclient.WithRetry(maxRetry, asDuration(item["max_retry_backoff"], 30*time.Second)))
+
+	maxRecvMsgSize := math.MaxInt32
+	if size := asInt(item["max_recv_msg_size"]); size > 0 {
+		maxRecvMsgSize = size
+	}
+
+	permitWithoutStream, err := milvusBool(item, "permit_without_stream", true)
+	if err != nil {
+		return nil, err
+	}
+
+	opts = append(opts, mclient.WithGrpcOpts(
+		asDuration(item["keepalive_time"], 30*time.Second),
+		asDuration(item["keepalive_timeout"], 10*time.Second),
+		permitWithoutStream,
+		asDuration(item["base_delay"], time.Second),
+		asFloat(item["multiplier"], 1.6),
+		asFloat(item["jitter"], 0.2),
+		asDuration(item["max_delay"], 120*time.Second),
+		asDuration(item["min_connect_timeout"], 10*time.Second),
+		maxRecvMsgSize,
+	))
+	return opts, nil
+}
+
+// milvusString 取条目里的字符串字段：没写或写成空值返回 ""；写了但不是字符串返回错误
+// （例如密码没加引号被 YAML 解析成数字），不静默当成没配。错误里不带值。
+func milvusString(item map[string]interface{}, key string) (string, error) {
+	v, ok := item[key]
+	if !ok || v == nil {
+		return "", nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("%s 必须是字符串（加引号）", key)
+	}
+	return s, nil
+}
+
+// milvusBool 取条目里的布尔开关：没写用默认值；写了但不是 true/false 返回错误，
+// 避免 "true" 之类的写法被静默当成 false（例如 TLS 没开）。
+func milvusBool(item map[string]interface{}, key string, def bool) (bool, error) {
+	v, ok := item[key]
+	if !ok || v == nil {
+		return def, nil
+	}
+	b, ok := v.(bool)
+	if !ok {
+		return false, fmt.Errorf("%s 必须是 true 或 false（不加引号）", key)
+	}
+	return b, nil
+}
+
+// milvusConnectFailure 把建连错误归成一类说明，不带原始错误文本。
+func milvusConnectFailure(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return fmt.Sprintf("建连或握手超时（上限 %s），检查地址、网络和 Milvus 状态", milvus.DefaultCreateTimeout)
+	case errors.Is(err, context.Canceled):
+		return "建连被取消"
+	}
+	switch code := status.Code(err); code {
+	case codes.Unknown, codes.OK:
+		return "建连或握手失败，检查地址、认证、库名和 TLS 配置"
+	default:
+		return fmt.Sprintf("服务端返回 gRPC 状态 %s，检查认证、库名和 TLS 配置", code)
+	}
+}
+
+// milvusReadFailedFormat Search / Query 最终失败日志的固定格式：只有操作名、首次与最终错误分类、
+// 执行次数和耗时，取值都来自固定词表或整数。执行次数是越过恢复门禁、执行查询函数的次数，
+// 不是服务端收到的 RPC 次数（可能在本地构建请求阶段就失败），也不含 SDK 内部的重试。
+const milvusReadFailedFormat = "milvus_read_failed op=%s first_class=%s final_class=%s attempts=%d elapsed_ms=%d"
+
+// milvusReadFailureObserver 返回挂到 milvus.list 里每个 Milvus 客户端上的只读恢复观察回调。
+//
+// 组件在 Search / Query 除首次直接成功外的每个出口同步回调一次；这里只在最终失败（ev.Err != nil）时
+// 往默认日志（logger.yaml 里 name 为 default 的那个，模板默认 logs/app.log）写一条 ERROR，恢复成功不写。
+// 刻意不记客户端名、地址、集合名、过滤表达式、向量和错误原文（服务端错误文本可能回显这些内容），
+// 也不调用错误的 Error()：分类只走 errors.Is / errors.As。回调可能被并发调用，日志组件写入自带锁。
+// 写入沿用现有同步文件日志，不排队、不重试；它只用于排查，不是失败请求的补偿记录。
+//
+// 边界（这里不额外处理）：
+//   - 只有 ProvideMilvusComponent 按 milvus.list 建的客户端挂了它；业务运行时自己 pool.Add 的客户端
+//     不会自动挂，需要失败日志时由业务自行接入同样脱敏的日志；
+//   - 删掉 logger.yaml 里的 default 项时日志组件可能回退到控制台，default 的级别配得比 ERROR 高时这条会被过滤；
+//   - 写入错误被忽略，不保证可靠落盘；连接池的限时 cleanup 到期后不保证迟到的回调都已结束，
+//     关闭连接池也不等于日志已经刷盘。
+func milvusReadFailureObserver(logger *logx.Manager) func(mclient.ReadRecoveryEvent) {
+	return func(ev mclient.ReadRecoveryEvent) {
+		if ev.Err == nil {
+			return
+		}
+		logger.LError("default", milvusReadFailedFormat,
+			milvusReadOp(ev.Op), milvusReadErrorClass(ev.FirstErr), milvusReadErrorClass(ev.Err),
+			ev.Attempts, ev.Elapsed.Milliseconds())
+	}
+}
+
+// milvusReadOp 把事件里的操作名收敛到固定取值。
+func milvusReadOp(op string) string {
+	switch op {
+	case "Search", "Query":
+		return op
+	default:
+		return "unknown"
+	}
+}
+
+// milvusReadErrorClass 把 Search / Query 的错误归成固定的分类名，不读取错误文本。
+//
+// 进入恢复后失败的 *ReadRecoveryError 按它的最终原因 Last 分类（首次错误多半是可恢复的，不能当成最终原因）。
+// 先用 errors.Is 认组件的终止原因、ctx 取消 / 超时和组件恢复白名单里的 Milvus 错误码（1/2/503/505），
+// 再按 gRPC 状态码兜底；gRPC 状态通过 errors.As 直接取，不走 status.Code（它会调用 Error()）。
+// 其余一律 other（含客户端已关闭、未列出的 Milvus 业务错误）。
+func milvusReadErrorClass(err error) string {
+	var recoveryErr *mclient.ReadRecoveryError
+	if errors.As(err, &recoveryErr) {
+		err = recoveryErr.Last
+	}
+	switch {
+	case err == nil:
+		return "other"
+	case errors.Is(err, mclient.ErrReadRecoveryExhausted):
+		return "recovery_exhausted"
+	case errors.Is(err, mclient.ErrReadRecoveryDatabaseChanged):
+		return "database_changed"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline_exceeded"
+	case errors.Is(err, merr.ErrServiceNotReady):
+		return "service_not_ready"
+	case errors.Is(err, merr.ErrServiceUnavailable):
+		return "service_unavailable"
+	case errors.Is(err, merr.ErrChannelNotAvailable):
+		return "channel_not_available"
+	case errors.Is(err, merr.ErrChannelTSafeStalled):
+		return "channel_tsafe_stalled"
+	}
+
+	var withStatus interface{ GRPCStatus() *status.Status }
+	if !errors.As(err, &withStatus) {
+		return "other"
+	}
+	st := withStatus.GRPCStatus()
+	if st == nil {
+		return "other"
+	}
+	switch st.Code() {
+	case codes.Canceled:
+		return "canceled"
+	case codes.DeadlineExceeded:
+		return "deadline_exceeded"
+	case codes.Unavailable:
+		return "grpc_unavailable"
+	case codes.Unauthenticated:
+		return "grpc_unauthenticated"
+	case codes.PermissionDenied:
+		return "grpc_permission_denied"
+	case codes.InvalidArgument:
+		return "grpc_invalid_argument"
+	case codes.NotFound:
+		return "grpc_not_found"
+	case codes.FailedPrecondition:
+		return "grpc_failed_precondition"
+	case codes.ResourceExhausted:
+		return "grpc_resource_exhausted"
+	case codes.Unimplemented:
+		return "grpc_unimplemented"
+	case codes.Internal:
+		return "grpc_internal"
+	default:
+		return "other"
+	}
 }
 {{- end }}

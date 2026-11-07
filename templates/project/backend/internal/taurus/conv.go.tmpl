@@ -1,6 +1,9 @@
 package taurus
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // 终端颜色，仅用于启动/清理日志
 const (
@@ -75,4 +78,16 @@ func asDuration(v interface{}, def time.Duration) time.Duration {
 	default:
 		return def
 	}
+}
+
+// emptyIfBlank 处理凭据类配置（密码、token、API key 及配套用户名）。
+//
+// 配置库的占位符默认值不能为空串（${VAR:default} 要求 default 至少一个字符），模板用一个空格占位，
+// 所以「只有空白」就当没配，返回空串；否则原样返回。不能 strings.TrimSpace：
+// 真实密码可以合法地带首尾空格，去掉就变成另一个密码，连接会以认证失败告终。
+func emptyIfBlank(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return ""
+	}
+	return s
 }

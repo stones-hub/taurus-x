@@ -1,0 +1,125 @@
+package taurus
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stones-hub/taurus-pro-config/pkg/config"
+	"github.com/stones-hub/taurus-pro-storage/pkg/redisx"
+)
+
+// realConfigDir 生成项目自带的 config/autoload（go test 在 internal/taurus 目录下运行）。
+const realConfigDir = "../../config/autoload"
+
+// loadConfigDir 把生成项目里真实的配置文件 files（相对 config/autoload 的路径）复制到一个临时目录，
+// 再写入 extra 里的补充文件（相对路径 → 内容），返回该目录。占位符 ${VAR:default} 在加载时
+// 按当前环境变量替换，测试用 t.Setenv / clearEnv 控制，不依赖开发机环境。
+func loadConfigDir(t *testing.T, files []string, extra map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	write := func(rel string, data []byte) {
+		target := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, rel := range files {
+		data, err := os.ReadFile(filepath.Join(realConfigDir, rel))
+		if err != nil {
+			t.Fatalf("读取生成项目配置 %s 失败: %v", rel, err)
+		}
+		write(rel, data)
+	}
+	for rel, content := range extra {
+		write(rel, []byte(content))
+	}
+	return dir
+}
+
+// loadConfig 用配置库加载 loadConfigDir 准备好的目录。
+func loadConfig(t *testing.T, files []string, extra map[string]string) *config.Config {
+	t.Helper()
+	cfg := config.New(config.WithPrintEnable(false))
+	if err := cfg.Initialize(loadConfigDir(t, files, extra), ""); err != nil {
+		t.Fatalf("加载配置失败: %v", err)
+	}
+	return cfg
+}
+
+// clearEnv 测试期间删掉这些环境变量（结束后恢复原值），让占位符取模板里的默认值。
+func clearEnv(t *testing.T, keys ...string) {
+	t.Helper()
+	for _, key := range keys {
+		t.Setenv(key, "") // 登记恢复原值
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestEmptyIfBlank 只有空白（模板占位用的一个空格）算没配；真实凭据原样保留，首尾空格也不能去掉。
+func TestEmptyIfBlank(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"", ""},
+		{" ", ""},
+		{"   ", ""},
+		{"\t \n", ""},
+		{"secret", "secret"},
+		{" pa ss ", " pa ss "},
+		{"  leading", "  leading"},
+		{"trailing\t", "trailing\t"},
+	}
+	for _, c := range cases {
+		if got := emptyIfBlank(c.in); got != c.want {
+			t.Errorf("emptyIfBlank(%q) = %q，应为 %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestRedisLogLevel_DefaultsToWarn 没配或写错都按 warn：info 会把每条命令的参数写进日志。
+func TestRedisLogLevel_DefaultsToWarn(t *testing.T) {
+	cases := map[string]redisx.LogLevel{
+		"":      redisx.LogLevelWarn,
+		"warn":  redisx.LogLevelWarn,
+		"bogus": redisx.LogLevelWarn,
+		"INFO":  redisx.LogLevelWarn,
+		"info":  redisx.LogLevelInfo,
+		"debug": redisx.LogLevelDebug,
+		"error": redisx.LogLevelError,
+	}
+	for name, want := range cases {
+		if got := redisLogLevel(name); got != want {
+			t.Errorf("redisLogLevel(%q) = %v，应为 %v", name, got, want)
+		}
+	}
+}
+
+// TestRedisConfig_RealFile 用生成项目真实的 redis.toml：默认日志级别是 warn；
+// 不配 REDIS_PASSWORD（或只配空白）等于无密码；真实密码经配置库解析后首尾空格仍在。
+func TestRedisConfig_RealFile(t *testing.T) {
+	files := []string{"redis/redis.toml"}
+
+	clearEnv(t, "REDIS_PASSWORD")
+	cfg := loadConfig(t, files, nil)
+	if got := redisLogLevel(cfg.GetString("redis.logger_level")); got != redisx.LogLevelWarn {
+		t.Errorf("redis.toml 默认日志级别应为 warn，实际 %v（%q）", got, cfg.GetString("redis.logger_level"))
+	}
+	if got := emptyIfBlank(cfg.GetString("redis.password")); got != "" {
+		t.Error("不配 REDIS_PASSWORD 时密码应为空")
+	}
+
+	t.Setenv("REDIS_PASSWORD", "   ")
+	if got := emptyIfBlank(loadConfig(t, files, nil).GetString("redis.password")); got != "" {
+		t.Error("REDIS_PASSWORD 只有空白时应按没配处理")
+	}
+
+	const secret = " r3dis pw "
+	t.Setenv("REDIS_PASSWORD", secret)
+	if got := emptyIfBlank(loadConfig(t, files, nil).GetString("redis.password")); got != secret {
+		t.Error("真实 Redis 密码被改动了（首尾空格必须保留）")
+	}
+}

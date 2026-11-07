@@ -6,7 +6,9 @@ address = ["${REDIS_HOST:127.0.0.1}:${REDIS_PORT:6379}"]
 
 # Redis 服务器密码。
 # 占位符默认值不能为空串（配置库的正则要求至少一个字符），这里用一个空格占位，
-# 组件里会 TrimSpace，所以不配 REDIS_PASSWORD 时等于无密码。
+# 只有空白的值按「没配」处理，所以不配 REDIS_PASSWORD 时等于无密码；非空白的值不会被代码去掉首尾空格。
+# 限制：占位符在 TOML 解析之前做文本替换，值里含引号、反斜线、右花括号或换行时会被改写或导致解析失败，
+# 不保证任意字符都能原样传递；首尾空格保留只验证过由进程环境变量直接提供的普通值，经 .env 类文件提供时未验证。
 password = "${REDIS_PASSWORD: }"
 
 # 使用的数据库索引
@@ -36,8 +38,10 @@ logger_fomatter = "default"
 # 日志地址
 logger_path = "./logs/redis.log"
 
-# 日志等级 [debug/warn/info/error]
-logger_level = "info"
+# 日志等级 [debug/info/warn/error]，没配或写错时按 warn。
+# 默认 warn：info 会把每条成功命令连同参数（会话键 auth:jti:*、用户认证版本号等）写进日志。
+# warn 下成功命令不再记录，但失败命令仍按 error 记录且带参数；排查问题时再临时调成 info / debug。
+logger_level = "warn"
 
 # 单个日志的大小 单位 mb
 logger_max_size = 100

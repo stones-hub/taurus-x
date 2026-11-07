@@ -5,14 +5,18 @@ consul:
 
   client:
     address: "${CONSUL_ADDRESS:127.0.0.1:8500}"
-    token: "${CONSUL_TOKEN: }"       # 留空表示不带 token（占位符默认值不能为空串，用一个空格占位）
+    # 凭据：占位符默认值不能为空串，用一个空格占位；只有空白的值按「没配」处理（不发出对应请求头），
+    # 非空白的值不会被代码去掉首尾空格。
+    # 限制：占位符在 YAML 解析之前做文本替换，值里含引号、反斜线、右花括号或换行时会被改写或导致解析失败，
+    # 不保证任意字符都能原样传递；首尾空格保留只验证过由进程环境变量直接提供的普通值，经 .env 类文件提供时未验证。
+    token: "${CONSUL_TOKEN: }"       # ACL token，留空表示不带 token
     timeout: 5                        # 请求超时（秒）
     scheme: "${CONSUL_SCHEME:http}"
     datacenter: "${CONSUL_DATACENTER:dc1}"
     wait_time: 10                     # 等待 consul 返回的时间（秒）
     retry_time: 3                     # 重试间隔（秒）
     max_retrys: 3                     # 最大重试次数
-    http_basic_auth:                  # consul 开了 basic auth 才需要填
+    http_basic_auth:                  # consul 前面挡了 basic auth 才需要填；username 和 password 必须同时配，只配一个启动报错
       username: "${CONSUL_USERNAME: }"
       password: "${CONSUL_PASSWORD: }"
 

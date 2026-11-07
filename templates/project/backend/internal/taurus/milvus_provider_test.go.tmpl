@@ -1,0 +1,421 @@
+package taurus
+{{- if .Has.milvus }}
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"errors"
+	"log"
+	"net"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/stones-hub/taurus-pro-milvus/pkg/milvus"
+	mclient "github.com/stones-hub/taurus-pro-milvus/pkg/milvus/client"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+)
+
+// milvusEnvKeys milvus.yaml 用到的环境变量；测试先全部清掉，只设需要的，不受开发机环境影响。
+var milvusEnvKeys = []string{
+	"MILVUS_ENABLE", "MILVUS_ADDRESS", "MILVUS_USERNAME", "MILVUS_PASSWORD",
+	"MILVUS_API_KEY", "MILVUS_DB", "MILVUS_TLS",
+}
+
+// fakeMilvus 进程内的 Milvus gRPC 服务端，只实现建连握手（Connect），记录每次握手带的认证头。
+// deny=true 时握手返回 PermissionDenied，且故意把收到的凭据写进错误消息，
+// 用来确认生成项目不会把服务端错误原文（可能回显秘密）带进自己的错误里。
+type fakeMilvus struct {
+	milvuspb.UnimplementedMilvusServiceServer
+
+	addr string
+	deny bool
+
+	mu    sync.Mutex
+	auths []string // 每次握手的 authorization 元数据（base64 解码后），没带为空串
+}
+
+func startFakeMilvus(t *testing.T, deny bool) *fakeMilvus {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &fakeMilvus{addr: lis.Addr().String(), deny: deny}
+	srv := grpc.NewServer()
+	milvuspb.RegisterMilvusServiceServer(srv, f)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+	return f
+}
+
+func (f *fakeMilvus) Connect(ctx context.Context, _ *milvuspb.ConnectRequest) (*milvuspb.ConnectResponse, error) {
+	var auth string
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if values := md.Get("authorization"); len(values) > 0 {
+			decoded, err := base64.StdEncoding.DecodeString(values[0])
+			if err != nil {
+				return nil, status.Error(codes.InvalidArgument, "bad authorization")
+			}
+			auth = string(decoded)
+		}
+	}
+	f.mu.Lock()
+	f.auths = append(f.auths, auth)
+	f.mu.Unlock()
+	if f.deny {
+		return nil, status.Errorf(codes.PermissionDenied, "auth rejected for %q", auth)
+	}
+	return &milvuspb.ConnectResponse{Status: &commonpb.Status{}, Identifier: 1}, nil
+}
+
+func (f *fakeMilvus) handshakes() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.auths...)
+}
+
+// capturePools 替换 newMilvusPool，记下 provider 创建的每个池（仍是组件真实的池实现）。
+func capturePools(t *testing.T) *[]milvus.Pool {
+	t.Helper()
+	var pools []milvus.Pool
+	orig := newMilvusPool
+	newMilvusPool = func() milvus.Pool {
+		p := orig()
+		pools = append(pools, p)
+		return p
+	}
+	t.Cleanup(func() { newMilvusPool = orig })
+	return &pools
+}
+
+// assertPoolClosed 通过公开接口确认池已关闭（Close 是终态，之后 Get 返回 ErrPoolClosed）。
+func assertPoolClosed(t *testing.T, p milvus.Pool, name string) {
+	t.Helper()
+	if _, err := p.Get(name); !errors.Is(err, milvus.ErrPoolClosed) {
+		t.Errorf("池应已关闭（Get 返回 ErrPoolClosed），实际 %v", err)
+	}
+}
+
+// captureLog 收集测试期间标准库 log 的输出。
+func captureLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	orig := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(orig) })
+	return &buf
+}
+
+// applyMilvusOptions 把选项作用到组件公开的 client.DefaultOptions() 上，读出最终生效的配置。
+func applyMilvusOptions(opts []mclient.Option) *mclient.Options {
+	o := mclient.DefaultOptions()
+	for _, opt := range opts {
+		opt(o)
+	}
+	return o
+}
+
+// TestMilvusClientOptions_PublicOptionSemantics 凭据与开关最终落到组件 Options 上的值：
+// 只有空白的凭据等于没配；真实值原样保留（含首尾空格）；api_key 优先且清掉用户名密码；
+// 只有用户名不带认证；disable_conn 永远是 false。
+func TestMilvusClientOptions_PublicOptionSemantics(t *testing.T) {
+	base := func(kv ...interface{}) map[string]interface{} {
+		item := map[string]interface{}{"name": "default", "address": "127.0.0.1:19530"}
+		for i := 0; i+1 < len(kv); i += 2 {
+			item[kv[i].(string)] = kv[i+1]
+		}
+		return item
+	}
+	cases := []struct {
+		name                   string
+		item                   map[string]interface{}
+		user, pass, apiKey, db string
+		tls                    bool
+	}{
+		{name: "模板占位的一个空格", item: base("username", "root", "password", " ", "api_key", " "), user: "", pass: "", apiKey: "", db: "default"},
+		{name: "只有空白", item: base("username", "root", "password", " \t ", "api_key", "\t")},
+		{name: "没写凭据字段", item: base()},
+		{name: "只有用户名", item: base("username", "root")},
+		{name: "用户名+带首尾空格的密码", item: base("username", "root", "password", " pa ss "), user: "root", pass: " pa ss "},
+		{name: "api_key 优先", item: base("username", "root", "password", "pw-ignored", "api_key", " k e y "), apiKey: " k e y "},
+		{name: "库名与 TLS", item: base("db_name", "vec", "enable_tls_auth", true), db: "vec", tls: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			opts, err := milvusClientOptions(c.item)
+			if err != nil {
+				t.Fatalf("不应报错: %v", err)
+			}
+			o := applyMilvusOptions(opts)
+			wantDB := c.db
+			if wantDB == "" {
+				wantDB = "default"
+			}
+			if o.Username != c.user || o.Password != c.pass || o.APIKey != c.apiKey {
+				t.Errorf("认证字段不符：username 应为 %q、password 匹配=%t、api_key 匹配=%t",
+					c.user, o.Password == c.pass, o.APIKey == c.apiKey)
+			}
+			if o.DBName != wantDB || o.EnableTLSAuth != c.tls || o.DisableConn {
+				t.Errorf("db=%q tls=%t disable_conn=%t，应为 db=%q tls=%t disable_conn=false",
+					o.DBName, o.EnableTLSAuth, o.DisableConn, wantDB, c.tls)
+			}
+			if o.Address != "127.0.0.1:19530" || o.MinConnectTimeout != 10*time.Second {
+				t.Errorf("address=%q min_connect_timeout=%v", o.Address, o.MinConnectTimeout)
+			}
+		})
+	}
+}
+
+// TestMilvusEntries_Rejects milvus.enable=true 时，所有不合法的 milvus.list 都返回错误，
+// 错误里不带凭据值。
+func TestMilvusEntries_Rejects(t *testing.T) {
+	const secret = "S3cret-marker"
+	item := func(kv ...interface{}) map[string]interface{} {
+		m := map[string]interface{}{
+			"name": "default", "address": "127.0.0.1:19530",
+			"username": "root", "password": secret, "api_key": " ",
+		}
+		for i := 0; i+1 < len(kv); i += 2 {
+			if kv[i+1] == nil {
+				delete(m, kv[i].(string))
+				continue
+			}
+			m[kv[i].(string)] = kv[i+1]
+		}
+		return m
+	}
+	cases := []struct {
+		name string
+		raw  interface{}
+		want string
+	}{
+		{"list 缺失", nil, "缺失或不是列表"},
+		{"list 不是列表", "default", "缺失或不是列表"},
+		{"list 为空", []interface{}{}, "为空"},
+		{"条目不是映射", []interface{}{"default"}, "milvus.list[0] 格式不对"},
+		{"name 缺失", []interface{}{item("name", nil)}, "name 为空"},
+		{"name 不是字符串", []interface{}{item("name", 1)}, "name 为空或不是字符串"},
+		{"name 为空", []interface{}{item("name", "")}, "name 为空"},
+		{"name 只有空白", []interface{}{item("name", "  \t")}, "name 为空"},
+		{"name 带首尾空白", []interface{}{item("name", " default ")}, "带首尾空白"},
+		{"name 重复", []interface{}{item(), item("address", "127.0.0.1:19531")}, "milvus.list[1] 的 name \"default\" 与前面的条目重复"},
+		{"address 缺失", []interface{}{item("address", nil)}, "address 为空"},
+		{"address 只有空白", []interface{}{item("address", " ")}, "address 为空"},
+		{"password 不是字符串", []interface{}{item("password", 123456)}, "password 必须是字符串"},
+		{"api_key 不是字符串", []interface{}{item("api_key", 42)}, "api_key 必须是字符串"},
+		{"有密码没用户名", []interface{}{item("username", " ")}, "username 为空"},
+		{"enable_tls_auth 不是布尔", []interface{}{item("enable_tls_auth", "true")}, "enable_tls_auth 必须是 true 或 false"},
+		{"disable_conn=true", []interface{}{item("disable_conn", true)}, "disable_conn=true"},
+		{"disable_conn 不是布尔", []interface{}{item("disable_conn", "false")}, "disable_conn 必须是 true 或 false"},
+		{"后面的条目不合法", []interface{}{item(), item("name", "second", "disable_conn", true)}, "milvus.list[1]（name=\"second\"）"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			entries, err := milvusEntries(c.raw)
+			if err == nil {
+				t.Fatalf("应报错，实际得到 %d 个条目", len(entries))
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("错误应包含 %q，实际 %q", c.want, err)
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Error("错误信息带出了凭据值")
+			}
+		})
+	}
+}
+
+// TestMilvusEntries_AcceptsDistinctNames 合法列表按顺序返回；name 区分大小写。
+func TestMilvusEntries_AcceptsDistinctNames(t *testing.T) {
+	raw := []interface{}{
+		map[string]interface{}{"name": "default", "address": "127.0.0.1:19530"},
+		map[string]interface{}{"name": "Default", "address": "127.0.0.1:19531", "disable_conn": false},
+	}
+	entries, err := milvusEntries(raw)
+	if err != nil {
+		t.Fatalf("不应报错: %v", err)
+	}
+	if len(entries) != 2 || entries[0].name != "default" || entries[1].name != "Default" || entries[1].index != 1 {
+		t.Errorf("条目不符: %+v", entries)
+	}
+}
+
+// TestProvideMilvusComponent_Disabled 默认（MILVUS_ENABLE 未设）不启用：返回 nil，不建池、不连接。
+func TestProvideMilvusComponent_Disabled(t *testing.T) {
+	clearEnv(t, milvusEnvKeys...)
+	pools := capturePools(t)
+	pool, cleanup, err := ProvideMilvusComponent(loadConfig(t, []string{"milvus/milvus.yaml"}, nil), newMilvusTestLog(t).manager)
+	if err != nil || pool != nil {
+		t.Fatalf("未启用时应返回 nil, nil，实际 pool=%v err=%v", pool, err)
+	}
+	cleanup()
+	if len(*pools) != 0 {
+		t.Error("未启用时不应创建连接池")
+	}
+}
+
+// TestProvideMilvusComponent_RealConfigCredentialsOnTheWire 用生成项目真实的 milvus.yaml、
+// 通过环境变量配置凭据，连进程内的 fake Milvus，看握手请求里实际带的认证信息。
+func TestProvideMilvusComponent_RealConfigCredentialsOnTheWire(t *testing.T) {
+	cases := []struct {
+		name string
+		env  map[string]string
+		want string // fake 收到的认证（base64 解码后），空串表示没带
+	}{
+		{"不配凭据（默认用户名 root、密码占位空格）", nil, ""},
+		{"密码只有空白", map[string]string{"MILVUS_PASSWORD": "   "}, ""},
+		{"api_key 只有空白", map[string]string{"MILVUS_API_KEY": " \t "}, ""},
+		{"真实密码带首尾空格", map[string]string{"MILVUS_PASSWORD": " pa ss "}, "root: pa ss "},
+		{"api_key 优先于用户名密码", map[string]string{"MILVUS_PASSWORD": "pw", "MILVUS_API_KEY": " k e y "}, " k e y "},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fake := startFakeMilvus(t, false)
+			clearEnv(t, milvusEnvKeys...)
+			t.Setenv("MILVUS_ENABLE", "true")
+			t.Setenv("MILVUS_ADDRESS", fake.addr)
+			for k, v := range c.env {
+				t.Setenv(k, v)
+			}
+			pool, cleanup, err := ProvideMilvusComponent(loadConfig(t, []string{"milvus/milvus.yaml"}, nil), newMilvusTestLog(t).manager)
+			if err != nil {
+				t.Fatalf("应连接成功: %v", err)
+			}
+			if _, err := pool.Get("default"); err != nil {
+				t.Fatalf("应能取到 default 客户端: %v", err)
+			}
+			got := fake.handshakes()
+			if len(got) != 1 || got[0] != c.want {
+				t.Errorf("握手认证不符：次数 %d，与期望一致=%t，期望带认证=%t", len(got), len(got) == 1 && got[0] == c.want, c.want != "")
+			}
+			cleanup()
+			assertPoolClosed(t, pool, "default")
+		})
+	}
+}
+
+// milvusListYAML 生成只含 milvus 段的启用配置。nameAddrs 依次为 name、address 成对出现，
+// extra 追加到每个条目末尾。
+func milvusListYAML(extra string, nameAddrs ...string) string {
+	var b strings.Builder
+	b.WriteString("milvus:\n  enable: true\n  list:\n")
+	for i := 0; i+1 < len(nameAddrs); i += 2 {
+		b.WriteString("    - name: \"" + nameAddrs[i] + "\"\n      address: \"" + nameAddrs[i+1] + "\"\n" + extra)
+	}
+	return b.String()
+}
+
+// TestProvideMilvusComponent_PartialFailureClosesPool 第一个客户端已连上、第二个握手被拒：
+// 返回错误，已建好的池被关闭，不打印成功日志；错误和日志里没有服务端回显的密码，也没有地址。
+func TestProvideMilvusComponent_PartialFailureClosesPool(t *testing.T) {
+	const secret = " S3cret-pw "
+	ok, denied := startFakeMilvus(t, false), startFakeMilvus(t, true)
+	extra := "      username: \"root\"\n      password: \"" + secret + "\"\n"
+	cfg := loadConfig(t, nil, map[string]string{
+		"milvus/milvus.yaml": milvusListYAML(extra, "first", ok.addr, "second", denied.addr),
+	})
+	pools := capturePools(t)
+	logs := captureLog(t)
+	appLog := newMilvusTestLog(t)
+
+	pool, _, err := ProvideMilvusComponent(cfg, appLog.manager)
+	if err == nil || pool != nil {
+		t.Fatalf("第二个客户端握手被拒时应返回错误，实际 pool=%v err=%v", pool, err)
+	}
+	if got := denied.handshakes(); len(got) != 1 || got[0] != "root:"+secret {
+		t.Fatal("被拒的握手没有带上原样的用户名密码（前置条件不成立）")
+	}
+	for _, want := range []string{"milvus.list[1]", `name="second"`, "PermissionDenied"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("错误应包含 %q，实际 %q", want, err)
+		}
+	}
+	for what, leak := range map[string]string{
+		"密码":      strings.TrimSpace(secret),
+		"地址":      denied.addr,
+		"服务端原始错误": "auth rejected",
+	} {
+		if strings.Contains(err.Error(), leak) || strings.Contains(logs.String(), leak) {
+			t.Errorf("错误或日志带出了%s", what)
+		}
+	}
+	if strings.Contains(logs.String(), "Milvus all initialized successfully") {
+		t.Error("失败时不应打印初始化成功")
+	}
+	if len(*pools) != 1 {
+		t.Fatalf("应创建 1 个池，实际 %d", len(*pools))
+	}
+	if len(ok.handshakes()) != 1 {
+		t.Fatal("第一个客户端应已连上（否则测不到部分失败的清理）")
+	}
+	assertPoolClosed(t, (*pools)[0], "first")
+	if lines := appLog.lines(t); len(lines) != 0 {
+		t.Errorf("建连失败不是查询失败，不应写 Milvus 查询失败日志，实际 %d 行", len(lines))
+	}
+}
+
+// TestProvideMilvusComponent_ConfigErrorsFailBeforeConnecting 配置不合法（这里是 disable_conn=true、重复 name）
+// 在连接前就拒绝：不建池，fake 服务端收不到任何握手。
+func TestProvideMilvusComponent_ConfigErrorsFailBeforeConnecting(t *testing.T) {
+	fake := startFakeMilvus(t, false)
+	for name, yaml := range map[string]string{
+		"disable_conn=true": milvusListYAML("      disable_conn: true\n", "default", fake.addr),
+		"name 重复":           milvusListYAML("", "default", fake.addr, "default", fake.addr),
+		"list 为空":           "milvus:\n  enable: true\n  list: []\n",
+		"list 缺失":           "milvus:\n  enable: true\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			pools := capturePools(t)
+			pool, _, err := ProvideMilvusComponent(loadConfig(t, nil, map[string]string{"milvus/milvus.yaml": yaml}), newMilvusTestLog(t).manager)
+			if err == nil || pool != nil {
+				t.Fatalf("应返回错误，实际 pool=%v err=%v", pool, err)
+			}
+			if len(*pools) != 0 {
+				t.Error("配置不合法时不应创建连接池")
+			}
+		})
+	}
+	if n := len(fake.handshakes()); n != 0 {
+		t.Errorf("配置不合法时不应发起握手，实际 %d 次", n)
+	}
+}
+
+// TestBuildComponents_MilvusFailureClosesPool 经 wire 生成的 buildComponents 走完整启动：
+// Milvus 握手失败时整体返回错误（不返回半成品容器），provider 建的池已关闭。
+func TestBuildComponents_MilvusFailureClosesPool(t *testing.T) {
+	denied := startFakeMilvus(t, true)
+	clearEnv(t, milvusEnvKeys...)
+	t.Setenv("MILVUS_ENABLE", "true")
+	t.Setenv("MILVUS_ADDRESS", denied.addr)
+	dir := loadConfigDir(t, []string{"logger/logger.yaml", "milvus/milvus.yaml"}, disabledStorageConfig)
+	t.Chdir(t.TempDir()) // 日志组件把 logs/ 写在当前目录
+	pools := capturePools(t)
+
+	components, cleanup, err := buildComponents(&ConfigOptions{ConfigPath: dir})
+	if err == nil {
+		cleanup()
+		t.Fatal("Milvus 握手失败时 buildComponents 应返回错误")
+	}
+	if components != nil {
+		t.Error("失败时不应返回组件容器")
+	}
+	if len(*pools) != 1 {
+		t.Fatalf("应创建 1 个池，实际 %d", len(*pools))
+	}
+	assertPoolClosed(t, (*pools)[0], "default")
+}
+
+// disabledStorageConfig 关掉 DB / Redis（本测试不连真实数据库），其余组件没给配置即为未启用。
+var disabledStorageConfig = map[string]string{
+	"db/db.yaml":       "databases:\n  enable: false\n",
+	"redis/redis.yaml": "redis:\n  enable: false\n",
+}
+{{- end }}
