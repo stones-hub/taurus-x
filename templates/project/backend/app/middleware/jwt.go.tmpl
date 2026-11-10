@@ -12,6 +12,7 @@ import (
 	"github.com/stones-hub/taurus-pro-common/pkg/util/tcrypt"
 	"github.com/stones-hub/taurus-pro-http/pkg/httpx"
 
+	"{{ .Module }}/app/helper/store"
 	"{{ .Module }}/internal/taurus"
 )
 
@@ -129,22 +130,26 @@ func signJWT(uid, username string) (token, jti string, ttl time.Duration, err er
 //
 // 两种情况都不存在「旧凭证换到可用会话」的窗口。反过来，如果在登记时现读版本，
 // 旧凭证的并发登录就会登记到新版本上，这正是不能只把自增提前到 SQL 之前的原因。
-func GenerateJWTToken(uid, username string, authVersion int64) (string, error) {
-	token, _, err := registerJWT(uid, username, authVersion)
+//
+// 会话登记受 store.SessionOperationTimeout 约束（在 ctx 上派生，ctx 期限更早时以 ctx 为准）。
+func GenerateJWTToken(ctx context.Context, uid, username string, authVersion int64) (string, error) {
+	token, _, err := registerJWT(ctx, uid, username, authVersion)
 	return token, err
 }
 
 // registerJWT 是 GenerateJWTToken 的实现，额外返回 jti，供写入失败时吊销。
-func registerJWT(uid, username string, authVersion int64) (token, jti string, err error) {
+func registerJWT(ctx context.Context, uid, username string, authVersion int64) (token, jti string, err error) {
 	userID, err := strconv.ParseUint(uid, 10, 64)
 	if err != nil {
 		return "", "", fmt.Errorf("签发 Token 失败: 用户 ID 非法")
 	}
+	ctx, cancel := context.WithTimeout(ctx, store.SessionOperationTimeout)
+	defer cancel()
 	token, jti, ttl, err := signJWT(uid, username)
 	if err != nil {
 		return "", "", err
 	}
-	if err := AuthSessionStore().RegisterSession(userID, jti, ttl, authVersion); err != nil {
+	if err := AuthSessionStore().RegisterSession(ctx, userID, jti, ttl, authVersion); err != nil {
 		return "", "", fmt.Errorf("签发 Token 失败: %w", err)
 	}
 	return token, jti, nil
@@ -155,20 +160,41 @@ func registerJWT(uid, username string, authVersion int64) (token, jti string, er
 //
 // 写入失败时返回 ErrJWTWriteFailed，并尽力吊销刚登记的会话（吊销失败只记日志）：
 // 客户端拿不到令牌，这个会话不应在白名单里留到过期。
-func IssueLoginJWT(w http.ResponseWriter, uid, username string, authVersion int64) (time.Time, error) {
-	token, jti, err := registerJWT(uid, username, authVersion)
+//
+// 登记与尽力吊销共用同一个 store.SessionOperationTimeout 预算，吊销不另开 Background：
+// 预算已经用完时吊销会直接失败（只记日志），会话键留到 TTL 到期，但令牌没有交给任何人。
+// 预算到期或请求已取消时不写 Cookie。
+func IssueLoginJWT(ctx context.Context, w http.ResponseWriter, uid, username string, authVersion int64) (time.Time, error) {
+	ctx, cancel := context.WithTimeout(ctx, store.SessionOperationTimeout)
+	defer cancel()
+	token, jti, err := registerJWT(ctx, uid, username, authVersion)
 	if err != nil {
 		return time.Time{}, err
 	}
 	expiresAt, err := JWTExpiresAt(token)
 	if err != nil {
-		if revokeErr := AuthSessionStore().RevokeSession(jti); revokeErr != nil {
-			log.Printf("登录令牌写入失败后吊销会话失败: %v\n", revokeErr)
-		}
+		revokeUndeliveredSession(ctx, jti)
 		return time.Time{}, fmt.Errorf("%w: %v", ErrJWTWriteFailed, err)
+	}
+	if err := ctx.Err(); err != nil {
+		revokeUndeliveredSession(ctx, jti)
+		return time.Time{}, fmt.Errorf("签发 Token 失败: %w", sessionDeadlineError(err))
 	}
 	setJWTCookie(w, token, expiresAt)
 	return expiresAt, nil
+}
+
+// revokeUndeliveredSession 尽力吊销一个已登记、但令牌没交给客户端的会话；失败只记日志。
+func revokeUndeliveredSession(ctx context.Context, jti string) {
+	if err := AuthSessionStore().RevokeSession(ctx, jti); err != nil {
+		log.Printf("登录令牌未交付后吊销会话失败: %v\n", err)
+	}
+}
+
+// sessionDeadlineError 会话预算到期或请求已取消：按会话存储不可用处理（调用方回 503），
+// 同时保留 ctx 的错误。
+func sessionDeadlineError(ctxErr error) error {
+	return fmt.Errorf("%w: %w", store.ErrSessionStoreUnavailable, ctxErr)
 }
 
 // ValidateJWTToken 验证 JWT 令牌签名与有效期（不含会话白名单校验，
@@ -199,7 +225,15 @@ func parseJWT(token, secret string) (*tcrypt.Claims, error) {
 // 顺序是先轮换会话、再写 Cookie。写 Cookie 失败时旧会话已被消费、新令牌也没交给客户端，
 // 用户只能重新登录。这是有意的失败即关闭：反过来先写 Cookie 再轮换，轮换失败时客户端
 // 会拿到一个不在白名单里的令牌，或者旧令牌在轮换失败后仍可用，都比强制重新登录更糟。
-func RefreshJWTToken(w http.ResponseWriter, token string) (time.Time, error) {
+//
+// 会话存储故障、会话预算（store.SessionOperationTimeout）到期或请求已取消时不写 Cookie，
+// 按存储不可用返回；预算在轮换写入期间或之后才到期时，Redis 端可能已经提交轮换，旧令牌同样不再可用。
+//
+// 预算在入口建立一次：解析、校验 + 签名 + 轮换（rotateSession 内再派生不会延长它）、
+// 读取过期时间到写 Cookie 前的检查共用同一个期限。
+func RefreshJWTToken(ctx context.Context, w http.ResponseWriter, token string) (time.Time, error) {
+	ctx, cancel := context.WithTimeout(ctx, store.SessionOperationTimeout)
+	defer cancel()
 	claims, err := parseJWT(token, taurus.Container.Config.GetString("http.jwt.secret"))
 	if err != nil {
 		return time.Time{}, err
@@ -208,7 +242,7 @@ func RefreshJWTToken(w http.ResponseWriter, token string) (time.Time, error) {
 	if err != nil {
 		return time.Time{}, errors.New("用户 ID 非法")
 	}
-	newToken, err := rotateSession(AuthSessionStore(), userID, claims.ID, func() (string, string, time.Duration, error) {
+	newToken, err := rotateSession(ctx, AuthSessionStore(), userID, claims.ID, func() (string, string, time.Duration, error) {
 		return signJWT(claims.Uid, claims.Username)
 	})
 	if err != nil {
@@ -217,6 +251,9 @@ func RefreshJWTToken(w http.ResponseWriter, token string) (time.Time, error) {
 	expiresAt, err := JWTExpiresAt(newToken)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("写入 JWT Cookie 失败: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return time.Time{}, fmt.Errorf("轮换会话失败: %w", sessionDeadlineError(err))
 	}
 	setJWTCookie(w, newToken, expiresAt)
 	return expiresAt, nil
@@ -230,9 +267,14 @@ func RefreshJWTToken(w http.ResponseWriter, token string) (time.Time, error) {
 // 这种并发下新 Token 的版本已经落后，下一次校验必然被拒。
 //
 // Redis 在一个原子操作中核对并消费旧会话、登记新会话；旧会话最多成功轮换一次。
-func rotateSession(s SessionStore, userID uint64, oldJTI string,
+//
+// 校验、签名、轮换共用一个 store.SessionOperationTimeout 预算，各步骤不重新计时；
+// 预算到期后不再轮换，也不返回新令牌。
+func rotateSession(ctx context.Context, s SessionStore, userID uint64, oldJTI string,
 	sign func() (token, jti string, ttl time.Duration, err error)) (string, error) {
-	authVersion, err := s.ValidateSession(userID, oldJTI)
+	ctx, cancel := context.WithTimeout(ctx, store.SessionOperationTimeout)
+	defer cancel()
+	authVersion, err := s.ValidateSession(ctx, userID, oldJTI)
 	if err != nil {
 		return "", err
 	}
@@ -240,8 +282,11 @@ func rotateSession(s SessionStore, userID uint64, oldJTI string,
 	if err != nil {
 		return "", err
 	}
-	if err := s.RotateSession(userID, oldJTI, newJTI, ttl, authVersion); err != nil {
+	if err := s.RotateSession(ctx, userID, oldJTI, newJTI, ttl, authVersion); err != nil {
 		return "", fmt.Errorf("轮换会话失败: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("轮换会话失败: %w", sessionDeadlineError(err))
 	}
 	return newToken, nil
 }

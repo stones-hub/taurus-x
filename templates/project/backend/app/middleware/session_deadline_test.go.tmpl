@@ -1,0 +1,249 @@
+package middleware
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"{{ .Module }}/app/helper/store"
+)
+
+// 这些用例证明中间件 / 刷新逻辑把请求 ctx 与会话预算正确地交给了会话存储，
+// 并在预算到期或请求取消后 fail closed。fake 不经过 Redis socket，
+// 不能代替 Redis 组件对 socket 读写期限的验证。
+
+// deadlineSessionStore 在 fakeSessionStore 外面按真实实现的 ctx 语义包一层：
+// I/O 前 ctx 已结束直接拒绝，成功返回前再查一次 ctx；同时记录每次调用收到的 ctx。
+type deadlineSessionStore struct {
+	*fakeSessionStore
+	ops  []string
+	ctxs []context.Context
+	// after 在底层操作成功后调用（例如取消父 ctx），用来确定性地模拟「操作期间预算用完」。
+	after func(op string)
+}
+
+func newDeadlineSessionStore() *deadlineSessionStore {
+	return &deadlineSessionStore{fakeSessionStore: newFakeSessionStore()}
+}
+
+func (d *deadlineSessionStore) begin(ctx context.Context, op string) error {
+	d.ops = append(d.ops, op)
+	d.ctxs = append(d.ctxs, ctx)
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: %w", store.ErrSessionStoreUnavailable, err)
+	}
+	return nil
+}
+
+func (d *deadlineSessionStore) end(ctx context.Context, op string, err error) error {
+	if err != nil {
+		return err
+	}
+	if d.after != nil {
+		d.after(op)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("%w: %w", store.ErrSessionStoreUnavailable, ctxErr)
+	}
+	return nil
+}
+
+func (d *deadlineSessionStore) RegisterSession(ctx context.Context, userID uint64, jti string, ttl time.Duration, authVersion int64) error {
+	if err := d.begin(ctx, "register"); err != nil {
+		return err
+	}
+	return d.end(ctx, "register", d.fakeSessionStore.RegisterSession(ctx, userID, jti, ttl, authVersion))
+}
+
+func (d *deadlineSessionStore) ValidateSession(ctx context.Context, userID uint64, jti string) (int64, error) {
+	if err := d.begin(ctx, "validate"); err != nil {
+		return 0, err
+	}
+	version, err := d.fakeSessionStore.ValidateSession(ctx, userID, jti)
+	if err := d.end(ctx, "validate", err); err != nil {
+		return 0, err
+	}
+	return version, nil
+}
+
+func (d *deadlineSessionStore) RevokeSession(ctx context.Context, jti string) error {
+	if err := d.begin(ctx, "revoke"); err != nil {
+		return err
+	}
+	return d.end(ctx, "revoke", d.fakeSessionStore.RevokeSession(ctx, jti))
+}
+
+func (d *deadlineSessionStore) RotateSession(ctx context.Context, userID uint64, oldJTI, newJTI string, ttl time.Duration, authVersion int64) error {
+	if err := d.begin(ctx, "rotate"); err != nil {
+		return err
+	}
+	return d.end(ctx, "rotate", d.fakeSessionStore.RotateSession(ctx, userID, oldJTI, newJTI, ttl, authVersion))
+}
+
+func assertSessionUnavailable(t *testing.T, err, want error) {
+	t.Helper()
+	if !errors.Is(err, store.ErrSessionStoreUnavailable) || !errors.Is(err, want) {
+		t.Fatalf("期望存储不可用且保留 %v，实际: %v", want, err)
+	}
+}
+
+// TestSessionValidator_PassesRequestContext 会话校验用的是请求 ctx（带着请求上的值），
+// 不是另起的 Background。
+func TestSessionValidator_PassesRequestContext(t *testing.T) {
+	type marker struct{}
+	prev := AuthSessionStore()
+	t.Cleanup(func() { SetAuthSessionStore(prev) })
+	fake := newDeadlineSessionStore()
+	fake.login(t, 7, "jti-a")
+	SetAuthSessionStore(fake)
+
+	reached := false
+	handler := SessionValidatorMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/admin/user/current-info", nil)
+	ctx := context.WithValue(req.Context(), marker{}, "request")
+	ctx = context.WithValue(ctx, JWTTokenClaimsKey, JWTClaims{UID: "7", JTI: "jti-a"})
+	handler.ServeHTTP(httptest.NewRecorder(), req.WithContext(ctx))
+
+	if !reached || len(fake.ctxs) != 1 || fake.ctxs[0].Value(marker{}) != "request" {
+		t.Fatalf("会话校验应使用请求 ctx: reached=%v calls=%v", reached, fake.ops)
+	}
+}
+
+// TestSessionValidator_DoneRequestFailsClosed 请求已取消或已过期：返回 503，不进入下游。
+func TestSessionValidator_DoneRequestFailsClosed(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+
+	for name, parent := range map[string]context.Context{"已取消": canceled, "已过期": expired} {
+		t.Run(name, func(t *testing.T) {
+			prev := AuthSessionStore()
+			t.Cleanup(func() { SetAuthSessionStore(prev) })
+			fake := newDeadlineSessionStore()
+			fake.login(t, 7, "jti-a")
+			SetAuthSessionStore(fake)
+
+			reached := false
+			handler := SessionValidatorMiddleware()(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				reached = true
+			}))
+			req := httptest.NewRequest(http.MethodGet, "/admin/user/current-info", nil)
+			req = req.WithContext(context.WithValue(parent, JWTTokenClaimsKey, JWTClaims{UID: "7", JTI: "jti-a"}))
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if reached {
+				t.Fatal("请求 ctx 已结束时不能放行")
+			}
+			// httpx.SendResponse 对 503 以 HTTP 200 + body.code 返回
+			var body struct {
+				Code int `json:"code"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.Code != http.StatusServiceUnavailable {
+				t.Fatalf("期望 code 503，实际 %s", rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestRotateSession_ValidateAndRotateShareOneBudget 刷新时校验与轮换共用一个预算：
+// 两次存储调用拿到的期限完全相同，且等于调用时刻 + SessionOperationTimeout。
+func TestRotateSession_ValidateAndRotateShareOneBudget(t *testing.T) {
+	fake := newDeadlineSessionStore()
+	fake.login(t, 7, "jti-old")
+	fake.ops, fake.ctxs = nil, nil
+
+	start := time.Now()
+	if _, err := rotateSession(context.Background(), fake, 7, "jti-old", fakeSign("new-token", "jti-new")); err != nil {
+		t.Fatal(err)
+	}
+	end := time.Now()
+
+	if len(fake.ops) != 2 || fake.ops[0] != "validate" || fake.ops[1] != "rotate" {
+		t.Fatalf("期望先校验后轮换，实际 %v", fake.ops)
+	}
+	validateDeadline, ok1 := fake.ctxs[0].Deadline()
+	rotateDeadline, ok2 := fake.ctxs[1].Deadline()
+	if !ok1 || !ok2 || !validateDeadline.Equal(rotateDeadline) {
+		t.Fatalf("校验与轮换应共用同一期限，实际 %v / %v", validateDeadline, rotateDeadline)
+	}
+	if validateDeadline.Before(start.Add(store.SessionOperationTimeout)) || validateDeadline.After(end.Add(store.SessionOperationTimeout)) {
+		t.Fatalf("期限应为调用时刻 + %v，实际 %v", store.SessionOperationTimeout, validateDeadline)
+	}
+}
+
+// TestRotateSession_EarlierParentDeadlineWins 请求 ctx 的期限更早时，校验与轮换都以它为准。
+func TestRotateSession_EarlierParentDeadlineWins(t *testing.T) {
+	fake := newDeadlineSessionStore()
+	fake.login(t, 7, "jti-old")
+	fake.ops, fake.ctxs = nil, nil
+
+	parentDeadline := time.Now().Add(store.SessionOperationTimeout - time.Second)
+	parent, cancel := context.WithDeadline(context.Background(), parentDeadline)
+	defer cancel()
+	if _, err := rotateSession(parent, fake, 7, "jti-old", fakeSign("new-token", "jti-new")); err != nil {
+		t.Fatal(err)
+	}
+	for i, ctx := range fake.ctxs {
+		if deadline, ok := ctx.Deadline(); !ok || !deadline.Equal(parentDeadline) {
+			t.Fatalf("%s 应沿用请求期限 %v，实际 %v", fake.ops[i], parentDeadline, deadline)
+		}
+	}
+}
+
+// TestRotateSession_CanceledDuringSignSkipsRotate 签名期间请求被取消：不再轮换，
+// 不返回新令牌，旧会话保持原样。
+func TestRotateSession_CanceledDuringSignSkipsRotate(t *testing.T) {
+	fake := newDeadlineSessionStore()
+	fake.login(t, 7, "jti-old")
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sign := func() (string, string, time.Duration, error) {
+		cancel()
+		return "new-token", "jti-new", time.Hour, nil
+	}
+
+	token, err := rotateSession(parent, fake, 7, "jti-old", sign)
+	assertSessionUnavailable(t, err, context.Canceled)
+	if token != "" {
+		t.Fatal("预算结束后不能返回新令牌")
+	}
+	if len(fake.revokes) != 0 {
+		t.Fatalf("没有轮换时不应消费旧会话: %v", fake.revokes)
+	}
+	if _, err := fake.ValidateSession(context.Background(), 7, "jti-old"); err != nil {
+		t.Fatalf("旧会话应保持可用: %v", err)
+	}
+}
+
+// TestRotateSession_ExpiredAfterRotateReturnsNoToken 轮换已提交、但返回前预算用完：
+// 不返回新令牌（调用方因此不写 Cookie），旧会话已被消费也不恢复。
+func TestRotateSession_ExpiredAfterRotateReturnsNoToken(t *testing.T) {
+	fake := newDeadlineSessionStore()
+	fake.login(t, 7, "jti-old")
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fake.after = func(op string) {
+		if op == "rotate" {
+			cancel()
+		}
+	}
+
+	token, err := rotateSession(parent, fake, 7, "jti-old", fakeSign("new-token", "jti-new"))
+	assertSessionUnavailable(t, err, context.Canceled)
+	if token != "" {
+		t.Fatal("预算结束后不能返回新令牌")
+	}
+	if _, err := fake.ValidateSession(context.Background(), 7, "jti-old"); !errors.Is(err, store.ErrSessionRevoked) {
+		t.Fatalf("已提交的轮换不应被回滚: %v", err)
+	}
+}

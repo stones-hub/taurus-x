@@ -1,0 +1,315 @@
+package store
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+)
+
+// 这些用例只证明会话层把期限、取消和剩余预算正确地传给了存储接口，并在期限到达后
+// fail closed。fake 不经过 socket：Redis 命令的读写是否真的遵守 ctx deadline，取决于
+// Redis 组件的 ContextTimeoutEnabled（组件自身的测试覆盖），这里不能代替那部分验证。
+
+// deadlineKV 记录每次存储调用收到的 ctx，并可在调用「完成后」执行钩子
+// （例如取消父 ctx），用来确定性地模拟「操作期间预算用完」，不依赖 sleep。
+type deadlineKV struct {
+	*fakeKV
+	calls []string
+	ctxs  []context.Context
+	// after 在底层操作完成后调用；返回非 nil 时作为驱动错误返回（写入已经发生）。
+	after func(op string) error
+}
+
+func newDeadlineKV() *deadlineKV {
+	return &deadlineKV{fakeKV: newFakeKV()}
+}
+
+func (k *deadlineKV) record(ctx context.Context, op string) {
+	k.calls = append(k.calls, op)
+	k.ctxs = append(k.ctxs, ctx)
+}
+
+func (k *deadlineKV) finish(op string, err error) error {
+	if err == nil && k.after != nil {
+		return k.after(op)
+	}
+	return err
+}
+
+func (k *deadlineKV) Get(ctx context.Context, key string) (string, error) {
+	k.record(ctx, "get")
+	v, err := k.fakeKV.Get(ctx, key)
+	return v, k.finish("get", err)
+}
+
+func (k *deadlineKV) Set(ctx context.Context, key string, value interface{}, ttl time.Duration) error {
+	k.record(ctx, "set")
+	return k.finish("set", k.fakeKV.Set(ctx, key, value, ttl))
+}
+
+func (k *deadlineKV) Del(ctx context.Context, keys ...string) error {
+	k.record(ctx, "del")
+	return k.finish("del", k.fakeKV.Del(ctx, keys...))
+}
+
+func (k *deadlineKV) Rotate(ctx context.Context, oldKey, newKey, value string, ttl time.Duration) (bool, error) {
+	k.record(ctx, "rotate")
+	ok, err := k.fakeKV.Rotate(ctx, oldKey, newKey, value, ttl)
+	return ok, k.finish("rotate", err)
+}
+
+// deadlineVersions 记录认证版本查询收到的 ctx，可在返回前执行钩子。
+type deadlineVersions struct {
+	*fakeAuthVersions
+	ctxs   []context.Context
+	before func()
+}
+
+func (v *deadlineVersions) CurrentAuthVersion(ctx context.Context, userID uint64) (int64, error) {
+	v.ctxs = append(v.ctxs, ctx)
+	if v.before != nil {
+		v.before()
+	}
+	return v.fakeAuthVersions.CurrentAuthVersion(ctx, userID)
+}
+
+func newDeadlineStore(t *testing.T) (*AuthRedisStore, *deadlineKV, *deadlineVersions) {
+	t.Helper()
+	kv := newDeadlineKV()
+	versions := &deadlineVersions{fakeAuthVersions: newFakeAuthVersions(7)}
+	return NewAuthRedisStoreWith(kv, versions), kv, versions
+}
+
+// sessionOps 四个会话操作，统一成同一签名，便于逐一跑同样的断言。
+func sessionOps(s *AuthRedisStore) map[string]func(context.Context) error {
+	return map[string]func(context.Context) error{
+		"register": func(ctx context.Context) error { return s.RegisterSession(ctx, 7, "jti-new", time.Hour, 1) },
+		"validate": func(ctx context.Context) error { _, err := s.ValidateSession(ctx, 7, "jti-a"); return err },
+		"rotate":   func(ctx context.Context) error { return s.RotateSession(ctx, 7, "jti-a", "jti-b", time.Hour, 1) },
+		"revoke":   func(ctx context.Context) error { return s.RevokeSession(ctx, "jti-a") },
+	}
+}
+
+func assertSessionCtxError(t *testing.T, err, want error) {
+	t.Helper()
+	if !errors.Is(err, ErrSessionStoreUnavailable) || !errors.Is(err, want) {
+		t.Fatalf("期望存储不可用且保留 %v，实际: %v", want, err)
+	}
+}
+
+// TestSessionOps_RejectDoneContextWithoutIO 父 ctx 已取消或已过期：四个操作都直接按
+// 存储不可用拒绝，并保留 ctx 的错误，不访问 Redis 也不查认证版本。
+func TestSessionOps_RejectDoneContextWithoutIO(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+
+	for ctxName, tc := range map[string]struct {
+		ctx  context.Context
+		want error
+	}{
+		"已取消": {canceled, context.Canceled},
+		"已过期": {expired, context.DeadlineExceeded},
+	} {
+		s, kv, versions := newDeadlineStore(t)
+		kv.data[sessionJTIKeyPrefix+"jti-a"] = "7:1"
+		for opName, op := range sessionOps(s) {
+			assertSessionCtxError(t, op(tc.ctx), tc.want)
+			if len(kv.calls) != 0 || len(versions.ctxs) != 0 {
+				t.Fatalf("%s/%s: ctx 已结束仍访问了存储: kv=%v versions=%d", ctxName, opName, kv.calls, len(versions.ctxs))
+			}
+		}
+		if kv.data[sessionJTIKeyPrefix+"jti-a"] != "7:1" || len(kv.data) != 1 {
+			t.Fatalf("%s: ctx 已结束的操作改动了存储: %v", ctxName, kv.data)
+		}
+	}
+}
+
+// TestSessionOps_EmptyJTIKeepsExistingSemantics 输入本身非法时保持原有结果，不因 ctx 改变：
+// 空 jti 校验 / 轮换仍是「已失效」，吊销空 jti 仍是无操作。
+func TestSessionOps_EmptyJTIKeepsExistingSemantics(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	s, kv, _ := newDeadlineStore(t)
+	if _, err := s.ValidateSession(canceled, 7, ""); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("空 jti 校验应为已失效，实际: %v", err)
+	}
+	if err := s.RotateSession(canceled, 7, "", "jti-b", time.Hour, 1); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("空 jti 轮换应为已失效，实际: %v", err)
+	}
+	if err := s.RevokeSession(canceled, ""); err != nil {
+		t.Fatalf("空 jti 吊销应为无操作，实际: %v", err)
+	}
+	if err := s.RegisterSession(canceled, 7, "", time.Hour, 1); err == nil || errors.Is(err, context.Canceled) {
+		t.Fatalf("空 jti 登记应按参数错误拒绝，实际: %v", err)
+	}
+	if len(kv.calls) != 0 {
+		t.Fatalf("非法输入不应访问存储: %v", kv.calls)
+	}
+}
+
+// TestSessionOps_DeriveBoundedDeadline 每个操作都在调用方 ctx 上派生期限：
+// 父 ctx 没有期限或期限更晚时，存储拿到的期限是调用时刻 + SessionOperationTimeout；
+// 父 ctx 期限更早时原样沿用父期限；父 ctx 的值也一并传下去。
+func TestSessionOps_DeriveBoundedDeadline(t *testing.T) {
+	type marker struct{}
+	// 父期限在每次调用前现算：「更早」比会话预算早 1 秒，留足余量，慢机器上也不会先到期
+	for parentName, parentDeadline := range map[string]func() time.Time{
+		"无期限":  func() time.Time { return time.Time{} },
+		"期限更晚": func() time.Time { return time.Now().Add(time.Hour) },
+		"期限更早": func() time.Time { return time.Now().Add(SessionOperationTimeout - time.Second) },
+	} {
+		s, kv, versions := newDeadlineStore(t)
+		for opName, op := range sessionOps(s) {
+			kv.data[sessionJTIKeyPrefix+"jti-a"] = "7:1"
+			delete(kv.data, sessionJTIKeyPrefix+"jti-b")
+			kv.calls, kv.ctxs, versions.ctxs = nil, nil, nil
+
+			parent := context.WithValue(context.Background(), marker{}, opName)
+			early := parentDeadline()
+			if !early.IsZero() {
+				var cancel context.CancelFunc
+				parent, cancel = context.WithDeadline(parent, early)
+				defer cancel()
+			}
+			start := time.Now()
+			if err := op(parent); err != nil {
+				t.Fatalf("%s/%s: 操作应成功，实际: %v", parentName, opName, err)
+			}
+			end := time.Now()
+
+			ctxs := append(append([]context.Context{}, kv.ctxs...), versions.ctxs...)
+			if len(ctxs) == 0 {
+				t.Fatalf("%s/%s: 没有访问存储", parentName, opName)
+			}
+			for _, ctx := range ctxs {
+				if ctx.Value(marker{}) != opName {
+					t.Fatalf("%s/%s: 存储拿到的 ctx 不是从调用方 ctx 派生的", parentName, opName)
+				}
+				deadline, ok := ctx.Deadline()
+				if !ok {
+					t.Fatalf("%s/%s: 存储拿到的 ctx 没有期限", parentName, opName)
+				}
+				if parentName == "期限更早" {
+					if !deadline.Equal(early) {
+						t.Fatalf("%s/%s: 父期限更早时应沿用父期限 %v，实际 %v", parentName, opName, early, deadline)
+					}
+					continue
+				}
+				if deadline.Before(start.Add(SessionOperationTimeout)) || deadline.After(end.Add(SessionOperationTimeout)) {
+					t.Fatalf("%s/%s: 期限应为调用时刻 + %v，实际 %v（调用区间 %v ~ %v）",
+						parentName, opName, SessionOperationTimeout, deadline, start, end)
+				}
+			}
+		}
+	}
+}
+
+// TestValidateSession_ResolverSharesGetBudget GET 与认证版本查询共用同一个期限：
+// 版本查询拿到的期限与 GET 完全相同，GET 用掉的时间不会重新补给版本查询。
+func TestValidateSession_ResolverSharesGetBudget(t *testing.T) {
+	s, kv, versions := newDeadlineStore(t)
+	kv.data[sessionJTIKeyPrefix+"jti-a"] = "7:1"
+	if _, err := s.ValidateSession(context.Background(), 7, "jti-a"); err != nil {
+		t.Fatal(err)
+	}
+	if len(kv.ctxs) != 1 || len(versions.ctxs) != 1 {
+		t.Fatalf("期望一次 GET 和一次版本查询，实际 kv=%v versions=%d", kv.calls, len(versions.ctxs))
+	}
+	getDeadline, _ := kv.ctxs[0].Deadline()
+	resolverDeadline, ok := versions.ctxs[0].Deadline()
+	if !ok || !resolverDeadline.Equal(getDeadline) {
+		t.Fatalf("版本查询应沿用 GET 的期限 %v，实际 %v", getDeadline, resolverDeadline)
+	}
+}
+
+// TestValidateSession_BudgetSpentByGetSkipsResolver GET 期间预算用完（这里用取消父 ctx
+// 确定性地模拟）：即便 GET 返回了数据，也不再查认证版本，按存储不可用拒绝。
+func TestValidateSession_BudgetSpentByGetSkipsResolver(t *testing.T) {
+	s, kv, versions := newDeadlineStore(t)
+	kv.data[sessionJTIKeyPrefix+"jti-a"] = "7:1"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	kv.after = func(string) error { cancel(); return nil }
+
+	_, err := s.ValidateSession(ctx, 7, "jti-a")
+	assertSessionCtxError(t, err, context.Canceled)
+	if len(versions.ctxs) != 0 {
+		t.Fatal("预算用完后不应再查认证版本")
+	}
+}
+
+// TestValidateSession_ExpiredBeforeSuccessReturn 版本查询期间预算用完、查询本身不理会 ctx
+// 照样返回了匹配的版本：不能当成通过。
+func TestValidateSession_ExpiredBeforeSuccessReturn(t *testing.T) {
+	s, kv, versions := newDeadlineStore(t)
+	kv.data[sessionJTIKeyPrefix+"jti-a"] = "7:1"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	versions.before = cancel
+
+	_, err := s.ValidateSession(ctx, 7, "jti-a")
+	assertSessionCtxError(t, err, context.Canceled)
+}
+
+// TestSessionOps_DriverErrorAfterDeadlineKeepsCtxError 驱动在期限到达后返回错误时，
+// 结果仍是存储不可用，并能用 errors.Is 认出 ctx 的错误。
+func TestSessionOps_DriverErrorAfterDeadlineKeepsCtxError(t *testing.T) {
+	s, kv, _ := newDeadlineStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	kv.data[sessionJTIKeyPrefix+"jti-a"] = "7:1"
+	kv.after = func(string) error { cancel(); return errFakeDown }
+
+	_, err := s.ValidateSession(ctx, 7, "jti-a")
+	assertSessionCtxError(t, err, context.Canceled)
+}
+
+// TestSessionMutations_ExpiredAfterWriteFailClosed 写操作已经落到存储、但返回前预算用完：
+// 结果按存储不可用报告（写入结果对调用方未知），不回滚、不恢复旧会话；
+// 之后带新 ctx 的请求照常成功。
+func TestSessionMutations_ExpiredAfterWriteFailClosed(t *testing.T) {
+	t.Run("登记", func(t *testing.T) {
+		s, kv, _ := newDeadlineStore(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		kv.after = func(string) error { cancel(); return nil }
+		assertSessionCtxError(t, s.RegisterSession(ctx, 7, "jti-late", time.Hour, 1), context.Canceled)
+		if kv.data[sessionJTIKeyPrefix+"jti-late"] != "7:1" {
+			t.Fatal("用例前提：写入已经发生")
+		}
+
+		kv.after = nil
+		if err := s.RegisterSession(context.Background(), 7, "jti-next", time.Hour, 1); err != nil {
+			t.Fatalf("恢复后的新登记应成功: %v", err)
+		}
+		if _, err := s.ValidateSession(context.Background(), 7, "jti-next"); err != nil {
+			t.Fatalf("恢复后的新会话应可用: %v", err)
+		}
+	})
+
+	t.Run("轮换", func(t *testing.T) {
+		s, kv, _ := newDeadlineStore(t)
+		kv.data[sessionJTIKeyPrefix+"old"] = "7:1"
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		kv.after = func(string) error { cancel(); return nil }
+		assertSessionCtxError(t, s.RotateSession(ctx, 7, "old", "new", time.Hour, 1), context.Canceled)
+
+		kv.after = nil
+		if _, err := s.ValidateSession(context.Background(), 7, "old"); !errors.Is(err, ErrSessionRevoked) {
+			t.Fatalf("已提交的轮换不应被回滚、旧会话不应复活: %v", err)
+		}
+	})
+
+	t.Run("吊销", func(t *testing.T) {
+		s, kv, _ := newDeadlineStore(t)
+		kv.data[sessionJTIKeyPrefix+"jti-a"] = "7:1"
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		kv.after = func(string) error { cancel(); return nil }
+		assertSessionCtxError(t, s.RevokeSession(ctx, "jti-a"), context.Canceled)
+	})
+}

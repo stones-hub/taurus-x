@@ -82,7 +82,7 @@ func (c *AuthController) Login(w http.ResponseWriter, r *http.Request) {
 	// 让签发侧现查当前版本会给「旧密码并发登录」留出可用会话。
 	// 令牌写入响应之后才记「登录成功」：写入失败时会话已被吊销，客户端也没拿到令牌，
 	// 这次登录实际没有成功，审计日志必须如实记失败。
-	expiresAt, err := middleware.IssueLoginJWT(w, fmt.Sprintf("%d", user.UserID), user.Username, authVersion)
+	expiresAt, err := middleware.IssueLoginJWT(r.Context(), w, fmt.Sprintf("%d", user.UserID), user.Username, authVersion)
 	if err != nil {
 		if errors.Is(err, middleware.ErrJWTWriteFailed) {
 			log.Printf("登录写入令牌失败: %v\n", err)
@@ -133,7 +133,7 @@ func (c *AuthController) Logout(w http.ResponseWriter, r *http.Request) {
 	// Token 解析不出来（缺失/过期/签名不对）时无需吊销：这种 Token 本来就过不了认证。
 	if token := middleware.GetJWTToken(r); token != "" {
 		if claims, _, err := middleware.ValidateJWTToken(token); err == nil && claims.JTI != "" {
-			if err := middleware.AuthSessionStore().RevokeSession(claims.JTI); err != nil {
+			if err := middleware.AuthSessionStore().RevokeSession(r.Context(), claims.JTI); err != nil {
 				// 吊销失败不能报成功：客户端以为登出了，服务端其实还认这个 Token。
 				log.Printf("登出吊销会话失败: %v\n", err)
 				Fail(w, http.StatusInternalServerError, "登出失败，请重试")
@@ -157,7 +157,7 @@ func (c *AuthController) RefreshToken(w http.ResponseWriter, r *http.Request) {
 		Fail(w, http.StatusUnauthorized, "缺少JWT令牌")
 		return
 	}
-	expiresAt, err := middleware.RefreshJWTToken(w, token)
+	expiresAt, err := middleware.RefreshJWTToken(r.Context(), w, token)
 	if err != nil {
 		if errors.Is(err, store.ErrSessionStoreUnavailable) {
 			Fail(w, http.StatusServiceUnavailable, "认证服务暂时不可用")

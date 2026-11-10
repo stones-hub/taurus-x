@@ -923,7 +923,7 @@ func assertSessionRevocationWiring(t *testing.T, outDir string) {
 	}
 
 	jwt := readFile(t, filepath.Join(backend, "app", "middleware", "jwt.go"))
-	if !strings.Contains(jwt, "func GenerateJWTToken(uid, username string, authVersion int64)") {
+	if !strings.Contains(jwt, "func GenerateJWTToken(ctx context.Context, uid, username string, authVersion int64)") {
 		t.Error("GenerateJWTToken 必须由调用方传入 authVersion，不能自己现读当前版本")
 	}
 	rotate := funcBody(jwt, "func rotateSession(")
@@ -932,11 +932,32 @@ func assertSessionRevocationWiring(t *testing.T, outDir string) {
 	}
 	// 刷新必须沿用 ValidateSession 返回的旧版本；现读当前版本会让刷新
 	// 变成绕过改密/禁用吊销的后门。
-	if !strings.Contains(rotate, "RotateSession(userID, oldJTI, newJTI, ttl, authVersion)") {
+	if !strings.Contains(rotate, "RotateSession(ctx, userID, oldJTI, newJTI, ttl, authVersion)") {
 		t.Error("rotateSession 必须以旧会话校验时拿到的版本登记新会话")
 	}
 	if strings.Contains(rotate, "CurrentAuthVersion") {
 		t.Error("rotateSession 不得重新读取当前认证版本")
+	}
+	// 校验、签名、轮换共用一个会话预算，不能每步各自重新计时，也不能另开 Background
+	if !strings.Contains(rotate, "context.WithTimeout(ctx, store.SessionOperationTimeout)") || strings.Contains(rotate, "context.Background()") {
+		t.Error("rotateSession 必须在调用方 ctx 上派生唯一的会话预算")
+	}
+	// 刷新入口建立预算：解析、轮换、写 Cookie 前的检查共用它（rotateSession 内再派生不会延长）
+	refresh := funcBody(jwt, "func RefreshJWTToken(")
+	if budget := strings.Index(refresh, "context.WithTimeout(ctx, store.SessionOperationTimeout)"); budget < 0 ||
+		budget > strings.Index(refresh, "parseJWT(") || strings.Contains(refresh, "context.Background()") {
+		t.Error("RefreshJWTToken 必须在解析令牌前、在调用方 ctx 上建立会话预算")
+	}
+	if !strings.Contains(store, "const SessionOperationTimeout = 2 * time.Second") {
+		t.Error("会话操作期限应固定为 store.SessionOperationTimeout = 2s")
+	}
+	if strings.Contains(store, "context.Background()") {
+		t.Error("auth_redis_store.go 不得再用 context.Background() 访问存储，必须使用调用方 ctx")
+	}
+	// 不开这个选项，ctx 的 deadline 管不到已经发出的 Redis 命令的 socket 读写
+	components := readFile(t, filepath.Join(backend, "internal", "taurus", "components.go"))
+	if !strings.Contains(components, "redisx.WithContextTimeoutEnabled(true)") {
+		t.Error("Redis 初始化必须开启 WithContextTimeoutEnabled(true)，会话期限才能约束 socket 读写")
 	}
 
 	// 6. 权威来源要在启动时注入；没注入时会话校验 fail closed，所以必须有这步

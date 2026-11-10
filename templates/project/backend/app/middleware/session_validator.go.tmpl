@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -16,11 +17,14 @@ import (
 //
 // RegisterSession 的 authVersion 必须由调用方从「校验凭证/状态的那次读取」带入，
 // ValidateSession 回传会话登记时的版本，供刷新 Token 原样沿用（见 rotateSession）。
+//
+// 四个方法的 ctx 都来自请求（或在请求 ctx 上派生的会话预算）：实现在其上派生
+// store.SessionOperationTimeout 期限，ctx 已取消 / 已过期时不发起 I/O，按存储不可用拒绝。
 type SessionStore interface {
-	RegisterSession(userID uint64, jti string, ttl time.Duration, authVersion int64) error
-	ValidateSession(userID uint64, jti string) (int64, error)
-	RevokeSession(jti string) error
-	RotateSession(userID uint64, oldJTI, newJTI string, ttl time.Duration, authVersion int64) error
+	RegisterSession(ctx context.Context, userID uint64, jti string, ttl time.Duration, authVersion int64) error
+	ValidateSession(ctx context.Context, userID uint64, jti string) (int64, error)
+	RevokeSession(ctx context.Context, jti string) error
+	RotateSession(ctx context.Context, userID uint64, oldJTI, newJTI string, ttl time.Duration, authVersion int64) error
 }
 
 // 默认用 Redis 实现；实例内部惰性解析组件容器，所以这里可以在 init 阶段构造。
@@ -47,7 +51,8 @@ func AuthSessionStore() SessionStore {
 //     （同一秒内改密也能吊销），也不受 Redis 淘汰影响（键丢了只会被拒）；
 //  2. 拿不到 claims / jti 时直接拒绝，而不是放行；
 //  3. Redis 或认证版本来源不可用时返回 503 拒绝请求（fail closed），
-//     不会退化成「谁都能过」。
+//     不会退化成「谁都能过」；本次校验超过 store.SessionOperationTimeout 或请求已取消，
+//     同样按不可用拒绝，不进入下游。
 //
 // 注意：需在 JWTMiddleware 之后使用（依赖 JWT 中间件注入的 claims）。
 func SessionValidatorMiddleware() func(next http.Handler) http.Handler {
@@ -65,7 +70,7 @@ func SessionValidatorMiddleware() func(next http.Handler) http.Handler {
 				return
 			}
 
-			if _, err := AuthSessionStore().ValidateSession(userID, claims.JTI); err != nil {
+			if _, err := AuthSessionStore().ValidateSession(r.Context(), userID, claims.JTI); err != nil {
 				if errors.Is(err, store.ErrSessionStoreUnavailable) {
 					// 认证依赖不可用时拒绝请求，恢复后自动恢复正常
 					httpx.SendResponse(w, http.StatusServiceUnavailable, "认证服务暂时不可用，请稍后重试", nil)

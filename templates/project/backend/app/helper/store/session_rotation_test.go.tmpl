@@ -13,7 +13,7 @@ import (
 func TestAtomicRotationSingleUse(t *testing.T) {
 	kv := newFakeKV()
 	store := NewAuthRedisStoreWith(kv, newFakeAuthVersions(7))
-	if err := store.RegisterSession(7, "old", time.Hour, 1); err != nil {
+	if err := store.RegisterSession(context.Background(), 7, "old", time.Hour, 1); err != nil {
 		t.Fatal(err)
 	}
 	var successes atomic.Int32
@@ -22,7 +22,7 @@ func TestAtomicRotationSingleUse(t *testing.T) {
 		wait.Add(1)
 		go func(index int) {
 			defer wait.Done()
-			err := store.RotateSession(7, "old", fmt.Sprintf("new-%d", index), time.Hour, 1)
+			err := store.RotateSession(context.Background(), 7, "old", fmt.Sprintf("new-%d", index), time.Hour, 1)
 			if err == nil {
 				successes.Add(1)
 			} else if !errors.Is(err, ErrSessionRevoked) {
@@ -40,40 +40,40 @@ func TestAtomicRotationLogoutAndFaultBoundaries(t *testing.T) {
 	for _, logoutFirst := range []bool{true, false} {
 		kv := newFakeKV()
 		store := NewAuthRedisStoreWith(kv, newFakeAuthVersions(7))
-		if err := store.RegisterSession(7, "old", time.Hour, 1); err != nil {
+		if err := store.RegisterSession(context.Background(), 7, "old", time.Hour, 1); err != nil {
 			t.Fatal(err)
 		}
 		if logoutFirst {
-			if err := store.RevokeSession("old"); err != nil {
+			if err := store.RevokeSession(context.Background(), "old"); err != nil {
 				t.Fatal(err)
 			}
-			if err := store.RotateSession(7, "old", "new", time.Hour, 1); !errors.Is(err, ErrSessionRevoked) {
+			if err := store.RotateSession(context.Background(), 7, "old", "new", time.Hour, 1); !errors.Is(err, ErrSessionRevoked) {
 				t.Fatalf("rotation after logout: %v", err)
 			}
 		} else {
 			kv.failing = true
-			if err := store.RotateSession(7, "old", "new", time.Hour, 1); !errors.Is(err, ErrSessionStoreUnavailable) {
+			if err := store.RotateSession(context.Background(), 7, "old", "new", time.Hour, 1); !errors.Is(err, ErrSessionStoreUnavailable) {
 				t.Fatalf("fault must fail closed: %v", err)
 			}
 			kv.failing = false
-			if _, err := store.ValidateSession(7, "old"); err != nil {
+			if _, err := store.ValidateSession(context.Background(), 7, "old"); err != nil {
 				t.Fatal(err)
 			}
-			if err := store.RotateSession(7, "old", "new", time.Hour, 1); err != nil {
+			if err := store.RotateSession(context.Background(), 7, "old", "new", time.Hour, 1); err != nil {
 				t.Fatal(err)
 			}
-			if err := store.RevokeSession("old"); err != nil {
+			if err := store.RevokeSession(context.Background(), "old"); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := store.ValidateSession(7, "new"); err != nil {
+			if _, err := store.ValidateSession(context.Background(), 7, "new"); err != nil {
 				t.Fatalf("old-token logout cannot revoke unknown successor: %v", err)
 			}
 			kv.failing = true
-			if _, err := store.ValidateSession(7, "old"); !errors.Is(err, ErrSessionStoreUnavailable) {
+			if _, err := store.ValidateSession(context.Background(), 7, "old"); !errors.Is(err, ErrSessionStoreUnavailable) {
 				t.Fatal(err)
 			}
 			kv.failing = false
-			if _, err := store.ValidateSession(7, "old"); !errors.Is(err, ErrSessionRevoked) {
+			if _, err := store.ValidateSession(context.Background(), 7, "old"); !errors.Is(err, ErrSessionRevoked) {
 				t.Fatalf("consumed token resurrected: %v", err)
 			}
 		}
@@ -106,16 +106,16 @@ func (kv committedRotationErrorKV) Rotate(ctx context.Context, oldKey, newKey, v
 func TestRotationLostResponseDoesNotResurrectConsumedSession(t *testing.T) {
 	kv := committedRotationErrorKV{newFakeKV()}
 	store := NewAuthRedisStoreWith(kv, newFakeAuthVersions(7))
-	if err := store.RegisterSession(7, "old", time.Hour, 1); err != nil {
+	if err := store.RegisterSession(context.Background(), 7, "old", time.Hour, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RotateSession(7, "old", "new", time.Hour, 1); !errors.Is(err, ErrSessionStoreUnavailable) {
+	if err := store.RotateSession(context.Background(), 7, "old", "new", time.Hour, 1); !errors.Is(err, ErrSessionStoreUnavailable) {
 		t.Fatalf("unknown outcome did not fail closed: %v", err)
 	}
-	if _, err := store.ValidateSession(7, "old"); !errors.Is(err, ErrSessionRevoked) {
+	if _, err := store.ValidateSession(context.Background(), 7, "old"); !errors.Is(err, ErrSessionRevoked) {
 		t.Fatalf("consumed session was restored: %v", err)
 	}
-	if _, err := store.ValidateSession(7, "new"); err != nil {
+	if _, err := store.ValidateSession(context.Background(), 7, "new"); err != nil {
 		t.Fatalf("committed successor missing: %v", err)
 	}
 }

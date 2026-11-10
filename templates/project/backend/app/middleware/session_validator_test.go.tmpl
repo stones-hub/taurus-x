@@ -56,12 +56,12 @@ func (f *fakeSessionStore) bumpVersion(uid uint64) int64 {
 // login 以当前版本登记一个会话（等价于一次成功登录）。
 func (f *fakeSessionStore) login(t *testing.T, uid uint64, jti string) {
 	t.Helper()
-	if err := f.RegisterSession(uid, jti, time.Hour, f.currentVersion(uid)); err != nil {
+	if err := f.RegisterSession(context.Background(), uid, jti, time.Hour, f.currentVersion(uid)); err != nil {
 		t.Fatalf("登记会话 %s 失败: %v", jti, err)
 	}
 }
 
-func (f *fakeSessionStore) RegisterSession(userID uint64, jti string, _ time.Duration, authVersion int64) error {
+func (f *fakeSessionStore) RegisterSession(_ context.Context, userID uint64, jti string, _ time.Duration, authVersion int64) error {
 	if f.unavailable {
 		return store.ErrSessionStoreUnavailable
 	}
@@ -73,7 +73,7 @@ func (f *fakeSessionStore) RegisterSession(userID uint64, jti string, _ time.Dur
 	return nil
 }
 
-func (f *fakeSessionStore) ValidateSession(userID uint64, jti string) (int64, error) {
+func (f *fakeSessionStore) ValidateSession(_ context.Context, userID uint64, jti string) (int64, error) {
 	if f.unavailable {
 		return 0, store.ErrSessionStoreUnavailable
 	}
@@ -87,7 +87,7 @@ func (f *fakeSessionStore) ValidateSession(userID uint64, jti string) (int64, er
 	return s.version, nil
 }
 
-func (f *fakeSessionStore) RevokeSession(jti string) error {
+func (f *fakeSessionStore) RevokeSession(_ context.Context, jti string) error {
 	if f.unavailable {
 		return store.ErrSessionStoreUnavailable
 	}
@@ -96,7 +96,7 @@ func (f *fakeSessionStore) RevokeSession(jti string) error {
 	return nil
 }
 
-func (f *fakeSessionStore) RotateSession(userID uint64, oldJTI, newJTI string, ttl time.Duration, authVersion int64) error {
+func (f *fakeSessionStore) RotateSession(ctx context.Context, userID uint64, oldJTI, newJTI string, ttl time.Duration, authVersion int64) error {
 	if f.unavailable {
 		return store.ErrSessionStoreUnavailable
 	}
@@ -104,10 +104,10 @@ func (f *fakeSessionStore) RotateSession(userID uint64, oldJTI, newJTI string, t
 	if !ok || old.uid != userID || old.version != authVersion {
 		return store.ErrSessionRevoked
 	}
-	if err := f.RegisterSession(userID, newJTI, ttl, authVersion); err != nil {
+	if err := f.RegisterSession(ctx, userID, newJTI, ttl, authVersion); err != nil {
 		return err
 	}
-	return f.RevokeSession(oldJTI)
+	return f.RevokeSession(ctx, oldJTI)
 }
 
 // withFakeSessionStore 安装假存储并在用例结束后还原，避免用例间互相影响。
@@ -169,7 +169,7 @@ func TestSessionValidator_DeniesRevoked(t *testing.T) {
 	fake.login(t, 7, "jti-a")
 
 	// 模拟登出
-	if err := fake.RevokeSession("jti-a"); err != nil {
+	if err := fake.RevokeSession(context.Background(), "jti-a"); err != nil {
 		t.Fatalf("吊销失败: %v", err)
 	}
 
@@ -186,7 +186,7 @@ func TestSessionValidator_DeniesRevoked(t *testing.T) {
 func TestSessionValidator_RevokeDoesNotHarmNewLogin(t *testing.T) {
 	fake := withFakeSessionStore(t)
 	fake.login(t, 7, "jti-old")
-	_ = fake.RevokeSession("jti-old")
+	_ = fake.RevokeSession(context.Background(), "jti-old")
 	// 同一时刻重新登录
 	fake.login(t, 7, "jti-new")
 
@@ -292,7 +292,7 @@ func TestSessionStore_DefaultIsRedisBacked(t *testing.T) {
 		t.Fatalf("默认会话存储应为 *store.AuthRedisStore，实际 %T", prev)
 	}
 	// 测试进程里没有 Redis，默认实现必须报存储不可用
-	if _, err := prev.ValidateSession(7, "jti-a"); !errors.Is(err, store.ErrSessionStoreUnavailable) {
+	if _, err := prev.ValidateSession(context.Background(), 7, "jti-a"); !errors.Is(err, store.ErrSessionStoreUnavailable) {
 		t.Fatalf("默认实现在无 Redis 时应返回存储不可用，实际: %v", err)
 	}
 

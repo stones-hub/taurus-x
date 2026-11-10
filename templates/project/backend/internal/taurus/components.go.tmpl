@@ -235,6 +235,12 @@ func ProvideRedisComponent(cfg *config.Config) (*redisx.RedisClient, func(), err
 			time.Duration(cfg.GetInt("redis.read_timeout"))*time.Second,
 			time.Duration(cfg.GetInt("redis.write_timeout"))*time.Second),
 		redisx.WithMaxRetries(cfg.GetInt("redis.max_retries")),
+		// 命令的 socket 读写期限取「调用方 ctx 的 deadline」与上面 read/write timeout 中更早的那个，
+		// 会话操作的期限（store.SessionOperationTimeout）才能约束到已经发出的 GET / SET / EVAL。
+		// 等连接池、等拨号结果、重试退避本来就响应 ctx 取消；只有已阻塞的 socket 读写只认 deadline、
+		// 不监听取消，ctx 被手动取消后仍可能等到剩余期限才返回。
+		// 这个选项来自 go.mod 依赖的已发布 taurus-pro-storage v0.3.1（组件默认关闭，这里显式开启）。
+		redisx.WithContextTimeoutEnabled(true),
 		redisx.WithLogging(redisLogger),
 	); err != nil {
 		return nil, func() {}, err

@@ -45,7 +45,7 @@ var All = []Component{
 	{
 		Name:        "storage",
 		Package:     "github.com/stones-hub/taurus-pro-storage",
-		Version:     "v0.3.0",
+		Version:     "v0.3.1",
 		Required:    true,
 		Description: "存储：GORM 多库 + Redis（后台底座依赖）",
 	},

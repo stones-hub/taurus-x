@@ -432,6 +432,27 @@ mysql -uroot -p {{ .DBName }} -e "UPDATE admin_user_logins SET login_credential=
   - 吊销标记不放 Redis，是因为 Redis 可淘汰、可重启丢失：计数一丢，已吊销的会话会复活。
     现在丢的只可能是 jti 键，而 jti 键丢失的后果是**拒绝**，方向是安全的；
   - 会话校验依赖的 Redis 或版本来源出错时**拒绝放行**（fail closed），而不是放过去。
+  - 每次会话操作有固定 **2 秒**期限（`store.SessionOperationTimeout`，不可配置）：登记、校验（Redis GET 与
+    认证版本查询共用这 2 秒）、轮换、吊销各在请求 ctx 上派生一个预算，请求 ctx 的期限更早时以它为准。
+    刷新先经会话中间件校验一次，再由刷新接口在入口建立的一个预算内完成解析、校验 + 签名 + 轮换和写 Cookie 前的检查，
+    **两段合计可达约 4 秒**；
+    登录的会话登记与写入失败后的尽力吊销共用一个预算，不另开。到期或请求已取消按会话存储不可用处理：
+    会话校验 / 刷新 / 登录回 503，登出回 500 且不清 Cookie；不放行、不下发令牌或 Cookie。
+  - 这只是会话依赖的等待上限，**不是整个 HTTP 请求的时限**：bcrypt、登录日志、最后登录信息、业务查询都不受它约束。
+  - Redis 命令的 socket 读写要遵守这个期限，靠 Redis 组件开启 `WithContextTimeoutEnabled(true)`（`internal/taurus/components.go`）：
+    socket 期限取 ctx deadline 与 `redis.toml` 读写超时中更早的那个。按驱动源码（go-redis v9.23.0），等连接池空闲连接、
+    等拨号结果、重试之间的退避会响应 ctx 取消；**只有已经阻塞的 socket 读写**只认 deadline、不监听取消，
+    请求被手动取消时这类读写**仍可能等到剩余期限**才返回，不是立即中止。
+  - 写操作（登记 / 轮换 / 吊销）超时后，Redis 端是否已写入**未知**：不回滚、不恢复旧会话、不补发令牌，按失败处理；
+    轮换已提交而响应超时时，旧令牌同样不再可用，用户需要重新登录。
+  - 测试边界：生成项目里的单测用 fake 存储验证期限传递、共享预算、取消后拒绝与不下发 Cookie，不经过 Redis socket；
+    静默 GET、冷连接握手的 socket 期限由组件自身测试覆盖。手动取消已阻塞的读写、连接池占满、写阻塞、拨号等待、
+    重试退避等场景没有专门测过。
+  > **依赖状态**：`redisx.WithContextTimeoutEnabled` 来自 `go.mod` 依赖的已发布 taurus-pro-storage v0.3.1，
+  > 模板不带 replace；该选项在组件里默认关闭，由 `internal/taurus/components.go` 显式开启。
+  > 维护方已完成该公开版本的必选、典型、全选组合生成 / Wire / 构建测试及各组合认证三包 race 重复三次；
+  > 同源 Linux 候选原生 / Docker 的正常认证、Redis 故障拒绝、Cookie 不变及同应用恢复增量验收通过。
+  > 这不是三组合逐一双部署或全部生产场景认证；部署与未验边界见 `docs/部署文档.md`。
 - **浏览器端只用 HttpOnly Cookie**：登录 / 刷新的响应体和响应头都不含令牌，后端只从 `jwt_token` Cookie 读令牌，
   不接受 `Authorization: Bearer` / `jwt_token` 请求头；前端不保存令牌（localStorage 里旧版本残留的令牌启动时删除），
   路由守卫只看非 HttpOnly 的 CSRF Cookie 是否存在，最终以服务端 401 为准。脚本调用用 cookie jar + `x-csrf-token` 头，

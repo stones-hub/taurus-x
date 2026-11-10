@@ -31,6 +31,17 @@ import (
 // 改密后新登录会以新版本重新登记，不会被误伤。
 const sessionJTIKeyPrefix = "auth:jti:"
 
+// SessionOperationTimeout 一次会话操作（登记 / 校验 / 轮换 / 吊销）的总期限。
+//
+// 每个操作入口在调用方 ctx 上派生**一个**期限，操作内的所有 I/O 共用它（校验的 GET 与
+// 认证版本查询共用同一份预算，不是各给 2 秒）；调用方 ctx 的期限更早时以调用方为准。
+// 它只约束会话操作本身，不是整个 HTTP 请求的期限。
+//
+// Redis 命令的 socket 读写要遵守这个期限，依赖 Redis 组件开启 ContextTimeoutEnabled
+// （见 internal/taurus/components.go）。等连接池、等拨号结果、重试退避会响应 ctx 取消；
+// 只有已阻塞的 socket 读写只认 deadline、不监听取消，ctx 被手动取消后仍可能等到剩余期限才返回，不是立即中止。
+const SessionOperationTimeout = 2 * time.Second
+
 var (
 	// ErrSessionStoreUnavailable 会话存储不可用（Redis 未初始化、访问失败，
 	// 或认证版本权威来源不可用）。认证链路遇到它必须拒绝请求（fail closed）。
@@ -129,10 +140,44 @@ func (s *AuthRedisStore) kvStore() (KVStore, error) {
 	}}, nil
 }
 
-func (s *AuthRedisStore) RotateSession(userID uint64, oldJTI, newJTI string, ttl time.Duration, authVersion int64) error {
+// sessionContext 在调用方 ctx 上派生本次会话操作的期限（见 SessionOperationTimeout）。
+// ctx 已取消或已过期时直接返回错误，调用方不得再发起任何 I/O。
+func sessionContext(parent context.Context) (context.Context, context.CancelFunc, error) {
+	ctx, cancel := context.WithTimeout(parent, SessionOperationTimeout)
+	if err := ctx.Err(); err != nil {
+		cancel()
+		return nil, nil, sessionExpired(err)
+	}
+	return ctx, cancel, nil
+}
+
+// sessionExpired 期限已到或被取消：按存储不可用拒绝，同时保留 ctx 的错误供 errors.Is 区分。
+func sessionExpired(ctxErr error) error {
+	return fmt.Errorf("%w: %w", ErrSessionStoreUnavailable, ctxErr)
+}
+
+// storeFailure 存储访问失败一律归为 ErrSessionStoreUnavailable；
+// 失败时本次期限已到或被取消的，一并保留 ctx 的错误。
+func storeFailure(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("%w: %w: %v", ErrSessionStoreUnavailable, ctxErr, err)
+	}
+	return fmt.Errorf("%w: %v", ErrSessionStoreUnavailable, err)
+}
+
+// RotateSession 在一次 Redis 原子操作里核对并消费旧会话、登记新会话。
+//
+// 写入超时或期限在写入后才到时，Redis 端可能已经轮换成功：这里照样返回存储不可用，
+// 不回滚、不恢复旧会话，调用方也不得把新令牌交给客户端（失败即关闭）。
+func (s *AuthRedisStore) RotateSession(ctx context.Context, userID uint64, oldJTI, newJTI string, ttl time.Duration, authVersion int64) error {
 	if oldJTI == "" || newJTI == "" || oldJTI == newJTI || ttl.Milliseconds() <= 0 || authVersion <= 0 {
 		return ErrSessionRevoked
 	}
+	ctx, cancel, err := sessionContext(ctx)
+	if err != nil {
+		return err
+	}
+	defer cancel()
 	kv, err := s.kvStore()
 	if err != nil {
 		return err
@@ -141,12 +186,15 @@ func (s *AuthRedisStore) RotateSession(userID uint64, oldJTI, newJTI string, ttl
 	if !ok {
 		return ErrSessionStoreUnavailable
 	}
-	rotated, err := rotator.Rotate(context.Background(), sessionJTIKeyPrefix+oldJTI, sessionJTIKeyPrefix+newJTI, fmt.Sprintf("%d:%d", userID, authVersion), ttl)
+	rotated, err := rotator.Rotate(ctx, sessionJTIKeyPrefix+oldJTI, sessionJTIKeyPrefix+newJTI, fmt.Sprintf("%d:%d", userID, authVersion), ttl)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrSessionStoreUnavailable, err)
+		return storeFailure(ctx, err)
 	}
 	if !rotated {
 		return ErrSessionRevoked
+	}
+	if err := ctx.Err(); err != nil {
+		return sessionExpired(err)
 	}
 	return nil
 }
@@ -167,7 +215,10 @@ func (s *AuthRedisStore) authVersions() (AuthVersionResolver, error) {
 // authVersion 必须由调用方从「校验凭证/状态的那次读取」里带进来，不能在这里
 // 现读一遍：现读会留下一个竞态窗口 —— 旧密码校验通过后、登记之前发生改密，
 // 登记就会用上新版本，旧凭证换来的会话反而活了下来。
-func (s *AuthRedisStore) RegisterSession(userID uint64, jti string, ttl time.Duration, authVersion int64) error {
+//
+// 写入超时或期限在写入后才到时返回存储不可用，但键可能已经写进 Redis（结果未知）；
+// 调用方此时不发令牌，残留的键只会在 TTL 内无人持有。
+func (s *AuthRedisStore) RegisterSession(ctx context.Context, userID uint64, jti string, ttl time.Duration, authVersion int64) error {
 	if jti == "" {
 		return errors.New("会话登记失败: 缺少 jti")
 	}
@@ -179,13 +230,21 @@ func (s *AuthRedisStore) RegisterSession(userID uint64, jti string, ttl time.Dur
 	if authVersion <= 0 {
 		return fmt.Errorf("%w: 会话登记失败: 缺少认证版本", ErrSessionStoreUnavailable)
 	}
+	ctx, cancel, err := sessionContext(ctx)
+	if err != nil {
+		return err
+	}
+	defer cancel()
 	kv, err := s.kvStore()
 	if err != nil {
 		return err
 	}
 	value := fmt.Sprintf("%d:%d", userID, authVersion)
-	if err := kv.Set(context.Background(), sessionJTIKeyPrefix+jti, value, ttl); err != nil {
-		return fmt.Errorf("%w: %v", ErrSessionStoreUnavailable, err)
+	if err := kv.Set(ctx, sessionJTIKeyPrefix+jti, value, ttl); err != nil {
+		return storeFailure(ctx, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return sessionExpired(err)
 	}
 	return nil
 }
@@ -194,18 +253,23 @@ func (s *AuthRedisStore) RegisterSession(userID uint64, jti string, ttl time.Dur
 //
 // 返回 nil error 才算通过；存储或版本来源故障返回 ErrSessionStoreUnavailable，
 // 调用方必须拒绝请求。返回的版本供「刷新 Token」原样沿用（见 middleware.rotateSession）。
-func (s *AuthRedisStore) ValidateSession(userID uint64, jti string) (int64, error) {
+// Redis GET 与认证版本查询共用同一个期限，GET 用掉的时间不会再补给版本查询。
+func (s *AuthRedisStore) ValidateSession(ctx context.Context, userID uint64, jti string) (int64, error) {
 	if jti == "" {
 		return 0, ErrSessionRevoked
 	}
+	ctx, cancel, err := sessionContext(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer cancel()
 	kv, err := s.kvStore()
 	if err != nil {
 		return 0, err
 	}
-	ctx := context.Background()
 	raw, err := kv.Get(ctx, sessionJTIKeyPrefix+jti)
 	if err != nil {
-		return 0, fmt.Errorf("%w: %v", ErrSessionStoreUnavailable, err)
+		return 0, storeFailure(ctx, err)
 	}
 	if raw == "" {
 		// 键不存在：已登出、已过期、被淘汰，或签发时未登记成功 —— 一律拒绝
@@ -223,29 +287,47 @@ func (s *AuthRedisStore) ValidateSession(userID uint64, jti string) (int64, erro
 	if err != nil {
 		return 0, err
 	}
+	// GET 已经用掉了一部分预算；到期了就不再查库
+	if err := ctx.Err(); err != nil {
+		return 0, sessionExpired(err)
+	}
 	current, err := resolver.CurrentAuthVersion(ctx, userID)
 	if err != nil {
-		return 0, fmt.Errorf("%w: 读取认证版本失败: %v", ErrSessionStoreUnavailable, err)
+		return 0, storeFailure(ctx, fmt.Errorf("读取认证版本失败: %v", err))
 	}
 	// current <= 0 表示用户不存在（约定见 AuthVersionResolver），按已吊销处理；
 	// 不相等（含 storedVersion 大于当前值这种异常）同样拒绝。
 	if current <= 0 || storedVersion != current {
 		return 0, ErrSessionRevoked
 	}
+	if err := ctx.Err(); err != nil {
+		return 0, sessionExpired(err)
+	}
 	return storedVersion, nil
 }
 
 // RevokeSession 吊销单个 Token（登出）。
-func (s *AuthRedisStore) RevokeSession(jti string) error {
+//
+// 空 jti 没有可吊销的会话，直接返回 nil，不访问存储。
+// 删除超时或期限在删除后才到时返回存储不可用，键可能已被删除（结果未知），调用方按失败处理。
+func (s *AuthRedisStore) RevokeSession(ctx context.Context, jti string) error {
 	if jti == "" {
 		return nil
 	}
+	ctx, cancel, err := sessionContext(ctx)
+	if err != nil {
+		return err
+	}
+	defer cancel()
 	kv, err := s.kvStore()
 	if err != nil {
 		return err
 	}
-	if err := kv.Del(context.Background(), sessionJTIKeyPrefix+jti); err != nil {
-		return fmt.Errorf("%w: %v", ErrSessionStoreUnavailable, err)
+	if err := kv.Del(ctx, sessionJTIKeyPrefix+jti); err != nil {
+		return storeFailure(ctx, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return sessionExpired(err)
 	}
 	return nil
 }

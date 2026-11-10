@@ -16,7 +16,8 @@
 >
 > **验证状态**：脚手架维护方实测过：Docker 方式（基础组件，arm64）；Ubuntu 裸机方式 A、B（Ubuntu 22.04 arm64 容器，含 supervisor 非 root 运行、更新与回滚）；nginx + `TRUSTED_PROXIES`；macOS 原生编译运行与 MySQL 8.4。以上均完成真实登录。
 > 脚手架 v0.6.0 发布前另在 linux/amd64 的隔离 Docker 测试环境验证过：全选组件生成的后端二进制直接在测试容器里运行，真实登录与权限页面通过，全部组件同时启用时就绪、收到 SIGTERM 后正常退出；原 `Dockerfile` 用 BuildKit 三阶段构建成功并核对过镜像内容，但这个镜像**没有启动**做业务验证。
-> **未实测**：带 systemd 的真实 Ubuntu 服务器（容器内用 `service` 代替了 `systemctl`）、在 amd64 服务器上按本文任一方式完整部署（上面的 amd64 验证是测试容器直接运行后端，不是本文的部署流程）、macOS 的 Homebrew 安装与 launchd 开机自启。
+> **后续候选补验**：linux/amd64 候选已在宿主原生与实际 Docker 镜像内运行，代表业务/API/UI、组件调用、隔离备份恢复与同镜像重建按各自范围通过。升级到公开 storage v0.3.1 后，标准 Dockerfile 无 replace 构建和静态核验通过，同源候选原生 / Docker 的正常认证、Redis 四路故障拒绝、Cookie 不变及同应用恢复增量验收完成；没有重跑全部 UI / 九组件，也不是三组合逐一双部署。
+> **仍未实测或未认证**：本文所有部署步骤在每种机器上的完整重演（包括真实 systemd / supervisor 安装配置）、macOS 的 Homebrew 安装与 launchd 开机自启、HTTPS、{{ if .Has.milvus }}生产外置 S3、{{ end }}跨版本回滚及容量认证。历史 Consul 依赖 TERM exit1 与 server 默认不 Leave 的版本语义一致，但原分支无日志直接证明，不称 graceful leave 已验；Docker UI 截图归档缺失，不冒完整截图证据。
 > 上线前请在你的目标机器上完整走一遍。
 >
 > 上线后的数据库备份 / 恢复、压测、SBOM 与漏洞扫描见 [`运维手册.md`](运维手册.md)。**Docker 方式**的 mysql 服务默认不映射端口，备份脚本只支持宿主机上的 MySQL 8.x 客户端，具体做法见运维手册 1.2 节。
@@ -1032,6 +1033,7 @@ curl -I http://{{ .ProjectName }}.example.com/
 | 刷新子路由 404 | 确认 Go 做 SPA 回退（history 模式），nginx 全量 `location /` 反代而非自 serve 静态 |
 | MySQL 连不上 | DSN 账号密码、账号 host（`localhost` vs `127.0.0.1`）、库是否存在 |
 | Redis 连不上 / 登录后马上失效 | `.env.local` / compose 的 `REDIS_*` 与实际一致；Redis 不可用时会话校验会拒绝请求 |
+| Redis 卡住时请求要等几秒才报「认证服务暂时不可用」 | 预期行为：每次会话操作约 2 秒期限到达后按 503 拒绝（刷新两段合计约 4 秒），登出回 500；这不是整个请求的时限，其它步骤另计。写操作超时后 Redis 端是否已写入未知，需要时让用户重新登录。详见 `README.md` 里「Token 吊销」相关条目 |
 | 配置值解析报错 | 环境变量值**加了引号**或含 `}` / 换行（配置是先文本替换再解析 YAML/TOML） |
 | 登录提示密码错误 | 初始密码只在生成项目时打印过一次；确认 `init.sql` 导入的是**同一次生成**的项目；忘记密码见 `README.md`「初始管理员账号」 |
 

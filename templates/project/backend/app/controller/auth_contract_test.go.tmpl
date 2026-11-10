@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"database/sql/driver"
 	"encoding/hex"
@@ -42,9 +43,12 @@ type authPolicySessions struct {
 	onRotate    func()
 	registered  []string
 	revokedJTIs []string
+	// contexts 每次会话调用收到的 ctx（按调用顺序），用来断言请求 ctx 一路传到了会话存储。
+	contexts []context.Context
 }
 
-func (s *authPolicySessions) RegisterSession(_ uint64, jti string, _ time.Duration, _ int64) error {
+func (s *authPolicySessions) RegisterSession(ctx context.Context, _ uint64, jti string, _ time.Duration, _ int64) error {
+	s.contexts = append(s.contexts, ctx)
 	if s.registerError != nil {
 		return s.registerError
 	}
@@ -54,21 +58,24 @@ func (s *authPolicySessions) RegisterSession(_ uint64, jti string, _ time.Durati
 	}
 	return nil
 }
-func (s *authPolicySessions) ValidateSession(uint64, string) (int64, error) {
+func (s *authPolicySessions) ValidateSession(ctx context.Context, _ uint64, _ string) (int64, error) {
+	s.contexts = append(s.contexts, ctx)
 	s.validations++
 	if s.validateError != nil {
 		return 0, s.validateError
 	}
 	return 1, nil
 }
-func (s *authPolicySessions) RotateSession(uint64, string, string, time.Duration, int64) error {
+func (s *authPolicySessions) RotateSession(ctx context.Context, _ uint64, _, _ string, _ time.Duration, _ int64) error {
+	s.contexts = append(s.contexts, ctx)
 	s.rotations++
 	if s.onRotate != nil {
 		s.onRotate()
 	}
 	return nil
 }
-func (s *authPolicySessions) RevokeSession(jti string) error {
+func (s *authPolicySessions) RevokeSession(ctx context.Context, jti string) error {
+	s.contexts = append(s.contexts, ctx)
 	s.revocations++
 	s.revokedJTIs = append(s.revokedJTIs, jti)
 	return s.revokeError
@@ -549,7 +556,7 @@ func TestRefreshTokenHidesInternalError(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(fmt.Sprintf("code=%d", tc.code), func(t *testing.T) {
 			sessions := authPolicyConfig(t, false)
-			token, err := middleware.GenerateJWTToken("7", "policy-user", 1)
+			token, err := middleware.GenerateJWTToken(context.Background(), "7", "policy-user", 1)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -682,7 +689,7 @@ func TestLoginSessionRegisterFailureHidesInternalError(t *testing.T) {
 // 返回 401、不下发 Cookie，旧会话已被消费（失败即关闭，用户需重新登录）。
 func TestRefreshTokenWriteFailureAfterRotation(t *testing.T) {
 	sessions := authPolicyConfig(t, false)
-	token, err := middleware.GenerateJWTToken("7", "policy-user", 1)
+	token, err := middleware.GenerateJWTToken(context.Background(), "7", "policy-user", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -831,7 +838,7 @@ func TestAdminChainRejectsTokenWithoutExpiry(t *testing.T) {
 		t.Fatalf("fixture must be rejected for missing exp, got %v", err)
 	}
 	assertFixedJWTInvalidResponse(t, recorder, middleware.ErrJWTMissingExpiry.Error())
-	valid, err := middleware.GenerateJWTToken("7", "policy-user", 1)
+	valid, err := middleware.GenerateJWTToken(context.Background(), "7", "policy-user", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -866,7 +873,7 @@ func TestAdminChainRejectsHeaderOnlyToken(t *testing.T) {
 		reached++
 		OK(w, map[string]bool{"reached": true})
 	})))
-	valid, err := middleware.GenerateJWTToken("7", "policy-user", 1)
+	valid, err := middleware.GenerateJWTToken(context.Background(), "7", "policy-user", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -896,7 +903,7 @@ func TestRefreshRejectsHeaderOnlyToken(t *testing.T) {
 	taurus.Container.Config.MergeMap(map[string]interface{}{"http": map[string]interface{}{
 		"jwt": map[string]interface{}{"enabled": true},
 	}})
-	valid, err := middleware.GenerateJWTToken("7", "policy-user", 1)
+	valid, err := middleware.GenerateJWTToken(context.Background(), "7", "policy-user", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -947,7 +954,7 @@ func TestAuthMethodAndCSRFBeforeSideEffects(t *testing.T) {
 			}
 		}
 	}
-	token, err := middleware.GenerateJWTToken("7", "policy-user", 1)
+	token, err := middleware.GenerateJWTToken(context.Background(), "7", "policy-user", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1046,7 +1053,7 @@ func TestLogoutExpiredCookiePolicyThroughRoute(t *testing.T) {
 					}
 				}
 			}
-			valid, err := middleware.GenerateJWTToken("7", "policy-user", 1)
+			valid, err := middleware.GenerateJWTToken(context.Background(), "7", "policy-user", 1)
 			if err != nil {
 				t.Fatal(err)
 			}

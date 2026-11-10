@@ -1,0 +1,231 @@
+package controller
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
+
+	"{{ .Module }}/app/helper"
+	"{{ .Module }}/app/helper/store"
+	"{{ .Module }}/app/middleware"
+	"{{ .Module }}/app/repo"
+	"{{ .Module }}/app/service"
+)
+
+// 这些用例只证明认证 handler 把请求 ctx 交给了会话存储、预算到期后不下发令牌；
+// 会话存储是 fake，不涉及 Redis socket 的期限行为。
+
+type sessionCtxMarker struct{}
+
+func withSessionMarker(req *http.Request, name string) *http.Request {
+	return req.WithContext(context.WithValue(req.Context(), sessionCtxMarker{}, name))
+}
+
+// TestAuthHandlersPassRequestContextToSessions 登录、刷新、登出访问会话存储时用的都是
+// 本次请求的 ctx（不是 Background）；刷新的校验与轮换共用同一个期限。
+func TestAuthHandlersPassRequestContextToSessions(t *testing.T) {
+	sessions := authPolicyConfig(t, false)
+	database, mock := newMockDB(t)
+	repoStore := repo.NewStoreWithDB(database)
+	controller := &AuthController{AuthService: service.NewAuthService(repoStore), LoginLogService: service.NewAdminLoginLogService(repoStore)}
+	hash, err := helper.HashPassword("policy-password-0001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectPolicyCredentials(mock, hash)
+	mock.ExpectExec("INSERT INTO `admin_user_login_logs`").WillReturnResult(sqlmock.NewResult(1, 1))
+	expectLastLoginUpdate(mock).WillReturnResult(sqlmock.NewResult(0, 1))
+
+	login := httptest.NewRecorder()
+	controller.Login(login, withSessionMarker(authPolicyRequest("/auth/login", policyLoginBody(t, "policy-password-0001"), ""), "login"))
+	if authPolicyCode(t, login) != 200 {
+		t.Fatal("login failed")
+	}
+	cookie := assertJWTCookie(t, login, false, false)
+
+	refresh := httptest.NewRecorder()
+	controller.RefreshToken(refresh, withSessionMarker(authPolicyRequest("/user/refresh-token", nil, cookie.Value), "refresh"))
+	if authPolicyCode(t, refresh) != 200 {
+		t.Fatal("refresh failed")
+	}
+	cookie = assertJWTCookie(t, refresh, false, false)
+
+	logout := httptest.NewRecorder()
+	controller.Logout(logout, withSessionMarker(authPolicyRequest("/auth/logout", nil, cookie.Value), "logout"))
+	if authPolicyCode(t, logout) != 200 {
+		t.Fatal("logout failed")
+	}
+
+	// 登记（登录）→ 校验 + 轮换（刷新）→ 吊销（登出）
+	want := []string{"login", "refresh", "refresh", "logout"}
+	if len(sessions.contexts) != len(want) {
+		t.Fatalf("expected %d session calls, got %d", len(want), len(sessions.contexts))
+	}
+	for i, ctx := range sessions.contexts {
+		if ctx.Value(sessionCtxMarker{}) != want[i] {
+			t.Fatalf("session call %d did not use the %s request context", i, want[i])
+		}
+	}
+	for _, i := range []int{0, 1, 2} {
+		if _, ok := sessions.contexts[i].Deadline(); !ok {
+			t.Fatalf("session call %d has no session budget deadline", i)
+		}
+	}
+	validateDeadline, _ := sessions.contexts[1].Deadline()
+	rotateDeadline, _ := sessions.contexts[2].Deadline()
+	if !validateDeadline.Equal(rotateDeadline) {
+		t.Fatal("refresh validate and rotate must share one session budget")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestIssueLoginJWTBudgetEndedIssuesNoCookie 登记成功后、写 Cookie 前会话预算结束（这里用取消
+// 父 ctx 确定性地模拟）：不写任何 Cookie，按存储不可用返回；尽力吊销用的是同一个已结束的
+// 预算 ctx，而不是另开 Background。
+func TestIssueLoginJWTBudgetEndedIssuesNoCookie(t *testing.T) {
+	sessions := authPolicyConfig(t, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sessions.onRegister = cancel
+
+	recorder := httptest.NewRecorder()
+	if _, err := middleware.IssueLoginJWT(ctx, recorder, "7", "policy-user", 1); !errors.Is(err, store.ErrSessionStoreUnavailable) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("budget end must fail closed as session store unavailable, got %v", err)
+	}
+	if len(recorder.Header().Values("Set-Cookie")) != 0 {
+		t.Fatal("login issued a cookie after the session budget ended")
+	}
+	if len(sessions.registered) != 1 || len(sessions.revokedJTIs) != 1 || sessions.revokedJTIs[0] != sessions.registered[0] {
+		t.Fatalf("undelivered session must be revoked best-effort: registered=%v revoked=%v", sessions.registered, sessions.revokedJTIs)
+	}
+	if revokeCtx := sessions.contexts[len(sessions.contexts)-1]; revokeCtx.Err() == nil {
+		t.Fatal("best-effort revoke must reuse the ended login budget, not a fresh context")
+	}
+}
+
+// TestRefreshBudgetEndedAfterRotateIssuesNoCookie 刷新的轮换已提交、但写 Cookie 前请求被取消：
+// 回 503，不下发 Cookie；旧会话已被消费（只轮换了一次），不补发新令牌。
+func TestRefreshBudgetEndedAfterRotateIssuesNoCookie(t *testing.T) {
+	sessions := authPolicyConfig(t, false)
+	token, err := middleware.GenerateJWTToken(context.Background(), "7", "policy-user", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sessions.onRotate = cancel
+
+	recorder := httptest.NewRecorder()
+	(&AuthController{}).RefreshToken(recorder, authPolicyRequest("/user/refresh-token", nil, token).WithContext(ctx))
+	if authPolicyCode(t, recorder) != 503 {
+		t.Fatal("refresh after budget end must return 503")
+	}
+	if len(recorder.Header().Values("Set-Cookie")) != 0 || recorder.Header().Get(middleware.JWTTokenKey) != "" {
+		t.Fatal("refresh issued a cookie or token header after the session budget ended")
+	}
+	if sessions.validations != 1 || sessions.rotations != 1 {
+		t.Fatalf("validations=%d rotations=%d", sessions.validations, sessions.rotations)
+	}
+}
+
+// TestLoginSessionDeadlineReturns503 会话登记因期限到达失败：与其它存储不可用一样回 503，
+// 不下发 Cookie，登录日志记失败。
+func TestLoginSessionDeadlineReturns503(t *testing.T) {
+	sessions := authPolicyConfig(t, false)
+	sessions.registerError = fmt.Errorf("%w: %w", store.ErrSessionStoreUnavailable, context.DeadlineExceeded)
+	recorder := failedPolicyLogin(t, "生成令牌失败")
+	if authPolicyCode(t, recorder) != 503 {
+		t.Fatal("session deadline during login must return 503")
+	}
+}
+
+// TestRefreshJWTTokenSharesOneBudget RefreshJWTToken 交给会话存储的校验、轮换 ctx 共用同一个期限，
+// 它落在「调用时刻 + SessionOperationTimeout」区间内，并且派生自调用方 ctx。
+//
+// 边界：入口预算与 rotateSession 内再派生的期限只差纳秒级的调用间隔，单测无法确定性地区分
+// 两者；「预算建在入口、解析之前」这一结构由生成器断言检查。入口预算在 rotateSession 返回后、
+// 写 Cookie 前（中间只有纯 CPU 的 JWTExpiresAt）才到期的窗口，没有生产钩子就无法确定性触发，这里不覆盖。
+func TestRefreshJWTTokenSharesOneBudget(t *testing.T) {
+	sessions := authPolicyConfig(t, false)
+	token, err := middleware.GenerateJWTToken(context.Background(), "7", "policy-user", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions.contexts = nil
+
+	parent := context.WithValue(context.Background(), sessionCtxMarker{}, "refresh")
+	recorder := httptest.NewRecorder()
+	start := time.Now()
+	if _, err := middleware.RefreshJWTToken(parent, recorder, token); err != nil {
+		t.Fatal(err)
+	}
+	end := time.Now()
+
+	if len(sessions.contexts) != 2 {
+		t.Fatalf("expected validate + rotate, got %d session calls", len(sessions.contexts))
+	}
+	validateDeadline, ok1 := sessions.contexts[0].Deadline()
+	rotateDeadline, ok2 := sessions.contexts[1].Deadline()
+	if !ok1 || !ok2 || !validateDeadline.Equal(rotateDeadline) {
+		t.Fatalf("validate and rotate must share one deadline: %v / %v", validateDeadline, rotateDeadline)
+	}
+	if validateDeadline.Before(start.Add(store.SessionOperationTimeout)) || validateDeadline.After(end.Add(store.SessionOperationTimeout)) {
+		t.Fatalf("deadline %v is outside call window + %v", validateDeadline, store.SessionOperationTimeout)
+	}
+	for i, ctx := range sessions.contexts {
+		if ctx.Value(sessionCtxMarker{}) != "refresh" {
+			t.Fatalf("session call %d is not derived from the caller context", i)
+		}
+	}
+	if len(recorder.Header().Values("Set-Cookie")) != 1 {
+		t.Fatal("successful refresh must write exactly one cookie")
+	}
+}
+
+// TestRefreshJWTTokenDoneContextIssuesNoCookie 调用时请求 ctx 已取消或已过期：不写 Cookie，
+// 按存储不可用返回并保留 ctx 的错误；会话存储收到的是已结束的 ctx（没有另开新的期限）。
+func TestRefreshJWTTokenDoneContextIssuesNoCookie(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+
+	for name, tc := range map[string]struct {
+		ctx  context.Context
+		want error
+	}{
+		"已取消": {canceled, context.Canceled},
+		"已过期": {expired, context.DeadlineExceeded},
+	} {
+		t.Run(name, func(t *testing.T) {
+			sessions := authPolicyConfig(t, false)
+			token, err := middleware.GenerateJWTToken(context.Background(), "7", "policy-user", 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sessions.contexts = nil
+
+			recorder := httptest.NewRecorder()
+			_, err = middleware.RefreshJWTToken(tc.ctx, recorder, token)
+			if !errors.Is(err, store.ErrSessionStoreUnavailable) || !errors.Is(err, tc.want) {
+				t.Fatalf("ended request context must fail closed with %v, got %v", tc.want, err)
+			}
+			if len(recorder.Header().Values("Set-Cookie")) != 0 {
+				t.Fatal("refresh wrote a cookie after the request context ended")
+			}
+			for i, ctx := range sessions.contexts {
+				if ctx.Err() == nil {
+					t.Fatalf("session call %d got a live context instead of the ended request budget", i)
+				}
+			}
+		})
+	}
+}
