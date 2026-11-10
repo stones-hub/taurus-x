@@ -28,14 +28,12 @@
 JAR=$(mktemp)                     # cookie jar，用完删除
 BASE=http://127.0.0.1:9080
 # 登录：凭证写进 cookie jar（jwt_token 为 HttpOnly，x-csrf-token 供写请求回传）；Origin 必须是可信来源
-curl -s -c "$JAR" -H "Origin: $BASE" -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"<密码>"}' "$BASE/auth/login"
+curl -s -c "$JAR" -H "Origin: $BASE" -H 'Content-Type: application/json' -d '{"username":"admin","password":"<密码>"}' "$BASE/auth/login"
 CSRF=$(awk '$6=="x-csrf-token"{print $7}' "$JAR")
 # 读接口：只带 Cookie
 curl -s -b "$JAR" "$BASE/admin/user/current-info"
 # 写接口：带 Cookie + 同值的 x-csrf-token 头
-curl -s -b "$JAR" -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' \
-  -d '{"page_no":1,"page_size":15}' "$BASE/admin/user/list"
+curl -s -b "$JAR" -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' -d '{"page_no":1,"page_size":15}' "$BASE/admin/user/list"
 # 刷新 / 退出：POST + 可信 Origin + CSRF；刷新后用 -c 写回新的 Cookie
 curl -s -b "$JAR" -c "$JAR" -H "Origin: $BASE" -H "x-csrf-token: $CSRF" -X POST "$BASE/user/refresh-token"
 curl -s -b "$JAR" -c "$JAR" -H "Origin: $BASE" -H "x-csrf-token: $CSRF" -X POST "$BASE/auth/logout"
@@ -78,10 +76,10 @@ service 返回的错误统一由 `controller.FailByError` 输出：越权回 403
 
 ## 待独立验收与一期之外
 
-Pi须对当前代码重新进行全新只读复审，并用隔离MySQL8.0/Redis7验证失败回滚、同部门并发替换、双刷新、退出先完成及故障恢复不复活。隔离HTTPS实测Secure Cookie属性、唯一性和清理，浏览器检查登录、退出成功/失败提示、401不递归、改密及基础页面。历史版本运行验收不自动适用于本候选。
+上线前须在你的环境独立验收：用隔离的 MySQL 8.0 / Redis 7 验证失败回滚、同部门并发替换、双刷新、退出先完成及故障恢复不复活；在隔离 HTTPS 下核对 Secure Cookie 属性、唯一性和清理，浏览器检查登录、退出成功/失败提示、401不递归、改密及基础页面。脚手架历史版本的运行验收不自动适用于你修改后的代码。
 
-v0.4.0 已补：日志有界队列及退出drain、操作日志按业务code判定成败；IP白名单不在应用内实现（HostMiddleware已删除，改由Nginx/防火墙负责，见部署文档7.5）。
+v0.4.0 已补：日志有界队列及退出drain、操作日志按业务code判定成败；IP白名单不在应用内实现（HostMiddleware已删除，改由Nginx/防火墙负责，见项目 `README.md` 的「按 IP 限制后台访问」）。
 
 一期仍不覆盖：Consul/Milvus/OTEL完整生产配置和运行、短信供应商、权限升级与角色删除等其他并发窗口、许可证/SBOM完整交付、Go依赖漏洞审计、备份恢复及容量验收。不得将本期代码修复等同于无条件商用。
 
-后续已补运维工具（见 `运维手册.md`）：MySQL 备份恢复脚本、登录/列表压测工具、`make sbom`、`make vuln`。这些只是工具和步骤：真库「备份→删测试库→恢复→登录」演练、在你的硬件与限流配置下的压测基准、许可证审查，仍要在你的环境实际执行并留档，工具存在不等于已验收。
+后续已补运维工具：MySQL 备份恢复脚本（见项目 `README.md`「备份与恢复」）、登录/列表压测工具、`make sbom`、`make vuln`（见 `运维手册.md`）。这些只是工具和步骤：真库「备份→恢复到新的空库→登录」演练、在你的硬件与限流配置下的压测基准、许可证审查，仍要在你的环境实际执行并留档，工具存在不等于已验收。

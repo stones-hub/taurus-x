@@ -1,260 +1,20 @@
-# {{ .ProjectName }} 运维手册
+# {{ .ProjectName }} 运维手册（高级）
 
-本手册覆盖四件事：MySQL 备份与恢复、压测、SBOM（软件物料清单）、依赖漏洞扫描。
-都是「一条命令 + 一份说明」，没有额外的页面或配置平台。
-{{- if .Has.milvus }}
-另附 Milvus 外置 S3 的运维要点（第五节）。
-Milvus 查询失败、恢复与失败日志见第六节。
-{{- end }}
+日常的配置、部署、状态与日志、停止、**备份与恢复**、更新与失败处理都在项目根目录的
+[`README.md`](../README.md)，那里是唯一说明，本手册不重复。本手册只放进阶内容：压测、SBOM（软件物料清单）、
+依赖漏洞扫描的结果判读{{ if .Has.milvus }}，以及 Milvus 查询失败日志的判读（第四节）{{ end }}。
 
 | 命令 | 做什么 | 依赖 | 联网 | 产物 |
 |------|--------|------|------|------|
-| `make db-backup DB=<库>` | mysqldump 导出并压缩 | 本机 MySQL 8.x 客户端（`mysql`、`mysqldump`）、`gzip` | 否 | `backups/<库>-<时间>.sql.gz` + `.meta` + `.sha256` |
-| `make db-restore ...` | 把**本项目自己生成**的备份恢复到**不存在或空**的库 | 本机 MySQL 8.x 客户端（`mysql`）、`gzip` | 否 | 无（写入目标库） |
 | `cd scripts/loadtest && go run . ...` | 登录 / 列表接口压测 | Go | 否（只连被测服务） | 终端报告，可选 JSON |
 | `make sbom` | 生成前后端 SBOM 并校验 | Go、Node/npm | 是（首次拉工具） | `artifacts/sbom/*.cdx.json` |
 | `make vuln` | govulncheck 扫描 | Go | 是（拉工具和漏洞库） | 终端输出 |
 
-`backups/` 与 `artifacts/` 已在 `.gitignore` 里：备份含业务数据（包括密码散列），不要提交。
+`artifacts/` 已在 `.gitignore` 里。
 
 ---
 
-## 一、MySQL 备份与恢复
-
-### 1.1 连接参数（只走环境变量）
-
-| 变量 | 默认 | 说明 |
-|------|------|------|
-| `MYSQL_OPS_HOST` | `127.0.0.1` | 总是走 TCP（见下） |
-| `MYSQL_OPS_PORT` | `3306` | |
-| `MYSQL_OPS_USER` | 无，必填 | 脚本**不提供**默认账号 |
-| `MYSQL_OPS_PASSWORD` | 无，必须显式设置 | 无密码账号写 `MYSQL_OPS_PASSWORD=`（显式为空） |
-
-密码怎么传：
-
-- 脚本一启动、调用任何外部命令之前，就把 `MYSQL_OPS_PASSWORD` 复制到一个**不导出**的 shell 变量并 `unset`
-  （调用方的 shell 开了 `set -a` 也不会导出它）。之后脚本启动的 `sha256sum` / `gzip` / `awk` / `mysql` / `mysqldump`
-  等子进程环境里都没有密码。
-- 密码只写进私有临时目录（`700`）里一个权限 `600` 的选项文件，经 `--defaults-file` 交给客户端；
-  脚本退出时（含失败和 Ctrl+C）删除整个临时目录。密码不出现在命令行参数（`ps` 看得到）里，也不出现在输出和备份报告里。
-- 管不到的范围：你自己的 shell、以及 `make db-backup` 时的 `make` 和它启动的 `sh`，都还能看到你 `export` 的变量
-  ——用完就 `unset`。
-
-推荐这样设置，避免密码进 shell 历史：
-
-```bash
-export MYSQL_OPS_USER={{ .DBName }}
-read -rs MYSQL_OPS_PASSWORD && export MYSQL_OPS_PASSWORD   # 键盘输入，不回显
-# ……执行备份或恢复……
-unset MYSQL_OPS_PASSWORD
-```
-
-**连接参数怎么给，为什么**：每条 `mysql` / `mysqldump` 命令的参数开头都固定是
-
-```
---defaults-file=<临时选项文件> --protocol=TCP --host=<MYSQL_OPS_HOST> --port=<MYSQL_OPS_PORT> --user=<MYSQL_OPS_USER>
-```
-
-（`mysql` 另加 `--local-infile=0`，SQL 里的 `LOAD DATA LOCAL INFILE` 读不到运维机上的文件。）
-
-- **`~/.mylogin.cnf` 会覆盖 `--defaults-file`**：用 `mysql_config_editor` 存过登录信息的机器上，客户端在读完
-  `--defaults-file` 之后仍会读 `~/.mylogin.cnf`，里面的 `host` / `port` / `user` / `password` 会盖掉选项文件里的同名项。
-  所以主机、端口、账号、协议这些不敏感的值放在**命令行**上：命令行参数优先级高于任何选项文件。
-  （实现时只用 MySQL 8.4 客户端做过离线参数解析检查，**待独立验证**；8.0 客户端未验证。）
-- 另外每次调用都设 `MYSQL_TEST_LOGIN_FILE=<私有临时目录里一个不存在的路径>`，客户端因此**根本不读**用户的
-  `~/.mylogin.cnf`（连同里面可能存的密码）。`MYSQL_TEST_LOGIN_FILE` 是 MySQL 8.0 / 8.4 文档里列出的环境变量；
-  它的实际效果同样**待独立验证**（8.0 客户端未验证）。没有用 `--no-login-paths`：
-  8.4 支持，但没能确认所有 8.0 小版本都认这个参数，不认的客户端会直接报错。
-- `--protocol=TCP`：MySQL 客户端在主机名是 `localhost` 时默认改走 unix socket、忽略端口，可能连到本机的另一个实例。
-  相应地，账号要允许从 TCP 来源登录：`skip_name_resolve=ON` 时，只建了 `'用户'@'localhost'` 的账号匹配不上
-  `127.0.0.1` 来的 TCP 连接，需要 `'用户'@'127.0.0.1'`。
-
-**连上以后核对服务端身份**：备份和恢复都会先查询并打印 `@@hostname`、`@@port`、`@@server_uuid`
-（都不是敏感信息）。上面这些参数保证连接用的是你给的主机、端口、账号，但「这个主机、端口上跑的是不是你以为的那台实例」
-只有你自己能判断：`--confirm` 只能核对「参数拼出来的目标」，**证明不了**实际连到的是哪台服务器。
-脚本只打印、**不会停下来等你确认**。要在执行前就确定目标，先用**同样的主机、端口、账号**单独查一次
-（整条命令写在一行；`-p` 后面不写密码，回车后从键盘输入；开头的 `MYSQL_TEST_LOGIN_FILE` 让客户端不读你的 `~/.mylogin.cnf`，
-`--protocol=TCP -h -P -u` 都显式给出，免得被 login 文件或 socket 改掉目标）：
-
-```bash
-MYSQL_TEST_LOGIN_FILE=/nonexistent/mylogin.cnf mysql --protocol=TCP -h 127.0.0.1 -P 3306 -u <账号> -p -e "SELECT @@hostname, @@port, @@server_uuid"
-```
-
-把 `127.0.0.1` / `3306` 换成你给 `MYSQL_OPS_HOST` / `MYSQL_OPS_PORT` 的值。执行备份或恢复时，再核对脚本打印的
-`server_uuid` 与这里一致；不一致时立即 Ctrl+C（已经开始导入的话，按下面的「部分写入」处理）。
-
-### 1.2 支持的运行方式
-
-**只支持本机已安装的 MySQL 8.x 客户端**（`mysql`、`mysqldump`，MariaDB 客户端会被拒绝），
-脚本不支持 `docker exec`。
-
-- 裸机 / macOS 部署：MySQL 就在本机或内网，直接用。
-- Docker 部署：`docker-compose.yml` 里的 mysql 服务**没有映射端口**，宿主机连不上。
-  需要你明确选一种：在能直连该 MySQL 的机器上执行；或者自己在 compose 里给 mysql 加一个
-  **只绑回环**的映射（`ports: ["127.0.0.1:3306:3306"]`）后重建 mysql 容器（数据卷不受影响），
-  用完再去掉。脚本不会替你改 compose。
-
-### 1.3 备份
-
-```bash
-make db-backup DB={{ .DBName }}
-# 等价于：scripts/db/backup.sh --database {{ .DBName }} [--output-dir backups]
-```
-
-做了什么：
-
-1. `mysqldump --single-transaction --quick --routines --triggers --events --hex-blob --no-tablespaces --set-gtid-purged=OFF`，
-   管道给 `gzip`，写到同目录下的临时文件。管道开了 `pipefail`：`mysqldump` 或 `gzip` 任一失败都算失败。
-2. 校验：`gzip -t` 通过，且解压后最后一行是 mysqldump 的 `-- Dump completed` 结尾（导出被中途杀掉时没有这一行）。
-3. 写 `.meta`（来源库名、源实例 hostname / port / server_uuid、库级对象标记数、时间）和 `.sha256`
-   （同时覆盖数据文件与 `.meta`），校验都通过后才落成最终文件名（硬链接，目标已存在时失败、不覆盖；
-   数据文件最后落）。**任何一步失败或 Ctrl+C 都不会留下最终文件**：临时文件，以及已经落成正式名的
-   `.meta` / `.sha256`，都由退出钩子删除；只有三个文件全部落好才算备份完成。
-   文件权限 `600`；输出目录**只在脚本新建时**是 `700`，已经存在的目录保持原权限（脚本不改你的目录），
-   请自己确认它不对其他用户开放。
-4. 导出里**不带** `CREATE DATABASE` / `USE`（没用 `--databases`），恢复时必须显式指定目标库，
-   这样才能恢复到一个独立的测试库。
-
-一致性与限制：
-
-- `--single-transaction` 在一个可重复读事务里导出，对 **InnoDB** 表给出一致性快照，不加表锁、不阻塞普通读写。
-  本项目 `init.sql` 建的 12 张表全是 InnoDB；你自己加的表也请用 InnoDB。
-- **MyISAM 等非事务表不在快照保护内**，导出期间被写入会不一致。
-- **备份期间不要做 DDL**（`ALTER` / `DROP` / `RENAME` / `TRUNCATE TABLE`）：快照看不到 DDL 的隔离，
-  mysqldump 可能读到不一致的表结构或直接报错退出（此时脚本按失败处理、不留文件）；
-  另外 mysqldump 正在导出的表上持有元数据锁，对它的 DDL 会一直等待，并连带阻塞之后访问这张表的请求。
-- 整个导出是一个长事务：表越大持续越久，期间 InnoDB 的 undo 历史无法清理（history list 增长）。
-  在业务低峰执行。
-- 这是逻辑备份，适合本项目这种体量；数据量很大、需要按时间点恢复时请用物理备份 + binlog，不在本脚本范围内。
-
-备份账号的最小权限（只授备份的那个库，不要用 root）：
-
-```sql
-GRANT SELECT, SHOW VIEW, TRIGGER, EVENT ON `{{ .DBName }}`.* TO '备份账号'@'127.0.0.1';
-```
-
-- `--single-transaction` 下不需要 `LOCK TABLES`；`--no-tablespaces` 下不需要 `PROCESS`；
-  没开 GTID 导出（`--set-gtid-purged=OFF`），不需要 `RELOAD`。
-- 导出存储过程 / 函数（`--routines`）：MySQL 8.0.20 起需要 `SHOW_ROUTINE` 或全局 `SELECT`，
-  否则其他账号定义的例程可能导不出来。本项目默认没有例程；你加了例程才需要这项，按需由 DBA 授予。
-- compose 建的 `{{ .DBName }}` 账号对本库有全部权限，备份够用。
-
-### 1.4 恢复
-
-```bash
-make db-restore BACKUP_FILE=backups/<文件>.sql.gz DB=<目标库> CONFIRM=<目标库>@<主机>:<端口> [CREATE=1]
-# 等价于：scripts/db/restore.sh --file ... --database ... --confirm ... [--create]
-```
-
-**信任边界（先读）**：恢复就是把备份文件里的 SQL 原样交给 `mysql` 执行。脚本**不能**、也不尝试把一份
-不可信的 SQL 变安全——没有哪种简单的文本检查能做到。所以：
-
-- **只恢复本项目 `backup.sh` 生成、并且一直存放在可信位置的备份**；不要恢复别人发来的、来源不明的 `.sql.gz`。
-- `.sha256` **只用来发现损坏**（传输、磁盘），不是来源认证：能改备份文件的人同样能改 `.sha256`。
-- 恢复账号只授**目标库**的权限（见下），出了问题影响面也只在这个库；**不要用 root 或全局权限账号恢复**。
-
-保护规则：
-
-- **目标库非空一律拒绝**（有任何表、视图、存储过程或事件），没有「强制覆盖」开关。
-  脚本从不执行 `DROP DATABASE`，也不会自动删任何库。要恢复生产数据，先恢复到一个**新库**，核对后再切换 DSN。
-- `CONFIRM` 必须逐字等于由参数拼出的 `库@主机:端口`（例如 `{{ .DBName }}_drill@127.0.0.1:3306`），防止填错目标。
-  它只核对参数；脚本连上后会打印服务端的 `hostname` / `port` / `server_uuid`，**请核对确实是你要恢复的实例**；
-  与备份的源实例是同一个时还会额外提示。
-- 目标库不存在时，只有加 `CREATE=1`（`--create`）才会创建（`utf8mb4` / `utf8mb4_general_ci`）。
-- 恢复前先校验文件（都在连库之前）：必须有 `.meta`（没有就不是本脚本支持的备份）；`.sha256` 与数据文件、`.meta`
-  都匹配（缺少 `.sha256` 时拒绝，确认文件来自可信存储后可直接调脚本加 `--skip-checksum`，会打印警告）；
-  `gzip -t` 通过；有 mysqldump 结尾标记；备份里的库级对象标记数与 `.meta` 一致。
-- 导入用 `mysql --binary-mode`：非交互输入下**禁用客户端命令**（`\!` / `system` 执行本机命令、`source`、`tee` 等），
-  只保留 mysqldump 输出需要的 `delimiter` / `charset`。这只挡住「借 mysql 客户端在运维机上执行命令」，
-  挡不住 SQL 本身。
-- 同时带 `--one-database`，但它**不是隔离手段**：它只按 `USE` 语句过滤，写成 `其它库.表` 的语句、`GRANT`、
-  `CREATE DATABASE` 照样会执行。真正限制影响面的是恢复账号的权限。
-- 导入失败或在导入中按 Ctrl+C 时退出码非 0，并提示目标库可能已写入部分数据；脚本**不会**替你清理，请人工检查。
-- 中断的时机：终端里按 Ctrl+C 会把 SIGINT 发给整个前台进程组（脚本和它正在跑的 `mysqldump` / `mysql` / `gzip`），
-  会立即中断。如果只对脚本进程本身 `kill <PID>`，bash 要等当前前台命令（整条 `mysqldump | gzip` 或导入管道）跑完
-  才处理信号：导入会先跑完，然后仍以 143 退出并提示可能部分写入。要立即停，就对整个进程组发信号（`kill -- -<PGID>`）。
-
-**库级对象（视图、存储过程 / 函数、触发器、事件）的限制**：mysqldump 导出这些对象时，定义里可能写死了**源库名**
-——视图里的 `` `源库`.`表` ``，以及 mysqldump 在例程 / 触发器 / 事件两侧输出的 `` ALTER DATABASE `源库` ... ``。
-恢复到**别的库名**时，这些语句会读写或修改到源库（源库在同一实例上还在时，就是误操作源库）。所以：
-
-- 备份时统计这些对象的标记行写进 `.meta`，报告里显示「库级对象：有 / 无」。认两种已知写法：带版本注释的
-  （`/*!50003 CREATE*/ ... PROCEDURE`、`/*!50106 CREATE*/ ... EVENT`、`/*!50001 CREATE ... VIEW` 等）和不带的
-  （`CREATE DEFINER=... PROCEDURE / FUNCTION / TRIGGER / EVENT / VIEW`、`CREATE PROCEDURE` / `CREATE FUNCTION` 等），
-  以及 `ALTER DATABASE`。你的 MySQL 版本实际导出哪种写法，没有在真库上确认过：项目里加了例程以后，
-  先备份一次，看报告是不是「库级对象：有」；
-- 备份**含**库级对象时，`restore.sh` **只允许恢复到与源库同名的库**；源库还在时，要演练就用**另一个 MySQL 实例**上的同名库；
-- 备份**不含**库级对象（本项目默认就是这样，只有表和数据）时，才可以恢复到任意名字的空库；
-- 事件（EVENT）恢复后会按原定义在目标实例上调度执行，恢复前确认它们在目标实例上运行是安全的；
-- 跨库外键（引用 `其它库.表`）同样会原样恢复，本项目没有，你加了就要自己评估。
-
-这里的「标记行」统计只认 mysqldump 自己的输出格式，是**格式检查**，用来决定适用哪种恢复约束，不是安全过滤。
-
-恢复账号的最小权限（只授目标库）：
-
-```sql
--- 恢复本项目默认的备份（只有表和数据）
-GRANT SELECT, INSERT, CREATE, DROP, ALTER, INDEX, REFERENCES, LOCK TABLES
-  ON `{{ .DBName }}_drill`.* TO '恢复账号'@'127.0.0.1';
-```
-
-- 导出里有 `DROP TABLE IF EXISTS`、`LOCK TABLES ... WRITE`、外键，所以需要 `DROP`、`LOCK TABLES`、`REFERENCES`；
-  `DROP` 只作用于这个库里的表，脚本本身不会 DROP 库。
-- 库级 `CREATE` 权限即可让账号在 `CREATE=1` 时创建**这个名字**的库；不要为此授全局 `CREATE`。
-  按「明确要建哪个库」授权：只在需要 `CREATE=1` 的那次恢复前授予，或直接由 DBA 先建好空库、不用 `CREATE=1`。
-- 备份含库级对象时还需要 `CREATE VIEW`、`SHOW VIEW`、`CREATE ROUTINE`、`ALTER ROUTINE`、`TRIGGER`、`EVENT`。
-  对象的 `DEFINER` 不是恢复账号自己时，还需要设置他人为定义者的权限：MySQL 8.0.22～8.1 为 `SET_USER_ID`，
-  8.2 起为 `SET_ANY_DEFINER`（定义者账号在目标实例上不存在时还要 `ALLOW_NONEXISTENT_DEFINER`），更早版本为 `SUPER`；
-  定义者带 `SYSTEM_USER` 时恢复账号也要有 `SYSTEM_USER`。这些都是高权限，只在确实有这类对象时由 DBA 显式、临时授予，
-  **不要图省事直接用 root 恢复**。
-- 「是否为空」只能看到本账号有权限看到的对象，所以恢复账号必须对目标库有上面这些权限。
-
-### 1.5 演练：备份 → 独立测试库删库 → 恢复 → 登录验证
-
-**只在独立的测试 MySQL 上做**（例如专门起的测试容器或测试实例，库名用 `{{ .DBName }}_drill` 这类一眼能认出的名字），
-不要在生产库上演练。下面的 `DROP DATABASE` 是**人工步骤**，脚本不会执行它。
-
-1. **准备测试库**：在测试 MySQL 上建库 `{{ .DBName }}_drill`，导入 `scripts/sql/init.sql`；
-   把**测试环境**后端的 `DB_DSN` 指向它并启动；用初始管理员登录一次，确认能进后台；
-   在「用户管理」里随便新建一个测试用户，作为恢复后要核对的数据。
-2. **记录基线**（人工）：
-
-   ```bash
-   mysql -h 127.0.0.1 -P 3306 -u <账号> -p {{ .DBName }}_drill \
-     -e "SELECT COUNT(*) FROM admin_users; SELECT COUNT(*) FROM admin_permissions;"
-   ```
-
-   （`-p` 后面不写密码，回车后从键盘输入。）
-3. **备份**：
-
-   ```bash
-   export MYSQL_OPS_USER=<账号>; read -rs MYSQL_OPS_PASSWORD && export MYSQL_OPS_PASSWORD
-   make db-backup DB={{ .DBName }}_drill
-   ```
-
-   记下输出的文件名、sha256 和「源实例」那行的 `server_uuid`；报告里「库级对象：无」，所以可以恢复到同名库（下面就是）。
-4. **停掉测试环境后端**，然后**人工删测试库**。执行前再核对一遍：主机、端口是测试实例，库名带 `_drill`：
-
-   ```bash
-   mysql -h 127.0.0.1 -P 3306 -u <账号> -p -e "DROP DATABASE {{ .DBName }}_drill"
-   ```
-
-5. **恢复**（库已不存在，所以要 `CREATE=1`）：
-
-   ```bash
-   make db-restore BACKUP_FILE=backups/<上一步的文件>.sql.gz \
-     DB={{ .DBName }}_drill CONFIRM={{ .DBName }}_drill@127.0.0.1:3306 CREATE=1
-   ```
-
-   核对脚本打印的「目标实例」`server_uuid`：应是你的测试实例（演练是同一实例，所以还会提示与源实例相同）。
-6. **核对数据**：重复第 2 步的查询，数字应与基线一致。
-7. **登录验证**：启动测试环境后端，浏览器**重新登录**初始管理员，打开用户管理，确认第 1 步新建的测试用户还在；
-   再打开角色 / 权限 / 部门 / 日志页面，控制台没有报错。
-8. 收尾：`unset MYSQL_OPS_PASSWORD`；测试库和 `backups/` 里的演练文件按需删除（人工）。
-
----
-
-## 二、压测
+## 一、压测
 
 工具在 `scripts/loadtest/`，用法、报告字段、**限流对结果的影响**和基准记录表见
 [`scripts/loadtest/README.md`](../scripts/loadtest/README.md)。要点：
@@ -263,16 +23,17 @@ GRANT SELECT, INSERT, CREATE, DROP, ALTER, INDEX, REFERENCES, LOCK TABLES
 - 账号走 `LOADTEST_USERNAME` / `LOADTEST_PASSWORD` 环境变量，不接受命令行传入；
 - 走真实的 Cookie + CSRF 登录，不用 Bearer；429 计入错误，不当成成功；
 - 默认限流下量到的主要是限流器。测容量要在测试环境**显式、临时**放宽限流，测完还原；不要改代码默认值。
+- 压测会写访问日志、登录日志，不要对生产库压测。
 
 ---
 
-## 三、SBOM
+## 二、SBOM
 
 ```bash
-make sbom            # = sbom-backend + sbom-frontend
-make sbom-backend    # → artifacts/sbom/backend.cdx.json
-make sbom-frontend   # → artifacts/sbom/frontend.cdx.json
+make sbom
 ```
+
+`make sbom` 等于依次执行 `make sbom-backend`（产出 `artifacts/sbom/backend.cdx.json`）和 `make sbom-frontend`（产出 `artifacts/sbom/frontend.cdx.json`），也可以单独执行其中一个。
 
 格式都是 CycloneDX 1.6 JSON。工具版本固定在根目录 `Makefile`（`CYCLONEDX_GOMOD_VERSION`、`CDXGEN_VERSION`），
 不跟随最新版；首次执行会联网下载工具到 Go / npm 缓存，不做全局安装。
@@ -308,7 +69,7 @@ cd scripts/sbomcheck && go run . -spec 1.6 ../../artifacts/sbom/backend.cdx.json
 
 ---
 
-## 四、依赖漏洞扫描（govulncheck）
+## 三、依赖漏洞扫描（govulncheck）
 
 ```bash
 make vuln
@@ -346,7 +107,7 @@ Package / Module 层**不是零风险证明**：结论只对这次的代码、�
 
 ### 历史扫描记录：golang.org/x/crypto 模块层 finding（GO-2026-5932）
 
-下面是**历史记录**，不是当前结论：模板 T10 阶段对一次全组件生成的后端做离线 source / symbol 级扫描（`-format json`），
+下面是**历史记录**，不是当前结论：脚手架维护方此前对一次全组件生成的后端做离线 source / symbol 级扫描（`-format json`），
 用的是当时准备好的本地漏洞库快照（最后修改于 2026 年 11 月），之后没有联网重扫或复核；它也不是 `make vuln` 的原样输出。
 漏洞库、公告和依赖版本都会变化，你的项目以自己执行时的实际输出和公告为准。
 
@@ -389,40 +150,9 @@ Package / Module 层**不是零风险证明**：结论只对这次的代码、�
 出现 Symbol 层 finding 时优先处理：按公告核对修复版本和兼容性后再升级对应依赖。
 {{- if .Has.milvus }}
 
-## 五、Milvus 外置 S3
+## 四、Milvus 查询失败日志
 
-compose 不内置对象存储，Milvus 的数据对象放在外置 S3 上，连接参数来自 compose 的 `.env` 里的 `MILVUS_S3_*`
-（变量表和固定的安全设置见部署文档第二节）。日常运维只记住下面几条：
-
-- **改 `.env` 要重建容器**：静态环境变量——compose 里的环境变量（含 `.env` 插值后的值）只在 Milvus 进程启动时读取。
-  改完 `.env` 后执行 `docker compose up -d milvus`，再看 `docker compose ps` 里 milvus 恢复 healthy、app 正常。
-- **etcd 覆盖不一样**：etcd 里的覆盖在运行中就会生效，不需要重启。Milvus 运行时会定期刷新 etcd 里的配置，
-  之后新发起的索引构建、统计、分析、导入、压缩（compaction）任务拿到的存储配置（StorageConfig）都会跟着变。
-  etcd 里一旦出现过非空的 CA 路径（`minio.ssl.tlsCACert`），C++ 存储客户端可能对之后的任务关闭证书和主机名校验，
-  存储 V2 还会把 CA 写进进程级状态，只删掉 etcd 里的覆盖不能保证恢复校验。
-  处置：先删掉 etcd 里的这条覆盖，再重启整个 Milvus 进程（例如 `docker compose restart milvus`），并按部署文档第二节末尾重新验收。
-  以上只按 v2.6.5 源码分析，没有做动态验证（NOT_RUN）。
-- **轮换访问密钥**：先在 S3 服务端为该桶签发新密钥并授同样的最小权限 → 改 `.env` 的
-  `MILVUS_S3_ACCESS_KEY_ID` / `MILVUS_S3_SECRET_ACCESS_KEY` → 重建 milvus 并确认检索正常 → 再吊销旧密钥。
-  密钥只放在 `.env`（`chmod 600`），不要写进 compose、日志或工单。
-- **不要动这几项**：`MINIO_USE_SSL: "true"`、`MINIO_SSL_TLSCACERT: ""`、`MINIO_CLOUD_PROVIDER: aws`、`MINIO_USE_IAM: "false"`、
-  `COMMON_STORAGETYPE: remote`。Milvus v2.6.5 的 C++ 存储客户端在 CA 路径非空时会关闭证书和主机名校验，
-  所以**不支持私有 CA / 自签证书**；端点证书换成私有 CA 签发时 Milvus 会连接失败，这是预期行为，不要为了连上而改配置。
-  也不要从别的配置来源改它们。配置优先级是 **etcd > 环境变量 > 配置文件**：
-  - etcd 的优先级高于环境变量，能直接盖掉 compose 里写死的值：etcd 里不写 Milvus 的 `minio.*` / `common.storageType` 配置。
-  - `user.yaml` 和 `MILVUSCONF`（改配置目录）属于配置文件层，优先级低于环境变量，按源码盖不掉这几项；
-    不挂载 `user.yaml`、不设置 `MILVUSCONF` 是防御性约束，不是因为它们优先级更高。
-  - `MILVUS_CONF_MINIO_*` 这类 `MILVUS_CONF_*` 前缀变量与普通环境变量同属环境变量层，是同一配置项的别名，
-    同时存在时谁生效取决于进程环境变量的遍历顺序，不能保证谁赢，所以也不设置。
-  - 防范边界：compose 里写死这些值防不了能写 etcd 的人，也防不了同一容器网络里已被攻破的容器
-    （compose 里的 etcd 没有开认证）；本项目没有改这部分网络和认证配置。
-- **不要改桶和前缀**：`MILVUS_S3_BUCKET` / `MILVUS_S3_ROOT_PATH` 有数据后改了就读不到旧数据。
-  换端点、桶或前缀属于数据迁移：停写后把 etcd 元数据（`etcd-data` 卷）和对象存储前缀一起做一致备份 / 迁移，
-  保留旧端点可回退，另行计划，不在本手册范围内。
-- **备份**：Milvus 的数据 = etcd 元数据 + 对象存储里该前缀下的对象，两者要按同一时间点备份才能恢复；
-  只备份其中一边不能恢复检索。本项目没有提供 Milvus 备份脚本，也没有对真实外置端点做过备份恢复验证。
-
-## 六、Milvus 查询失败日志
+Milvus 外置 S3 的配置、日常运维与上线前验收见 [`README.md`](../README.md) 的「Milvus 外置 S3」一节；本节只讲查询失败时的恢复行为和日志怎么读。
 
 - **恢复由请求驱动**：Search / Query 用组件默认启用的只读恢复，生成代码不显式开关。首次遇到确认过的暂时性故障
   （gRPC Unavailable、Milvus 错误码 1 / 2 / 503 / 505）时，只在**本次请求内**每隔 5 秒重建连接后重试；

@@ -17,7 +17,7 @@ http:
   authorization: Bearer ${AUTHORIZATION:123456}
 
   # 按来源 IP 限制后台访问不在应用里做：请在 Nginx（allow/deny）或防火墙/安全组上配置，
-  # 见 docs/部署文档.md「按 IP 限制后台访问」。
+  # 见项目 README.md「按 IP 限制后台访问」。
 
   # 可信反向代理（逗号分隔的 IP 或 CIDR）。
   # 只有直连对端命中这里时，后端才采信 X-Forwarded-For / X-Real-IP；

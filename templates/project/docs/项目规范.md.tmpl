@@ -268,10 +268,10 @@
 ### 13. Wiring
 - 新增 controller / service 都定义 `var XxxSet = wire.NewSet(...)`（变量名以 `Set` 结尾，auto-scanner 才会扫到）；`*repo.Store` 由 `repo.StoreSet = wire.NewSet(NewStore)`（`app/repo/store.go`）提供。改完执行 `make wire` 重新生成（否则 `app.Core.XxxController` undefined）。
 - **service 构造函数统一注入 `store *repo.Store`**（`NewXxxService(store *repo.Store)`），仓储经 `store.Xxx()` accessor 获取；**禁止无参自装配 + `repo.NewXxxRepository()` 直接构造**（无参构造已废除）。
-- 构建：
+- 构建（在项目根目录执行；括号表示子 shell，执行完仍停在根目录；pnpm 用固定版本临时调用，不需要全局安装）：
   ```bash
-  cd backend && make wire && go build ./...
-  cd frontend && pnpm build
+  (cd backend && make wire && go build ./...)
+  (cd frontend && npm exec --yes pnpm@10.34.7 -- build)
   ```
 
 ### 14. 前端路由对齐 + 菜单链接

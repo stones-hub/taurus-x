@@ -182,23 +182,31 @@ func assertMilvusFailFast(t *testing.T, outDir string, selected []string) {
 		t.Errorf("wire_rollback_test.go 应当且仅当同时选了 consul 和 milvus 时包含回滚测试（实际 %t）", hasRollback)
 	}
 
-	deployDoc := readFile(t, filepath.Join(outDir, "docs", "部署文档.md"))
+	assertMilvusDocs(t, outDir)
+}
+
+// assertMilvusDocs 勾选 milvus 时，生成 README「6.5 Milvus 外置 S3」（原部署文档第二节并入）是外置 S3 契约与
+// 启用即 fail-fast 的唯一说明；README / 运维手册不残留旧说法与内置 MinIO 结论。
+func assertMilvusDocs(t *testing.T, outDir string) {
+	t.Helper()
 	readme := readFile(t, filepath.Join(outDir, "README.md"))
+	manual := readFile(t, filepath.Join(outDir, "docs", "运维手册.md"))
 	for _, stale := range []string{"连不上时也只打日志", "app 自身不依赖 Milvus 启动"} {
-		if strings.Contains(deployDoc+readme, stale) {
+		if strings.Contains(readme+manual, stale) {
 			t.Errorf("文档仍残留过期说法 %q", stale)
 		}
 	}
-	if !strings.Contains(deployDoc, "Milvus 启用后连不上会让启动失败") {
-		t.Error("部署文档应说明 Milvus 启用即 fail-fast")
+	s3 := markdownSection(t, readme, readmeMilvusS3Heading)
+	if !strings.Contains(s3, "Milvus 启用后连不上会让启动失败") {
+		t.Error("README「6.5 Milvus 外置 S3」应说明 Milvus 启用即 fail-fast")
 	}
 	// 外置 S3 契约：必填变量、固定安全设置、私有 CA 不支持、不得被更高优先级来源覆盖、兼容验收未做
 	for _, want := range []string{"Milvus 的对象存储必须接外置 S3", "`MILVUS_S3_ADDRESS`", "`MILVUS_S3_ACCESS_KEY_ID` / `MILVUS_S3_SECRET_ACCESS_KEY`",
 		"`MILVUS_S3_BUCKET`", "`MILVUS_S3_ROOT_PATH`", "`MILVUS_S3_REGION`", "`MILVUS_S3_USE_VIRTUAL_HOST`", "`MILVUS_S3_REQUEST_TIMEOUT_MS`",
 		"`MINIO_SSL_TLSCACERT: \"\"`", "`MINIO_USE_SSL: \"true\"`", "**只支持公共 CA 签发证书的 HTTPS 端点**",
 		"**不支持私有 CA / 自签证书**", "**不要在 etcd 里写 Milvus 的", "`MILVUS_CONF_MINIO_*`", "状态 NOT_RUN"} {
-		if !strings.Contains(deployDoc, want) {
-			t.Errorf("部署文档缺少外置 S3 契约说明 %q", want)
+		if !strings.Contains(s3, want) {
+			t.Errorf("README「6.5 Milvus 外置 S3」缺少外置 S3 契约说明 %q", want)
 		}
 	}
 	if !strings.Contains(readme, "**外置 S3**") || !strings.Contains(readme, "不支持私有 CA / 自签证书 / HTTP") {
@@ -206,7 +214,7 @@ func assertMilvusFailFast(t *testing.T, outDir string, selected []string) {
 	}
 	// 旧的内置 MinIO 结论必须全部撤掉
 	for _, stale := range []string{"对象存储镜像分发", "minio/minio:", "minio-data", "确认旧标签可拉取", "MINIO_ROOT_USER", "minioadmin"} {
-		if strings.Contains(deployDoc+readme, stale) {
+		if strings.Contains(readme+manual, stale) {
 			t.Errorf("文档仍残留内置 MinIO 的过期说法 %q", stale)
 		}
 	}
@@ -318,10 +326,17 @@ func assertMilvusReadFailureLog(t *testing.T, outDir, componentsSrc, provide, mi
 		}
 	}
 
+	assertMilvusReadFailureDocs(t, outDir)
+}
+
+// assertMilvusReadFailureDocs 勾选 milvus 时，运维手册「四、Milvus 查询失败日志」（原第六节，运维手册只保留进阶判读后重新编号）
+// 是恢复与失败日志口径的完整说明；README「6.5 Milvus 外置 S3」只保留用户必需的摘要并指向它，不残留过期说法。
+func assertMilvusReadFailureDocs(t *testing.T, outDir string) {
+	t.Helper()
 	manual := readFile(t, filepath.Join(outDir, "docs", "运维手册.md"))
-	_, opsLog, found := strings.Cut(manual, "\n## 六、Milvus 查询失败日志\n")
+	_, opsLog, found := strings.Cut(manual, "\n## 四、Milvus 查询失败日志\n")
 	if !found {
-		t.Fatal("勾选 milvus 时运维手册缺少「六、Milvus 查询失败日志」一节")
+		t.Fatal("勾选 milvus 时运维手册缺少「四、Milvus 查询失败日志」一节")
 	}
 	for _, want := range []string{"只在**本次请求内**每隔 5 秒重建连接后重试", "单次调用最多 60 秒，调用方 ctx 的期限更短时以调用方为准",
 		"没有后台重连、健康轮询或自动重放", "前一次失败不会把客户端关掉", "写操作（插入、删除、建删集合等）不在恢复范围内",
@@ -343,33 +358,32 @@ func assertMilvusReadFailureLog(t *testing.T, outDir, componentsSrc, provide, mi
 		"删掉这项时日志组件可能回退到控制台", "级别配得比 ERROR 高时这条会被过滤",
 		"限时清理到期后，不保证迟到的日志回调都已结束", "关闭连接池也不等于失败日志已经刷盘"} {
 		if !strings.Contains(opsLog, want) {
-			t.Errorf("运维手册第六节缺少 %q", want)
+			t.Errorf("运维手册第四节缺少 %q", want)
 		}
 	}
 	for _, stale := range []string{"只有进程退出时的连接池 Close 是终态", "实际发出的查询次数", "失败直接返回，是否重试由调用方决定",
 		// 已发布 v0.3.0 后撤掉候选 / 未发布 / 编译不过的说法
 		"v0.2.0", "尚未发布", "候选", "编译不过", "未交付边界"} {
 		if strings.Contains(opsLog, stale) {
-			t.Errorf("运维手册第六节仍残留过期说法 %q", stale)
+			t.Errorf("运维手册第四节仍残留过期说法 %q", stale)
 		}
 	}
+	// README 只留摘要：失败后等待 5 秒（不承诺固定拨号节奏）、拨号与 SDK 重试共用 60 秒预算且调用方更短期限优先、
+	// 无后台重连、包装层写不重试（不代表 SDK 不重试）、最终失败一条脱敏日志、已发布版本无 replace，并指向运维手册第四节
 	readme := readFile(t, filepath.Join(outDir, "README.md"))
-	for _, want := range []string{"**Milvus 查询失败只写脱敏日志、恢复由请求驱动**", "`docs/运维手册.md` 第六节",
-		"`go.mod` 依赖的已发布 taurus-pro-milvus " + milvusRelease, "模板不带 replace",
-		"SDK / gRPC 对已建连接的既有维护不在此列", "显式调用的连接池 Close 才是终态", "组件包装层不重试（不代表 SDK 内部不重试）",
-		"执行次数（不含 SDK 内部重试，也不保证每次都发到服务端）",
-		"5 秒是失败后的等待间隔，不保证每 5 秒都拨号一次", "只覆盖按 `milvus.list` 创建的客户端",
-		"Close 会取消在途的 Search / Query 和恢复", "组件不承诺裸 SDK 透明恢复"} {
-		if !strings.Contains(readme, want) {
-			t.Errorf("README 缺少 Milvus 失败日志说明 %q", want)
+	milvusNote := markdownSection(t, readme, readmeMilvusS3Heading)
+	for _, want := range []string{"只在本次请求内失败后等待 5 秒再重建重试", "5 秒是等待间隔，不保证固定的拨号节奏",
+		"拨号和 SDK 内部重试共用单次 60 秒预算", "调用方 ctx 期限更短时以调用方为准", "组件包装层没有后台重连",
+		"写操作组件包装层不重试（不代表 SDK 内部不重试）", "`milvus_read_failed`", "[`docs/运维手册.md`](docs/运维手册.md) 第四节",
+		"`go.mod` 依赖的已发布 taurus-pro-milvus " + milvusRelease, "模板不带 replace"} {
+		if !strings.Contains(milvusNote, want) {
+			t.Errorf("README 的 Milvus 失败日志摘要缺少 %q", want)
 		}
 	}
-	// 只看 Milvus 失败日志这一条：README 其它段落里 consul / tcp 的 v0.2.0 是正常的版本说明
-	_, milvusNote, _ := strings.Cut(readme, "**Milvus 查询失败只写脱敏日志、恢复由请求驱动**")
-	milvusNote, _, _ = strings.Cut(milvusNote, "\n### ")
-	for _, stale := range []string{"v0.2.0", "尚未发布", "候选", "编译不过"} {
+	// 「每 5 秒重建重试」会被读成固定拨号节奏
+	for _, stale := range []string{"v0.2.0", "尚未发布", "候选", "编译不过", "每 5 秒重建重试"} {
 		if strings.Contains(milvusNote, stale) {
-			t.Errorf("README 的 Milvus 失败日志说明仍残留过期说法 %q", stale)
+			t.Errorf("README 的 Milvus 说明仍残留过期说法 %q", stale)
 		}
 	}
 }

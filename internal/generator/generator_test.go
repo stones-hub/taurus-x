@@ -184,9 +184,9 @@ func assertToolchainAndDeps(t *testing.T, outDir string, selected []string) {
 	if !strings.Contains(dockerfile, "FROM --platform=$BUILDPLATFORM "+image+" AS backend-builder") {
 		t.Errorf("Dockerfile 后端构建镜像应为 %s（与 go.mod 的 go 指令一致）", image)
 	}
-	deployDoc := readFile(t, filepath.Join(outDir, "docs", "部署文档.md"))
-	if strings.Count(deployDoc, image) != 3 {
-		t.Errorf("部署文档预拉的 golang 镜像应与 Dockerfile 一致：%s", image)
+	readme := readFile(t, filepath.Join(outDir, "README.md"))
+	if strings.Count(readme, image) != 3 {
+		t.Errorf("README 预拉的 golang 镜像应与 Dockerfile 一致：%s", image)
 	}
 	// 扫描生成项目的全部文件：golang:1.27-alpine、golang:alpine、golang:latest 这类标签会随上游漂移。
 	err := filepath.WalkDir(outDir, func(path string, d fs.DirEntry, err error) error {
@@ -291,9 +291,9 @@ func untaggedGolangImages(src string) []string {
 // 带标签的引用、正文里提到的 golang 一词、golang.org 之类的路径都不算。
 func TestUntaggedGolangImages(t *testing.T) {
 	flagged := map[string]string{
-		"FROM golang":                                                                "golang",
-		"FROM golang AS builder":                                                     "golang",
-		"FROM --platform=$BUILDPLATFORM golang AS x":                                 "golang",
+		"FROM golang":            "golang",
+		"FROM golang AS builder": "golang",
+		"FROM --platform=$BUILDPLATFORM golang AS x": "golang",
 		"  image: golang":                                                            "golang",
 		"    image: \"library/golang\"":                                              "library/golang",
 		"docker pull mirror.example/library/golang":                                  "mirror.example/library/golang",
@@ -435,7 +435,7 @@ func assertCookieOnlyAuthAndLogQueue(t *testing.T, outDir string) {
 	if _, err := os.Stat(filepath.Join(app, "middleware", "host.go")); !os.IsNotExist(err) {
 		t.Error("middleware/host.go 应已删除")
 	}
-	// 只查后端代码与配置；部署文档里有「已删除」的说明
+	// 只查后端代码与配置；README 里有「应用本身不做来源 IP 白名单」的说明
 	assertNoMatch(t, filepath.Join(outDir, "backend"), "host_white_list")
 	assertNoMatch(t, filepath.Join(outDir, "backend"), "HostMiddleware")
 	for _, rel := range []string{"access_log.go", "operation_log.go"} {
@@ -605,15 +605,18 @@ func assertShutdownOrchestration(t *testing.T, outDir string, selected []string)
 	}
 	wait := m[1]
 	compose := readFile(t, filepath.Join(outDir, "docker-compose.yml"))
-	deployDoc := readFile(t, filepath.Join(outDir, "docs", "部署文档.md"))
+	readme := readFile(t, filepath.Join(outDir, "README.md"))
 	if !strings.Contains(compose, "stop_grace_period: "+wait+"s\n") {
 		t.Errorf("docker-compose.yml 的 stop_grace_period 应为 %ss", wait)
 	}
-	if !strings.Contains(deployDoc, "stopwaitsecs="+wait+"\n") || !strings.Contains(deployDoc, "<key>ExitTimeOut</key>\n    <integer>"+wait+"</integer>") {
-		t.Errorf("部署文档的 stopwaitsecs / ExitTimeOut 应为 %s", wait)
+	// README 的原生部署不再给逐平台守护配置，但必须写明各守护工具的停止等待取值（= DeployStopWait）
+	for _, want := range []string{"**停止等待不少于 " + wait + " 秒**", "`stopwaitsecs=" + wait + "`", "`TimeoutStopSec=" + wait + "`", "`ExitTimeOut` 为 `" + wait + "`"} {
+		if !strings.Contains(readme, want) {
+			t.Errorf("README 的停止等待说明应包含 %q", want)
+		}
 	}
 	for _, stale := range []string{"stop_grace_period: 30s", "stopwaitsecs=30", "15.5 秒"} {
-		if strings.Contains(compose+deployDoc, stale) {
+		if strings.Contains(compose+readme, stale) {
 			t.Errorf("部署文件仍有旧的退出预算 %q", stale)
 		}
 	}
@@ -2656,7 +2659,7 @@ func assertBaseline(t *testing.T, outDir, project string) {
 	for _, f := range []string{
 		filepath.Join("scripts", "sql", "init.sql"),
 		filepath.Join("docker-compose.yml"),
-		filepath.Join("docs", "部署文档.md"),
+		filepath.Join("docs", "运维手册.md"),
 		"README.md",
 		filepath.Join("frontend", ".env"),
 		filepath.Join("frontend", "index.html"),

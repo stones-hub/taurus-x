@@ -7,7 +7,7 @@
 #
 # 一致性：--single-transaction 对 InnoDB 表给出一致性快照，不锁表；本项目的表都是 InnoDB。
 # 限制：备份期间不要做 DDL（ALTER / DROP / RENAME / TRUNCATE），否则快照可能不一致或导出报错；
-# MyISAM 等非事务表不在快照保护内。详见 docs/运维手册.md。
+# MyISAM 等非事务表不在快照保护内。详见项目 README.md「备份与恢复」。
 set -euo pipefail
 
 # 在调用任何外部命令之前拿走密码：脚本目录只用 shell 内建计算（不调 dirname），source 之后
@@ -137,7 +137,7 @@ dbops_verify_dump "$partial"
 	printf 'created_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } >"$partial_meta"
 
-# .sha256 覆盖数据文件和 .meta，只用来发现损坏，不是来源认证（见运维手册）。
+# .sha256 覆盖数据文件和 .meta，只用来发现损坏，不是来源认证（见 README.md「备份与恢复」）。
 sum=$(dbops_sha256 "$partial")
 meta_sum=$(dbops_sha256 "$partial_meta")
 {
@@ -158,5 +158,5 @@ printf '备份完成\n'
 printf '  库:          %s@%s:%s（server_uuid=%s）\n' "$database" "$DBOPS_HOST" "$DBOPS_PORT" "$DBOPS_SERVER_UUID"
 printf '  文件:        %s（%s 字节）\n' "$final" "$size"
 printf '  sha256:      %s\n' "$sum"
-printf '  库级对象:    %s\n' "$([ "$DBOPS_DUMP_STORED_MARKERS" -eq 0 ] && echo '无（只有表和数据）' || echo "有（视图/存储过程/触发器/事件，恢复只能用同名库，见运维手册）")"
+printf '  库级对象:    %s\n' "$([ "$DBOPS_DUMP_STORED_MARKERS" -eq 0 ] && echo '无（只有表和数据）' || echo "有（视图/存储过程/触发器/事件，恢复只能用同名库，见 README.md「备份与恢复」）")"
 printf '  耗时:        %s 秒\n' "$(($(date +%s) - started))"

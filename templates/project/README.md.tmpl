@@ -1,525 +1,796 @@
 # {{ .ProjectName }}
 
-由 [taurus-x](https://github.com/stones-hub/taurus-x) 生成的后台管理底座：Go + Vue3 单体部署，
-前端构建产物由 Go 进程直接托管（SPA history 回退），对外只暴露一个端口。
+由 [taurus-x](https://github.com/stones-hub/taurus-x) 生成的后台管理底座：Go + Vue3 单体部署，前端构建产物由 Go 进程直接托管（SPA history 回退），对外只暴露一个端口。底座只包含**管理后台最小闭环**：登录鉴权、用户 / 角色 / 权限（菜单 / 按钮 / 接口三级 RBAC）、部门与成员、登录 / 访问 / 操作 / 前端错误四类日志。**不含任何业务模块**，业务按 `docs/后端开发流程.md` 与 `docs/前端开发流程.md` 往上长。
 
-底座只包含**管理后台最小闭环**：登录鉴权、用户 / 角色 / 权限（RBAC 三级：菜单 / 按钮 / 接口）、
-部门与部门成员、四类日志（登录 / 访问 / 操作 / 前端错误）。**不含任何业务模块**，业务从空白开始按
-`docs/后端开发流程.md` 与 `docs/前端开发流程.md` 往上长。
+**本文是这个项目的日常操作入口**：配置、首次初始化、本机开发、部署、状态与日志、停止、备份恢复、更新与失败处理都在这里。`docs/` 下另有开发规范和进阶的[运维手册](docs/运维手册.md)（压测、SBOM、漏洞扫描判读）。命令如无特别说明都在**项目根目录**执行；每条命令单独一行，配置文件内容一律用编辑器写入；形如 `(cd frontend && ...)` 的括号表示在子 shell 里执行，执行完仍停在项目根目录。
+
+## 目录
+
+- [一、项目概览](#一项目概览)
+- [二、准备环境](#二准备环境)
+- [三、配置](#三配置)
+- [四、首次初始化](#四首次初始化)
+- [五、本机开发](#五本机开发)
+- [六、部署](#六部署)
+- [七、日常运维：状态、日志、停止](#七日常运维状态日志停止)
+- [八、备份与恢复](#八备份与恢复)
+- [九、更新与失败处理](#九更新与失败处理)
+- [十、常见问题](#十常见问题)
+- [十一、已知风险与待办](#十一已知风险与待办)
 
 ---
 
-## 一、技术栈
-
-| 层 | 选型 |
-|----|------|
-| 后端 | Go {{ .GoVersion }}、Google Wire DI、GORM、Redis |
-| 框架组件 | taurus-pro 套件（见下表） |
-| 前端 | Vue 3 + TypeScript + Vite + Element Plus + Pinia + vue-router |
-| 数据库 | MySQL 8.x（建表只走 `scripts/sql/`，**不开 GORM AutoMigrate**） |
-
-### 已启用的框架组件
+## 一、项目概览
 
 | 组件 | 作用 | 配置目录 |
 |------|------|----------|
-| common | 日志 / JWT / 工具库 | `backend/config/` |
-| config | 配置加载与环境变量替换 | `backend/config/` |
-| http | HTTP 服务与中间件 | `backend/config/autoload/http/` |
-| storage | MySQL + Redis | `backend/config/autoload/db/`、`redis/` |
+| common / config / http | 日志与 JWT、配置加载与环境变量替换、HTTP 服务与中间件 | `backend/config/`、`autoload/http/` |
+| storage | MySQL 8.x + Redis（建表只走 `scripts/sql/`，**不开 GORM AutoMigrate**） | `autoload/db/`、`autoload/redis/` |
 {{- if .Has.consul }}
-| consul | 服务注册发现 | `backend/config/autoload/consul/` |
+| consul | 服务注册发现；compose 内置的 Consul 是 dev 模式、无 ACL，宿主端口只绑 127.0.0.1，只适合联调 | `autoload/consul/` |
 {{- end }}
 {{- if .Has.opentelemetry }}
-| opentelemetry | 链路追踪 / 指标上报 | `backend/config/autoload/otel/` |
+| opentelemetry | 链路追踪 / 指标上报；默认关闭，collector 不在 compose 内，需自备后填地址打开 | `autoload/otel/` |
 {{- end }}
 {{- if .Has.tcp }}
-| tcp | 自带 TCP 长连接服务 | `backend/config/autoload/tcp/` |
+| tcp | TCP 长连接服务（8081）；默认关闭，注册好 handler 后打开 `TCP_ENABLE` | `autoload/tcp/` |
 {{- end }}
 {{- if .Has.grpc }}
-| grpc | 自带 gRPC 服务 | `backend/config/autoload/grpc/` |
+| grpc | gRPC 服务（50051）；默认关闭，注册好 service 后打开 `GRPC_ENABLE` | `autoload/grpc/` |
 {{- end }}
 {{- if .Has.milvus }}
-| milvus | 向量库客户端池 | `backend/config/autoload/milvus/` |
+| milvus | 向量库客户端池；compose 内置 standalone v2.6.5 + 独立 etcd v3.5.18，宿主端口只绑 127.0.0.1 | `autoload/milvus/` |
 {{- end }}
 
-未选中的可选组件**完全不存在**于本项目：不在 `go.mod`、不在 `internal/taurus`、不在
-`config/autoload/`、不在 `docker-compose.yml`。需要时再按已有组件的写法补。
+后端 Go {{ .GoVersion }} + Google Wire + GORM，前端 Vue 3 + TypeScript + Vite + Element Plus + Pinia。生成时未选中的可选组件**完全不存在**于本项目（不在 `go.mod`、`internal/taurus`、`config/autoload/`、`docker-compose.yml`），需要时按已有组件的写法补。
+{{- if .Has.milvus }}
 
----
+> ⚠️ 本项目勾选了 milvus：compose 不内置对象存储，Docker 方式必须接你们自己有人维护的**外置 S3**（只支持公共 CA 签发证书的 HTTPS 端点，不支持私有 CA / 自签证书 / HTTP），`.env` 里 `MILVUS_S3_*` 必填项缺一项 compose 即拒绝启动；见 [6.5 Milvus 外置 S3](#65-milvus-外置-s3)。本项目未对任何真实外置端点做过兼容验收。
+{{- end }}
 
-## 二、目录结构
-
-```
+```text
 {{ .ProjectName }}/
-├── backend/
-│   ├── bin/main.go              # 入口
-│   ├── app/
-│   │   ├── bootstrap.go         # 启动 / 信号 / 优雅关闭
-│   │   ├── wire.go|wire_gen.go  # 应用层 DI（make wire 生成）
-│   │   ├── routes/routes.go     # 路由注册 + SPA 静态托管
-│   │   ├── middleware/          # JWT / 权限 / CSRF / 限流 / 三类日志
-│   │   ├── controller/          # 入参校验 + 调 service + 统一响应
-│   │   ├── service/             # 业务编排（事务、权限判断、DTO 组装）
-│   │   ├── repo/                # 数据访问（baseRepository + Store 工作单元）
-│   │   ├── model/               # 贫血模型（12 张底座表）
-│   │   ├── dto/                 # 请求 / 响应结构
-│   │   ├── helper/              # 密码散列 / 校验 / 验证码 / 分页等
-│   │   └── constants/           # 枚举 + 值→中文名映射
-│   ├── internal/taurus/         # 框架层组件图（Components + Provide* + wire）
-│   └── config/                  # 配置（autoload/ 按组件分目录）
-├── frontend/
-│   └── src/{api,types,router,views,composables,components,directives,stores}
-├── scripts/
-│   ├── sql/init.sql             # 建表 + 底座权限数据 + 初始管理员
-│   ├── db/                      # MySQL 备份 / 恢复脚本（make db-backup / db-restore）
-│   └── loadtest/                # 登录 / 列表接口压测工具（独立 Go module，go run）
-├── docs/                        # 项目规范 / 前后端开发流程 / 部署文档 / 运维手册
-├── Dockerfile
-└── docker-compose.yml
+├── backend/            Go 后端：bin/main.go 入口、bin/hashpw 散列工具、app/ 业务分层、internal/taurus 组件图、config/ 配置
+├── frontend/           Vue 前端（构建产物 frontend/dist 由后端托管）
+├── scripts/sql/        init.sql：建表 + 底座权限 + 初始管理员（只用于全新空库）；以后的增量 SQL 也放这里
+├── scripts/db/         MySQL 备份 / 恢复脚本（make db-backup / db-restore）
+├── scripts/loadtest/   登录 / 列表接口压测工具（独立 Go module）
+├── docs/               项目规范、前后端开发流程、运维手册（高级）、商用加固一期说明
+└── Dockerfile / docker-compose.yml / Makefile
 ```
+
+运行时只有一个 Go 进程（默认端口 9080），**必须以 `backend/` 为工作目录**：`-config ./config`、`-env .env.local`、前端 `../frontend/dist`、日志 `logs/` 都是相对路径。路由：`/health` 健康检查，`/auth/*`、`/admin/*` 等为 API，其它路径回退前端页面。需要 80/443 或 HTTPS 时在前面加 nginx（6.3）。
 
 ---
 
-## 三、本地起步
+## 二、准备环境
 
-### 1. 准备 MySQL / Redis 并导入初始化 SQL
+| 场景 | 需要 |
+|------|------|
+| 本机开发 | Go {{ .GoVersion }}+、Node 22.12+（前端测试要 22.18+）、make、Docker（只用来起测试用 MySQL / Redis） |
+| Docker 部署（推荐） | Linux 服务器：Docker Engine + compose 插件，构建必须有 BuildKit / buildx |
+| 原生部署 | MySQL 8.x、Redis、一个非 root 运行用户、你们已有的进程守护工具（supervisor / systemd / launchd 等）；构建机需 Go 与 Node |
+| 备份 / 恢复 | 执行脚本的机器上装 MySQL 8.x 客户端（`mysql`、`mysqldump`）、bash、gzip、awk、`sha256sum` 或 `shasum` |
 
-```bash
-mysql -u <用户> -p -e "CREATE DATABASE IF NOT EXISTS {{ .DBName }} DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
-mysql -u <用户> -p {{ .DBName }} < scripts/sql/init.sql
-```
-
-### 2. 配置环境变量
-
-```bash
-cd backend
-cp .env.example .env.local        # 填 DB_DSN / REDIS_*
-openssl rand -hex 32              # 把输出写进 .env.local 的 JWT_SECRET=
-```
-
-> `JWT_SECRET` **必填**：`.env.example` 里刻意留空（该文件进版本库，带现成密钥等于把签名
-> 密钥一起提交）。未配置、过短（< 32 字符）或是示例/弱值时服务会**拒绝启动**，
-> 见 `app/helper/startup_check.go`。
->
-> `.env.local` 的值会被**原样文本替换**进 `config/` 下的配置文件，再做 YAML/TOML 解析：
-> **不要加引号**，不要在值里写 `}` 或换行。
-
-### 3. 起后端
-
-```bash
-cd backend
-make wire     # 仅在增删 controller/service 后需要
-make build    # 产出 build/{{ .ProjectName }}
-./build/{{ .ProjectName }} -config ./config -env .env.local
-```
-
-> ⚠️ 必须**以 `backend/` 为工作目录**运行：`-config ./config`、前端产物 `../frontend/dist`、
-> 日志 `logs/` 都是相对路径。
-
-### 4. 起前端
-
-```bash
-cd frontend
-pnpm install
-pnpm dev      # 开发（Vite dev server，接口代理见 vite.config.ts）
-pnpm build    # 生产构建（含 vue-tsc 类型检查），产出 dist/，由后端托管
-```
-
-### 5. 登录
-
-浏览器打开 `http://127.0.0.1:9080/`，用下面的初始管理员账号登录。
+前端包管理器是 pnpm 10.34.7。本文一律用 `npm exec --yes pnpm@10.34.7 -- <命令>` 临时调用固定版本，**不要求全局安装 pnpm**；根目录 `Makefile` 的 `frontend-*`、`dev`、`build` 目标直接调用 `pnpm`，只有全局装了 pnpm 才能用。Wire 通过 `go run` 调用，不需要全局安装。
 
 ---
 
-## 四、初始管理员账号
+## 三、配置
+
+### 3.1 配置放在哪
+
+| 文件 | 用途 |
+|------|------|
+| `backend/.env.example` | 配置示例，进版本库；`JWT_SECRET` 刻意留空 |
+| `backend/.env.local` | 本机开发与原生部署运行时读取的实际配置（启动参数 `-env .env.local`），**不进 Git** |
+| 项目根目录 `.env` | 只给 Docker Compose 用，compose 从它读取 `${VAR}` 注入容器，**不进 Git、不进镜像** |
+| `docker-compose.yml` 里 app 的 `environment` | Docker 下实际传进容器的变量；没列在这里的变量（例如 `TRUSTED_PROXIES`、`ADMIN_RATE_LIMIT_*`、`LOG_RETENTION_DAYS`）要加一行才会生效 |
+| `backend/config/` | 配置模板，`${VAR:默认值}` 占位；可选组件的开关和地址见各配置文件注释 |
+| `frontend/vite.config.ts` | 开发服务器端口及 `/api` 代理目标（默认 `http://127.0.0.1:9080`） |
+
+### 3.2 常用变量
+
+| 变量 | 填什么 |
+|------|--------|
+| `DB_DSN` | 例如 `{{ .DBName }}:<强密码>@tcp(127.0.0.1:3306)/{{ .DBName }}?charset=utf8mb4&parseTime=True&loc=Local`；Docker 下主机写容器名 `mysql`。数据库时区要与 `loc` 一致 |
+| `DB_NAME` | 连接实例的标记名，保持 `{{ .DBName }}`；连哪个库由 `DB_DSN` 决定 |
+| `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` | 无密码时写 `REDIS_PASSWORD=`（不要写 `""`） |
+| `JWT_SECRET` | **必填**，`openssl rand -hex 32` 生成；留空、少于 32 字符或弱值时程序拒绝启动 |
+| `AUTHORIZATION` | 内部接口授权码，换成随机值（`openssl rand -hex 24`） |
+| `SERVER_ADDRESS` / `SERVER_PORT` | 直接对外用 `0.0.0.0`，本机开发或前面有 nginx 的原生部署用 `127.0.0.1`；Docker 容器内始终 `0.0.0.0`（见 3.4）；端口默认 `9080`，改了要同步改 Vite 代理 |
+| `TRUSTED_PROXIES`、`AUTH_TRUSTED_ORIGINS`、`JWT_COOKIE_SECURE` | 反向代理 / HTTPS 部署时设置，见 3.4 |
+| `ADMIN_RATE_LIMIT_BURST` / `ADMIN_RATE_LIMIT_PER_SECOND` | 后台接口按 IP 限流，默认 `300` / `10`；两项都填 `0` 关闭；负数、非整数、只有一项为 `0` 或每秒超过 `10000` 时拒绝启动 |
+| `LOG_RETENTION_DAYS` | 日志表保留天数，默认 `180`，`0` 不清理；负数或非数字拒绝启动 |
+| `HTTP_SHUTDOWN_TIMEOUT_SECONDS`、`REQUEST_LOG_*` | 退出时等在途请求（默认 5，1~10 秒）、访问 / 操作日志队列容量 / worker / 排空秒数（默认 1000 / 2 / 5）；越界拒绝启动 |
+
+### 3.3 写法限制与文件权限
+
+- 值会被**原样文本替换**进 `config/` 下的配置文件再做 YAML / TOML 解析：**不要加引号**，不要在值里写 `}` 或换行。密码、密钥最好只用字母和数字（`openssl rand -hex` 的输出即可），避免引号、`$`、`}`、`@`、`/`、`#` 这类会被配置解析、DSN 或 compose 插值改写的字符。
+- 凭据首尾空格：Redis 密码{{ if .Has.consul }}、Consul token / Basic Auth{{ end }}{{ if .Has.milvus }}、Milvus 用户名 / 密码 / API key{{ end }}只有纯空白时按没配处理，非空白的值不会被代码去掉首尾空格；受配置库「先文本替换再解析」的限制，不保证任意字符都能原样传递；首尾空格保留只验证过由进程环境变量直接提供的普通值，经 `.env.local` 等文件提供时未验证。
+- `.env.local` 和 `.env` 含密钥：不进 Git（`.gitignore` 已忽略），权限 `600`（原生部署用 `640` 且属组为运行组，见 6.2），每次编辑后核对权限。读不到 `-env` 指定的文件时程序**直接退出**，不会带着默认配置运行。
+- Docker 构建上下文是整个项目目录：`.dockerignore` 排除了各层 `.env*`（只放行 `frontend/.env`、`frontend/.env.production` 两个非敏感构建配置）、`*.local`、`*account*.txt` 和 `browser-credentials.json`；自己另起名字的秘密文件（密钥、证书、导出数据等）放到项目目录外或自行加进 `.dockerignore`，这些规则不能保证构建上下文里没有任何秘密。
+
+### 3.4 HTTPS、反向代理与可信来源
+
+- **HTTPS 由反向代理终止时**必须设置 `AUTH_TRUSTED_ORIGINS=https://实际后台域名`（多个精确 Origin 用逗号分隔，不用通配符）和 `JWT_COOKIE_SECURE=true`；Docker 下这两项已在 compose 透传，写进 `.env` 即可。认证接口只接受 POST 并校验来源，刷新始终校验 CSRF，细节见 `docs/商用加固一期说明.md`。
+- **前面有 nginx 等代理时**，用 `TRUSTED_PROXIES` 填代理自己的地址，并让后端只能从本机访问：原生部署设 `SERVER_ADDRESS=127.0.0.1`；Docker 容器内保持 `SERVER_ADDRESS: 0.0.0.0`（改成回环宿主就连不进容器），只把宿主端口映射改成 `127.0.0.1:9080:9080`。否则所有请求都像来自代理：登录日志 IP 全一样、所有人共用一份限流额度。**不要填 `0.0.0.0/0` 之类的大网段**：被信任的地址可以伪造客户端 IP。默认不采信 `X-Forwarded-For` / `X-Real-IP`。
+
+---
+
+## 四、首次初始化
+
+### 4.1 数据库只初始化一次
+
+`scripts/sql/init.sql` 建 12 张底座表、写入底座权限、超级管理员角色和初始管理员。**它只用于全新的空库**：本机开发和原生部署建好空库后手工导入一次（5.1、6.2）；Docker 的 mysql 只在**数据卷第一次为空时**自动导入，之后不再执行。不要向已有数据的库重复导入，也不要为更新而导入；修改 `init.sql` 不会改变已有的库，以后的变更写增量 SQL（第九节）。
+
+### 4.2 初始管理员
 
 | 项 | 值 |
 |----|-----|
 | 用户名 | `{{ .AdminUsername }}` |
 | 初始密码 | **随机生成，只在 `taurus-x` 生成本项目时在终端打印过一次**（不写进本文件，也不写进 `scripts/sql/init.sql`） |
-| 角色 | `super_admin`（代码里直接放行全部菜单/按钮/接口权限） |
+| 角色 | `super_admin`（放行全部菜单 / 按钮 / 接口权限） |
 
-密码在 `scripts/sql/init.sql` 里只以 **bcrypt 散列**存入 `admin_user_logins.login_credential`
-（`salt` 列为空，bcrypt 的盐编码在散列串里），每次生成项目都不同。
-算法与 `backend/app/helper/crypto.go` 的 `HashPassword` 一致。
+`init.sql` 里只有 bcrypt 散列（`admin_user_logins.login_credential`，`salt` 列为空），每次生成都不同。**首次登录后立即改密**（个人信息 → 修改密码）：改密会吊销该账号的所有既有会话，页面提示「密码已修改，请重新登录」并跳转登录页，这是有意的。
 
-**没记下初始密码怎么办**：明文无法从散列反推。自己选一个新密码，用项目自带的小工具算出散列，再更新库里那一行：
+### 4.3 忘记初始密码 / 重置管理员密码
+
+明文无法从散列反推。没有业务数据的测试项目，最简单是重新生成项目、配新的空库。**已有数据时不要删库**，按四步重置：
+
+**第 1 步：计算新密码的散列。** 密码从键盘输入、不回显、不进命令历史，只输出散列；新密码要满足后端规则（6–20 字节、含字母和数字）。散列不是密码，但能被离线暴力破解，不要贴进聊天、工单或问题报告：
 
 ```bash
-# 1. 计算新密码的 bcrypt 散列：密码从键盘输入（不回显），不会进命令行历史，只输出散列
-cd backend && go run ./bin/hashpw
-
-# 2. 回写散列，并让该账号已有的登录全部失效
-mysql -uroot -p {{ .DBName }} -e "UPDATE admin_user_logins SET login_credential='<上一步输出的散列>', salt='' WHERE login_type='username' AND login_value='{{ .AdminUsername }}'; UPDATE admin_users SET auth_version = auth_version + 1 WHERE username='{{ .AdminUsername }}';"
+(cd backend && go run ./bin/hashpw)
 ```
 
-> 散列里含 `$` 符号，上面用双引号包住整条 SQL、散列放在单引号里，shell 不会替换它；
-> 如果你改用其它写法，注意别让 shell 把 `$2a$10$...` 当成变量吃掉。
+**第 2 步：用交互式 mysql 客户端连上数据库。** 不要把含散列的 SQL 写在 shell 命令参数里（例如 `mysql -e "UPDATE ..."`）：散列形如 `$2a$10$...`，放在双引号里时 shell 仍会把 `$2`、`$10` 这类片段当成变量展开，写进库的就不是你算出的散列；命令参数还会进 shell 历史和 `ps`。`MYSQL_HISTFILE=/dev/null` 让客户端这次不写 `~/.mysql_history`，`-p` 后面不写密码。本机 / 原生部署用第一条（账号需对该库有写权限），Docker 部署用第二条（输入 `.env` 里的 `MYSQL_PASSWORD`）：
 
-也可以直接重新生成一个项目，拿新的随机初始密码。
+```bash
+MYSQL_HISTFILE=/dev/null mysql --protocol=TCP -h 127.0.0.1 -P 3306 -u <账号> -p {{ .DBName }}
+docker exec -it -e MYSQL_HISTFILE=/dev/null {{ .ProjectName }}-mysql mysql -u{{ .DBName }} -p {{ .DBName }}
+```
 
-> ⚠️ **首次登录后立即改密**（个人信息 → 修改密码）。改密会吊销该账号的所有既有 Token，
-> 需要重新登录，这是有意的：改密成功后页面会提示「密码已修改，请重新登录」，自动清掉本地登录态并跳转登录页。
->
-> 个人信息里的「最后登录时间 / 最后登录 IP」在每次登录成功后更新；从未登录过的账号显示「-」。
+**第 3 步：在 `mysql>` 提示符里粘贴执行**，把 `<第 1 步输出的散列>` 整体替换掉（保留两侧单引号）。这一块**不含提交**：
+
+```sql
+START TRANSACTION;
+UPDATE admin_user_logins SET login_credential='<第 1 步输出的散列>', salt='' WHERE login_type='username' AND login_value='{{ .AdminUsername }}';
+UPDATE admin_users SET auth_version = auth_version + 1 WHERE username='{{ .AdminUsername }}';
+```
+
+**第 4 步：先看结果再决定提交。** 两条 UPDATE 都应提示 `1 row affected`；任何一条不是 1 行时，在同一个 `mysql>` 会话里输入 `ROLLBACK;`，查清账号名再来。两条都是 1 行时，同一会话里再输入：
+
+```sql
+COMMIT;
+```
+
+`auth_version` 加 1 与换散列在同一个事务里提交，让该账号已签发的会话立即失效。完成后 `exit`，用新密码登录。
 
 ---
 
-## 五、开发约定（必读）
+## 五、本机开发
 
-| 文档 | 内容 |
-|------|------|
-| [`docs/项目规范.md`](docs/项目规范.md) | **唯一权威规则**：分层边界、RBAC、DTO、命名、分页哨兵、前端交互 |
-| [`docs/后端开发流程.md`](docs/后端开发流程.md) | 后端新模块 6 步（model → repo → dto → service → controller → routes + 权限 SQL） |
-| [`docs/前端开发流程.md`](docs/前端开发流程.md) | 前端新模块 4 步（types → api → router → views） |
-| [`docs/部署文档.md`](docs/部署文档.md) | Ubuntu 裸机（supervisor）、macOS（launchd）、Docker（compose）三种部署方式，含 amd64 / arm64 说明与可选 nginx |
+后端直接运行在本机，前端用 Vite 开发服务器，MySQL 和 Redis 用本项目专用的测试容器。**不要使用、重置或清空其他项目正在运行的数据库。**
 
-几条最容易踩的硬约束：
+### 5.1 起 MySQL / Redis 并初始化
 
-1. **建表与权限数据只走 `scripts/sql/`**，不开 GORM AutoMigrate；变更写增量脚本留痕。
-2. **接口 path 必须与 `admin_permissions.path` 完全一致**（`permission_type=3` 精确匹配）。
-3. 新模块的三级权限（菜单/按钮/接口）要一次配齐；刷新按钮**复用 `.query`**，不单独建权限。
-4. `/admin/option/*` 走 `userBaseChain`（只校验登录），**无需**接口权限。
-5. 密码相关一律用 `app/helper/crypto.go`，不要自己写散列。
+先在当前终端输入一个仅测试用的 MySQL root 密码（不回显、不进命令历史），再启动容器（`-e MYSQL_ROOT_PASSWORD` 从环境读取，密码不出现在命令行上）、等就绪（显示 `mysqld is alive`）、导入初始化 SQL：
+
+```bash
+read -rs MYSQL_ROOT_PASSWORD && export MYSQL_ROOT_PASSWORD
+docker run -d --name {{ .ProjectName }}-dev-mysql -p 127.0.0.1:23309:3306 -e MYSQL_ROOT_PASSWORD -e MYSQL_DATABASE={{ .DBName }} -e TZ=Asia/Shanghai mysql:8.0 --default-time-zone=+08:00
+docker run -d --name {{ .ProjectName }}-dev-redis -p 127.0.0.1:26382:6379 redis:7-alpine
+docker exec -it {{ .ProjectName }}-dev-mysql mysqladmin -uroot -p ping
+docker cp scripts/sql/init.sql {{ .ProjectName }}-dev-mysql:/tmp/init.sql
+docker exec -it {{ .ProjectName }}-dev-mysql mysql -uroot -p {{ .DBName }} -e 'source /tmp/init.sql'
+docker exec {{ .ProjectName }}-dev-mysql rm -f /tmp/init.sql
+```
+
+时区与 `docker-compose.yml` 一致（`Asia/Shanghai`、`+08:00`）；DSN 用 `loc=Local` 时，数据库时区应等于后端所在机器的本地时区，否则 `CURRENT_TIMESTAMP` 生成的时间会差一个时区差。root 账号只用于本机测试容器。
+
+### 5.2 配置与启动
+
+```bash
+cp backend/.env.example backend/.env.local
+chmod 600 backend/.env.local
+openssl rand -hex 32
+```
+
+用编辑器打开 `backend/.env.local`，修改下面这些字段（其余保留示例值）：
+
+```dotenv
+SERVER_ADDRESS=127.0.0.1
+SERVER_PORT=9080
+DB_DSN=root:<你的测试 root 密码>@tcp(127.0.0.1:23309)/{{ .DBName }}?charset=utf8mb4&parseTime=True&loc=Local
+REDIS_HOST=127.0.0.1
+REDIS_PORT=26382
+REDIS_PASSWORD=
+JWT_SECRET=<openssl rand -hex 32 的输出>
+AUTHORIZATION=<另一个随机值>
+```
+
+安装前端依赖后开两个终端（都先进入项目根目录）：终端一启动后端（`make run` 先执行 Wire 再读取 `backend/.env.local`），终端二启动前端。两条都用子 shell，`Ctrl+C` 停止后终端仍在项目根目录：
+
+```bash
+(cd frontend && npm exec --yes pnpm@10.34.7 -- install)
+(cd backend && make run)
+(cd frontend && npm exec --yes pnpm@10.34.7 -- dev --host 127.0.0.1)
+```
+
+打开前端终端打印的地址（通常 `http://127.0.0.1:5173/login`），用初始管理员登录，先打开用户、角色、权限、部门、日志、个人中心页面确认无接口错误（有些业务失败仍是 HTTP 200，要看响应 JSON 的 `code`）。后端健康检查 `http://127.0.0.1:9080/health`；后端改了端口时同步改 `frontend/vite.config.ts` 的 `target`。测试结束在两个终端按 `Ctrl+C`。
+
+前端测试（Node 22.18+）、生产构建（含 vue-tsc 类型检查，产出 `frontend/dist/`；chunk 超过 500 kB 是警告不是失败），以及用完后删除本节测试容器（会删掉容器里的测试数据，先确认名字是本节创建的）：
+
+```bash
+(cd frontend && npm exec --yes pnpm@10.34.7 -- test)
+(cd frontend && npm exec --yes pnpm@10.34.7 -- build)
+docker rm -f -v {{ .ProjectName }}-dev-mysql {{ .ProjectName }}-dev-redis
+unset MYSQL_ROOT_PASSWORD
+```
+
+### 5.3 开发约定与 Wire
+
+分层、RBAC、命名等**唯一权威规则**见 [`docs/项目规范.md`](docs/项目规范.md)，新模块步骤见 [`docs/后端开发流程.md`](docs/后端开发流程.md) 与 [`docs/前端开发流程.md`](docs/前端开发流程.md)，发版前的 `make vuln` / `make sbom` 见 [`docs/运维手册.md`](docs/运维手册.md)。最容易踩的硬约束：
+
+1. **建表与权限数据只走 `scripts/sql/`**，不开 GORM AutoMigrate；变更写增量脚本留痕（执行方式见第九节）。
+2. **接口 path 必须与 `admin_permissions.path` 完全一致**；新模块的菜单 / 按钮 / 接口权限一次配齐；`/admin/option/*` 只校验登录。
+3. 密码相关一律用 `app/helper/crypto.go`；前端按钮隐藏不能替代后端接口权限。
+4. Wire 生成文件（`backend/app/wire.go`、`backend/app/wire_gen.go`、`backend/internal/taurus/wire_gen.go`）与系统架构无关，**要提交到 Git**，不要手改。`make run`、`make build` 会自动重新生成；新增或删除 controller / service 后执行下面的命令并一起提交。Docker 构建**不会执行 Wire**，漏提交会导致镜像编译失败或漏掉新服务。
+
+```bash
+(cd backend && make wire && go build ./...)
+```
 
 ---
 
 ## 六、部署
 
-部署步骤统一写在 [`docs/部署文档.md`](docs/部署文档.md)，本文不再重复。它包含：
+推荐 **Docker Compose**（6.1）：数据库、缓存和应用一起编排。不用 Docker 时按 6.2 的原生部署要点自行接入你们的主机与进程守护。两种方式程序都**不以 root 运行**，都默认不含 nginx；上线前在目标机器完整走一遍，**能在浏览器登录进首页才算部署完成**。
 
-- 怎么选：Docker、Ubuntu 服务器、macOS 三种方式分别适合什么场景；
-- 每种方式从安装依赖到登录验证的完整步骤，以及更新发版和回滚；
-- 不同 CPU 架构（amd64 / arm64）怎么编译、怎么出包；
-- 可选的 nginx 反向代理，以及必须同步设置的 `TRUSTED_PROXIES`；
-- 常见问题排查。
+### 6.1 Docker Compose 部署（推荐）
 
-上线后的日常运维写在 [`docs/运维手册.md`](docs/运维手册.md)：
+**准备**（部署目录以 `/data/app` 为例）。`Dockerfile` **必须用 BuildKit 构建**：没有 BuildKit 的旧构建器不会注入 `BUILDPLATFORM`，在第一条 `FROM --platform=$BUILDPLATFORM` 就报 `"" is an invalid OS component`。app 容器以 uid 1000 运行，日志目录要先交给 uid 1000，否则日志初始化失败、容器直接退出：
 
-| 命令 | 用途 |
-|------|------|
-| `make db-backup DB=<库>` / `make db-restore ...` | MySQL 备份 / 恢复到空库（连接参数走 `MYSQL_OPS_*` 环境变量，恢复从不覆盖非空库） |
-| `cd scripts/loadtest && go run . -scenario login\|list` | 登录 / 列表接口压测（默认只压本机，先读 `scripts/loadtest/README.md` 的限流说明） |
-| `make sbom` | 前后端 CycloneDX SBOM → `artifacts/sbom/` |
-| `make vuln` | govulncheck 依赖漏洞扫描（已知的 x/crypto/openpgp 模块告警及判定见运维手册） |
+```bash
+docker compose version
+docker buildx version
+git clone <你的仓库地址> /data/app
+cd /data/app
+git checkout <要发布的 tag 或提交号>
+mkdir -p docker-data/logs
+sudo chown -R 1000:1000 docker-data
+```
+
+compose 的项目名默认取部署目录名，数据卷名带这个前缀（例如 `app_mysql-data`）。以后**不要改部署目录名，也不要随意加 `-p` 换项目名**：项目名一变，compose 会建一套新的空数据卷、MySQL 重新初始化，看起来像数据没了（旧卷其实还在）。
+
+**写 compose 的 `.env`**：用编辑器在项目根目录创建 `.env`，把占位换成真实值（密码用 `openssl rand -hex 24` 生成），然后 `chmod 600 .env`：
+
+```dotenv
+MYSQL_ROOT_PASSWORD=<强密码一>
+MYSQL_PASSWORD=<强密码二>
+AUTHORIZATION=<随机串>
+JWT_SECRET=<openssl rand -hex 32 的输出>
+DB_DSN={{ .DBName }}:<强密码二>@tcp(mysql:3306)/{{ .DBName }}?charset=utf8mb4&parseTime=True&loc=Local
+# 只在 HTTPS 反向代理后面部署时打开下面两行（见 3.4）
+# AUTH_TRUSTED_ORIGINS=https://实际后台域名
+# JWT_COOKIE_SECURE=true
+{{- if .Has.milvus }}
+# Milvus 外置 S3（含义见 6.5）
+MILVUS_S3_ADDRESS=<外置 S3 端点 host>
+MILVUS_S3_ACCESS_KEY_ID=<该桶专用访问密钥 ID>
+MILVUS_S3_SECRET_ACCESS_KEY=<该桶专用访问密钥>
+MILVUS_S3_BUCKET=<预先建好的桶名>
+MILVUS_S3_ROOT_PATH={{ .ProjectName }}/milvus
+MILVUS_S3_REGION=<桶所在区域>
+{{- end }}
+```
+
+```bash
+chmod 600 .env
+```
+
+- `JWT_SECRET` 没设置时 compose 直接报错拒绝启动（故意如此）{{ if .Has.milvus }}；`MILVUS_S3_*` 六个必填项同样如此{{ end }}。
+- **`MYSQL_ROOT_PASSWORD`、`MYSQL_PASSWORD` 一定要设置**，否则 compose 用模板里的弱默认值。它们只在 MySQL 数据卷**第一次初始化**时生效；之后改 `.env` 不会改变库里的账号密码，要先在 MySQL 里 `ALTER USER` 再同步 `.env`。`MYSQL_PASSWORD` 与 `DB_DSN` 里的密码必须一致，`DB_DSN` 的主机是容器名 `mysql`。
+- 能执行 `docker` 命令的账号可以用 `docker inspect` 看到容器环境变量（含这些密码），按管理员权限对待。
+
+**首次构建并启动**（首次启动时 MySQL 在空数据卷上自动导入 `init.sql`，app 等 mysql 健康后才启动）：
+
+```bash
+docker compose up -d --build
+docker compose ps
+```
+
+app 端口映射 `9080:9080` 绑定所有网卡：直接对外时用防火墙只放行需要的来源；前面加 nginx 时改成 `"127.0.0.1:9080:9080"` 并按 6.3 设置 `TRUSTED_PROXIES`。以后改了 `.env` 或 app 的 `environment`，用 `docker compose up -d --no-deps app` 重建 app 才生效（`restart` 不重新读配置）。
+
+**构建架构与国内网络**：镜像默认按构建机架构编译，**不要**在 compose 里写 `platform:`。为另一种架构出包用 `docker buildx build --platform linux/amd64 -t <你的镜像仓库>/{{ .ProjectName }}-app:<tag> --push .`，交叉构建的镜像必须在目标架构机器上实际启动验证。Go 依赖代理默认 `goproxy.cn`，可用 `docker compose build --build-arg GOPROXY=https://proxy.golang.org,direct app` 覆盖。官方基础镜像拉取失败时**不要配置来源不明的全局镜像代理**，从你明确信任的加速源预拉并打回原始标签：
+
+```bash
+docker pull <明确选定的加速源>/library/golang:{{ .GoVersion }}-alpine
+docker tag <明确选定的加速源>/library/golang:{{ .GoVersion }}-alpine golang:{{ .GoVersion }}-alpine
+docker pull <明确选定的加速源>/library/node:22-alpine
+docker tag <明确选定的加速源>/library/node:22-alpine node:22-alpine
+docker pull <明确选定的加速源>/library/alpine:3.20
+docker tag <明确选定的加速源>/library/alpine:3.20 alpine:3.20
+```
+
+### 6.2 原生部署（要点）
+
+适用于自行管理 MySQL 8 与 Redis 的 Linux / macOS 主机，以部署目录 `/data/app` 为例（macOS 的系统根目录只读，部署目录改用例如 `/opt/{{ .ProjectName }}`，下文路径同步替换）。进程守护用你们已有的工具，本文不提供逐平台安装教程。
+
+**数据库**：在交互式 `mysql` 里建空库和只授本库权限的账号（`<强密码>` 换掉；开启了 `skip_name_resolve` 而经 `127.0.0.1` 连接被拒时，再建 `'{{ .DBName }}'@'127.0.0.1'` 并授同样权限）。Redis 默认只监听本机即可，设了 `requirepass` 就同步 `REDIS_PASSWORD`。
+
+```sql
+CREATE DATABASE IF NOT EXISTS {{ .DBName }} DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+CREATE USER '{{ .DBName }}'@'localhost' IDENTIFIED BY '<强密码>';
+GRANT ALL PRIVILEGES ON {{ .DBName }}.* TO '{{ .DBName }}'@'localhost';
+```
+
+**构建**（在有 Go 和 Node 的机器上、项目根目录）。为别的系统 / 架构编译时先 `(cd backend && make wire)`，再显式设置 `GOOS` / `GOARCH`（例如 `(cd backend && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o build/{{ .ProjectName }} ./bin/main.go)`）；前端产物、配置和 SQL 与架构无关：
+
+```bash
+(cd backend && make build)
+(cd frontend && npm exec --yes pnpm@10.34.7 -- install --frozen-lockfile)
+(cd frontend && npm exec --yes pnpm@10.34.7 -- build)
+```
+
+把 `backend/build/{{ .ProjectName }}`、`backend/config/`、`backend/.env.example`、`frontend/dist/`、`scripts/` 按同样的相对位置放到 `/data/app` 下（或在服务器上的独立构建目录里 `git checkout` 固定版本后构建，再复制过来，见 9.3）。`.env.local` 只在服务器上单独配置，不随发布包分发。
+
+**运行用户、配置与权限**：程序**不要以 root 运行**，先选定运行用户和它的组（下文 `<运行用户>`、`<运行组>`）：
+
+- **Linux**：新建一个不能登录的专用系统用户，例如用户名 `app`：`sudo useradd --system --no-create-home --shell /usr/sbin/nologin app`。多数发行版会同时建同名组，用 `id -gn app` 确认实际组名作为 `<运行组>`。
+- **macOS**：没有 `useradd`，不要照抄上一条；直接选一个已有的非管理员账号作为运行用户，`<运行组>` 用它的实际主组（`id -gn <运行用户>` 查看，常见是 `staff`）。
+
+`.env.local` 属于你自己、属组为运行组、权限 `640`；日志目录交给运行用户。以后每次编辑 `.env.local` 都重新执行这两条 `chown` / `chmod`（部分编辑方式会改掉属组，运行用户读不到时程序启动即退出）：
+
+```bash
+cp /data/app/backend/.env.example /data/app/backend/.env.local
+sudo chown "$USER":<运行组> /data/app/backend/.env.local
+chmod 640 /data/app/backend/.env.local
+mkdir -p /data/app/backend/logs
+sudo chown -R <运行用户>:<运行组> /data/app/backend/logs
+```
+
+用编辑器按 3.2 改 `.env.local` 后，首次导入初始化 SQL（只用于全新的空库），再以运行用户试运行，另开终端 `curl http://127.0.0.1:9080/health` 正常后 `Ctrl+C`：
+
+```bash
+cd /data/app && mysql -u {{ .DBName }} -p {{ .DBName }} < scripts/sql/init.sql
+cd /data/app/backend && sudo -u <运行用户> ./build/{{ .ProjectName }} -config ./config -env .env.local
+```
+
+**交给进程守护**（supervisor / systemd / launchd 均可），必须满足：
+
+- 以运行用户启动，**不要改成 root**；工作目录是 `/data/app/backend`，命令 `/data/app/backend/build/{{ .ProjectName }} -config ./config -env .env.local`；异常退出自动重启，标准输出写到 `backend/logs/` 下单独的文件。
+- 停止时先发 SIGTERM，**停止等待不少于 45 秒**再强杀：supervisor `stopwaitsecs=45`（默认只等 10 秒，必须改）、systemd `TimeoutStopSec=45`、launchd `ExitTimeOut` 为 `45`。程序优雅退出最坏约 37.7 秒（第十一节「优雅退出」），等待太短会丢日志、断在途请求。
+- macOS 作服务器时还要关闭自动睡眠，launchd 用 `UserName` 指定运行用户；开机时 MySQL / Redis 未就绪程序会退出，由守护工具重试。
+
+### 6.3 反向代理、HTTPS 与按 IP 限制后台访问
+
+仅当需要 80/443、HTTPS 或域名入口时加 nginx，把全部 `location /` 反代给 `http://127.0.0.1:9080`（Go 自己区分 API、静态文件和 SPA 回退）。核心配置（用编辑器写入 nginx 站点配置；证书放在其他用户不可读的位置；HTTP 的 80 端口只做 301 跳转到 HTTPS）：
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name {{ .ProjectName }}.example.com;
+    ssl_certificate     /etc/nginx/ssl/{{ .ProjectName }}.pem;
+    ssl_certificate_key /etc/nginx/ssl/{{ .ProjectName }}.key;
+    client_max_body_size 20m;
+    location / {
+        proxy_pass http://127.0.0.1:9080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
+```
+
+同步修改应用配置（原因见 3.4）：原生部署在 `.env.local` 设 `SERVER_ADDRESS=127.0.0.1`、`TRUSTED_PROXIES=127.0.0.1`、`AUTH_TRUSTED_ORIGINS=https://{{ .ProjectName }}.example.com`（换成实际域名）、`JWT_COOKIE_SECURE=true` 后重启；Docker 在 `.env` 打开后两项，在 compose 的 app `environment` 加 `TRUSTED_PROXIES: <Docker 网关地址>`，端口改为 `"127.0.0.1:9080:9080"`，再 `docker compose up -d --no-deps app`。网关地址：`docker network ls` 找到以 `{{ .ProjectName }}-net` 结尾的网络，`docker network inspect <网络名> | grep Gateway`。Ubuntu 的 nginx 自带默认站点，用 IP 访问会落到它，按需删掉 `/etc/nginx/sites-enabled/default`。
+
+**按 IP 限制后台访问**：应用本身**不做**来源 IP 白名单。在 nginx 的 `location /` 里加 `allow` / `deny`，或用防火墙 / 安全组只放行可信来源；同时 Go 只监听 `127.0.0.1`（或端口只映射到回环），否则绕过 nginx 直连 9080 就能跳过限制。
+
+### 6.4 部署后验证
+
+```bash
+curl http://127.0.0.1:9080/health
+curl -I http://127.0.0.1:9080/login
+ps -eo user=,args= | grep "[b]uild/{{ .ProjectName }}"
+```
+
+第三条只适用于原生部署，第一列应是运行用户而不是 root。最终以**浏览器实际登录进首页**为准，然后立即修改初始密码（4.2），并按 8.5 做第一份备份。
 {{- if .Has.milvus }}
 
-> ⚠️ 本项目勾选了 milvus：compose 不再内置对象存储，Docker 方式必须接你们自己有人维护的**外置 S3**（只支持公共 CA 签发证书的 HTTPS 端点，
-> 不支持私有 CA / 自签证书 / HTTP），并在 compose 的 `.env` 里填好 `MILVUS_S3_*` 必填项，缺一项 compose 即拒绝启动；变量表、
-> 固定的安全设置和上线前验收见部署文档第二节。本项目未对任何真实外置端点做过兼容验收。`MILVUS_ENABLE=true` 时 Milvus 连不上会让启动失败；不用 Milvus 时保持 `false`。
+### 6.5 Milvus 外置 S3
+
+本节是 Milvus 对象存储配置、日常运维和上线前验收的唯一说明。⚠️ **Milvus 的对象存储必须接外置 S3（生产前置条件）**：compose 拓扑是 milvus standalone v2.6.5 + 独立 etcd v3.5.18 + **外置 S3**，不再内置 MinIO（社区版 MinIO 已停止维护，且没有经本项目验证可拉取的公开固定镜像）；etcd 健康后 milvus 才启动，milvus 健康后 app 才启动。外置 S3 由你们自己有人维护的服务提供，本项目**没有对任何真实外置端点做过兼容验收**。
+
+| `.env` 变量（6.1） | 必填 | 说明 |
+|---|---|---|
+| `MILVUS_S3_ADDRESS` | 是 | 端点 `host` 或 `host:port`，**不带** `http://` / `https://`；不写端口按 443 |
+| `MILVUS_S3_ACCESS_KEY_ID` / `MILVUS_S3_SECRET_ACCESS_KEY` | 是 | 静态访问密钥，只放在 `.env`，按最小权限只授该桶（及前缀）的读写列删 |
+| `MILVUS_S3_BUCKET` | 是 | 建议预先建好并专用；桶不存在时 Milvus 会尝试建桶（需要建桶权限） |
+| `MILVUS_S3_ROOT_PATH` | 是 | 对象键前缀，不以 `/` 开头，例如 `{{ .ProjectName }}/milvus`；**有数据后不能再改**，不要与其它服务共用 |
+| `MILVUS_S3_REGION` | 是 | 桶所在区域，必须写对：C++ 存储客户端只在非空时才设置签名区域 |
+| `MILVUS_S3_USE_VIRTUAL_HOST` | 否，默认 `false` | 服务商只支持 virtual-host 寻址时改 `true` |
+| `MILVUS_S3_REQUEST_TIMEOUT_MS` | 否，默认 `10000` | 只作用于 C++ 客户端，写 1000 的整数倍、不低于 1000 |
+
+必填项缺任何一项 `docker compose up` 直接报错拒绝启动。
+
+**固定的安全设置（compose 里写死，不要改）**：只走 HTTPS（`MINIO_USE_SSL: "true"`），**CA 必须显式置空**（`MINIO_SSL_TLSCACERT: ""`），`MINIO_CLOUD_PROVIDER: aws`、`MINIO_USE_IAM: "false"`、`COMMON_STORAGETYPE: remote`。原因：Milvus v2.6.5 的 C++ 对象存储客户端（含存储 V2）在 CA 路径非空时会**关闭证书和主机名校验**，而镜像自带配置的 CA 占位值非空。CA 置空后两侧都用系统信任库校验，因此**只支持公共 CA 签发证书的 HTTPS 端点**；**不支持私有 CA / 自签证书**，也**不支持 HTTP 明文**，换成私有 CA 证书后连接失败是预期行为，不要为了连上而改这几项。
+
+**配置来源**：Milvus v2.6.5 的配置优先级是 **etcd > 环境变量 > 配置文件**。
+
+- etcd 的优先级高于环境变量，能直接盖掉 compose 里写死的值：**不要在 etcd 里写 Milvus 的 `minio.*` / `common.storageType` 配置**。
+- `user.yaml` 和 `MILVUSCONF`（改配置目录）属于配置文件层，优先级低于环境变量；不挂载 `user.yaml`、不设置 `MILVUSCONF` 是防御性约束，不是因为它们优先级更高。
+- `MILVUS_CONF_MINIO_*` 这类 `MILVUS_CONF_*` 前缀变量与普通环境变量同属环境变量层，是同一配置项的别名，同时存在时谁生效取决于进程环境变量的遍历顺序，不能保证谁赢，所以也不要设置。
+- 生效时机：compose 里的环境变量（含 `.env` 插值后的值）只在 Milvus 进程启动时读取，改完要重建 milvus 容器；etcd 里的覆盖在运行中就会生效，不需要重启，之后新发起的索引构建、统计、分析、导入、压缩（compaction）任务拿到的存储配置（StorageConfig）都会跟着变。
+- etcd 里一旦出现过非空的 CA 路径（`minio.ssl.tlsCACert`），C++ 存储客户端可能对之后的任务关闭证书和主机名校验，存储 V2 还会把 CA 写进进程级状态，只删掉 etcd 里的覆盖不能保证恢复校验。处置：先删掉 etcd 里的这条覆盖，再重启整个 Milvus 进程（`docker compose restart milvus`），然后重新做下面的上线前验收。
+- 防范边界：compose 里写死这些值防的是 `.env` 误配和镜像默认值，防不了能写 etcd 的人，也防不了同一容器网络里已被攻破的容器（compose 的 etcd 没有开认证）；本项目没有改这部分网络和认证配置。以上 etcd 运行时覆盖、非空 CA 的影响只按 v2.6.5 源码分析，没有做动态验证（NOT_RUN）。
+
+**日常运维**：
+
+- 改了 `.env` 里的 `MILVUS_S3_*` 后执行 `docker compose up -d --no-deps milvus` 重建 milvus，看 `docker compose ps` 恢复 healthy、app 正常；重建期间 app 的 Milvus 调用会失败，安排在低峰。
+- **轮换访问密钥**：S3 服务端为该桶签发新密钥并授同样的最小权限 → 改 `.env` → 重建 milvus 并确认检索正常 → 再吊销旧密钥。密钥不要写进 compose、日志或工单。
+- **不要动这几项**：`MINIO_USE_SSL: "true"`、`MINIO_SSL_TLSCACERT: ""`、`MINIO_CLOUD_PROVIDER: aws`、`MINIO_USE_IAM: "false"`、`COMMON_STORAGETYPE: remote`。
+- **不要改桶和前缀**：有数据后改了就读不到旧数据。换端点、桶或前缀属于数据迁移：停写后把 etcd 元数据（`etcd-data` 卷）和对象存储前缀一起做一致备份 / 迁移，保留旧端点可回退，另行计划。
+- **备份**：Milvus 的数据 = etcd 元数据 + 对象存储里该前缀下的对象，两者要按同一时间点备份才能恢复，只备份一边不能恢复检索。本项目没有提供 Milvus 备份脚本，也没有对真实外置端点做过备份恢复验证；第八节的 MySQL 备份不包含 Milvus 数据。
+- **查询失败与恢复**：Search / Query 遇到确认过的暂时性故障时，只在本次请求内失败后等待 5 秒再重建重试（5 秒是等待间隔，不保证固定的拨号节奏）；拨号和 SDK 内部重试共用单次 60 秒预算，调用方 ctx 期限更短时以调用方为准；请求结束后组件包装层没有后台重连。写操作组件包装层不重试（不代表 SDK 内部不重试）。最终失败只往默认日志（`logs/app.log`）写一条脱敏的 `milvus_read_failed` ERROR。字段含义与边界见 [`docs/运维手册.md`](docs/运维手册.md) 第四节。这些行为来自 `go.mod` 依赖的已发布 taurus-pro-milvus v0.3.0，模板不带 replace。
+
+**上线前自己验收（本项目未做，状态 NOT_RUN）**：实际写入向量 → flush / 建索引 / load → 检索结果正确，并在桶里看到对象；同卷重启 Milvus 后检索仍正确；错误密钥、错误区域、证书主机名不匹配的端点都应被拒绝。
+
+**Milvus 启用后连不上会让启动失败**（`MILVUS_ENABLE=true` 时逐个建连并握手，失败直接退出，错误信息不含密码和地址）；compose 里 app 的 `MILVUS_ENABLE` 是 `true`，原生部署默认 `false`。Docker 方式暂时不用 Milvus 时，三步要一起做（用编辑器改 `docker-compose.yml`）：
+
+1. 把 app 的 `MILVUS_ENABLE` 改成 `"false"`；
+2. 删掉 app 的 `depends_on` 里的 `milvus` 一项；
+3. 删除（或整段注释掉）`milvus`、`etcd` 两个服务，顶层 `volumes` 里的 `etcd-data`、`milvus-data` 可一并删除。
+
+只做前两步不够：这两个服务仍在 compose 里，`docker compose up` 仍会创建它们，并仍要求填写外置 S3 必填变量。已有 Milvus 数据时先按上面「备份」处理；只删 compose 里的卷声明不会删除已存在的 Docker 卷。其它约束（建连上限、调用必须带 deadline、Close 是终态、不允许 `disable_conn=true` 等）见 `backend/config/autoload/milvus/milvus.yaml` 开头的注释。
 {{- end }}
 
 ---
 
-## 七、已知风险与待办
+## 七、日常运维：状态、日志、停止
 
-底座是从一个在用的管理后台抽取的。安全加固**已落实到代码**的部分见下方「已落实的加固」，
-以下问题**已知、尚未修复**，在上生产前请逐条处理：
+| 日志 | 位置 |
+|------|------|
+| 应用日志（启动、错误{{ if .Has.milvus }}、Milvus 查询最终失败{{ end }}） | `backend/logs/app.log`（Docker：宿主 `docker-data/logs/app.log`）；按 100 MB 切分，保留 5 个旧文件 30 天 |
+| 其它文件日志 | `logs/simple.log`（JSON）、`logs/db_{{ .ProjectName }}-YYYY-MM-DD.log`（只记耗时 / 行数 / 语句类型 / 错误分类，不记 SQL 原文）、`logs/redis.log`（默认 warn，失败命令仍带参数） |
+| 进程标准输出（启动失败原因、「限流器 admin 已拒绝 N 次请求」汇总） | Docker：`docker compose logs --tail 200 app`；原生：守护工具写到 `backend/logs/` 的文件 |
+| 业务审计日志 | MySQL 表，后台「日志」菜单查看；默认保留 180 天（`LOG_RETENTION_DAYS`） |
+
+日志目录只给运行用户写；排查时提供脱敏后的片段，**不要提供密码、JWT、Cookie 或完整的 `.env.local` / `.env`**。
+
+| 目的 | Docker Compose | 原生部署 |
+|------|----------------|----------|
+| 状态 | `docker compose ps` | 守护工具的 status，或 6.4 的 `ps` |
+| 停止 / 启动 app | `docker compose stop app` / `docker compose start app` | 守护工具的 stop / start |
+| 让新配置 / 新镜像生效 | `docker compose up -d --no-deps app` | 改 `.env.local`（重新 `chown` / `chmod`）后 restart |
+| 停止全部 | `docker compose stop`；`docker compose down` 删除容器与网络、保留数据卷 | 停 app 后按需停 MySQL / Redis |
+
+- **`docker compose down -v` 会删除数据卷，等于删库**，日常任何操作都不要加 `-v`。不加 `-v` 也不等于数据永远安全：`docker volume rm`、`docker volume prune`、`docker system prune --volumes`、换部署目录名或 `-p` 项目名，都会让数据卷被删或“换成新的空卷”。数据的保障是第八节的备份。
+- `--no-deps` 只重建 / 启动 app；不加时 compose 会检查依赖服务，配置（含 `.env` 插值结果）有变化的会被重建，数据卷保留但数据库会重启。
+- 停止时程序分阶段优雅退出，最坏约 37.7 秒；Docker 已设 `stop_grace_period: 45s`，原生守护工具按 6.2 设 45 秒。退出超时或被强杀时，队列里未写完的访问 / 操作日志会丢失；退出过程中再发一次 SIGTERM / SIGINT 会立即终止进程。
+
+---
+
+## 八、备份与恢复
+
+本节是数据库备份与恢复的**唯一说明**。脚本是 `scripts/db/backup.sh`、`scripts/db/restore.sh`（共用 `scripts/db/common.sh`），根目录 `Makefile` 的 `db-backup` / `db-restore` 是快捷入口，命令都在项目根目录执行。
+
+### 8.1 范围
+
+备份 MySQL 里本项目的库（逻辑备份：mysqldump → gzip）；恢复只往**不存在或为空**的库里导入，脚本从不删除任何库。不在范围内：Redis（只存会话和验证码，丢了用户重新登录即可）、日志、配置与秘密文件（`.env.local`、`.env`、证书，另行安全保管）{{ if .Has.milvus }}、Milvus 数据（见 6.5）{{ end }}。这是逻辑备份，适合本项目这种体量；数据量很大或需要按时间点恢复时请用物理备份 + binlog，不在本脚本范围内。
+
+### 8.2 运行脚本的机器与连接参数
+
+**只支持本机已安装的 MySQL 8.x 客户端**（`mysql`、`mysqldump`；MariaDB 客户端会被拒绝），脚本不支持 `docker exec`，总是用 TCP 连接你给的主机和端口。Ubuntu 装客户端：`sudo apt install -y mysql-client`；macOS Homebrew 的 `mysql@8.4` 自带。
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `MYSQL_OPS_HOST` / `MYSQL_OPS_PORT` | `127.0.0.1` / `3306` | 总是走 TCP（见下） |
+| `MYSQL_OPS_USER` | 无，必填 | 脚本**不提供**默认账号 |
+| `MYSQL_OPS_PASSWORD` | 无，必须显式设置 | 无密码账号写 `MYSQL_OPS_PASSWORD=`（显式为空） |
+
+在**执行备份 / 恢复的同一个终端**里先设置变量：用 `read -rs` 从键盘输入密码，避免进 shell 历史；主机、端口不是默认值时同样 `export`：
+
+```bash
+export MYSQL_OPS_USER=<账号>
+read -rs MYSQL_OPS_PASSWORD && export MYSQL_OPS_PASSWORD
+```
+
+然后在这个终端里执行 8.5 的备份或 8.7 的恢复（含核对与演练的全部步骤）。**等这些命令全部结束之后**——无论成功、失败还是被 Ctrl+C 中断——再清掉密码；中途不要提前 `unset`，否则脚本会因密码未设置而拒绝运行。关闭这个终端同样会丢弃变量。
+
+```bash
+unset MYSQL_OPS_PASSWORD
+```
+
+- 脚本一启动、调用任何外部命令之前，就把 `MYSQL_OPS_PASSWORD` 复制到一个**不导出**的 shell 变量并 `unset`（调用方开了 `set -a` 也不会导出），之后的 `sha256sum` / `gzip` / `awk` / `mysql` / `mysqldump` 子进程环境里都没有密码。密码只写进私有临时目录（`700`）里一个权限 `600` 的选项文件，经 `--defaults-file` 交给客户端，退出时（含失败和 Ctrl+C）删除整个临时目录；不出现在命令行参数（`ps` 可见）、输出和备份报告里。管不到的范围：你自己的 shell、以及 `make` 和它启动的 `sh` 都还能看到你 `export` 的变量——用完就 `unset`。
+- 每条 `mysql` / `mysqldump` 命令的参数开头固定是 `--defaults-file=<临时选项文件> --protocol=TCP --host=<MYSQL_OPS_HOST> --port=<MYSQL_OPS_PORT> --user=<MYSQL_OPS_USER>`（`mysql` 另加 `--local-infile=0`，SQL 里的 `LOAD DATA LOCAL INFILE` 读不到运维机上的文件）。
+- **`~/.mylogin.cnf` 会覆盖 `--defaults-file`**：用 `mysql_config_editor` 存过登录信息的机器上，客户端读完 `--defaults-file` 后仍会读它，其中的 host / port / user / password 会盖掉选项文件的同名项，所以不敏感的连接值放在**命令行**上（优先级高于任何选项文件）。另外每次调用都设 `MYSQL_TEST_LOGIN_FILE=<私有临时目录里一个不存在的路径>`，让客户端根本不读用户的 `~/.mylogin.cnf`。这两点只用 MySQL 8.4 客户端做过离线参数解析检查，**待独立验证**，8.0 客户端未验证。
+- `--protocol=TCP`：主机名是 `localhost` 时客户端默认改走 unix socket、忽略端口，可能连到另一个实例。相应地账号要允许 TCP 来源：`skip_name_resolve=ON` 时只建了 `'用户'@'localhost'` 的账号匹配不上 `127.0.0.1`，需要 `'用户'@'127.0.0.1'`。
+
+### 8.3 先核对要连的是哪台实例
+
+备份和恢复都会先查询并打印 `@@hostname`、`@@port`、`@@server_uuid`（都不敏感）。参数只保证用了你给的主机、端口、账号，「那里跑的是不是你以为的那台实例」只有你能判断：`CONFIRM` / `--confirm` 只能核对「参数拼出来的目标」，**证明不了**实际连到的是哪台服务器；脚本只打印、**不会停下来等你确认**。所以执行前先用**同样的主机、端口、账号**单独查一次（`-p` 后不写密码；开头的 `MYSQL_TEST_LOGIN_FILE` 让客户端不读 login 文件；把 `127.0.0.1` / `3306` 换成你的 `MYSQL_OPS_HOST` / `MYSQL_OPS_PORT`）：
+
+```bash
+MYSQL_TEST_LOGIN_FILE=/nonexistent/mylogin.cnf mysql --protocol=TCP -h 127.0.0.1 -P 3306 -u <账号> -p -e "SELECT @@hostname, @@port, @@server_uuid"
+```
+
+记下 `server_uuid`。执行备份或恢复时核对脚本打印的 `server_uuid` 与此一致；不一致立即 Ctrl+C（已开始导入的按 8.7「部分写入」处理）。
+
+### 8.4 Docker 部署：连到 compose 里的 MySQL
+
+compose 的 mysql 服务**没有映射端口**，这是有意的默认设置：不要为了备份去改它，更不要把 3306 发布到公网。因此 Docker 部署下 `MYSQL_OPS_HOST` 的默认值 `127.0.0.1:3306` **不是**这个容器：宿主没有服务监听时连接失败，宿主另装了 MySQL 时会连到那一台、备份错实例。
+
+**原生 Linux 宿主（Docker Engine）**可以直接访问 bridge 网络里的容器 IP。依次：确认 mysql 在运行；查容器 IP（取非空的那项，容器重建后可能变化，每次重新查）；在容器内查身份（输入 `.env` 的 `MYSQL_PASSWORD`）；从宿主经 TCP 用同一账号再查一次（`<容器IP>` 换成第 2 步的值）；核对通过后把 IP 交给脚本：
+
+```bash
+docker compose ps mysql
+docker inspect {{ .ProjectName }}-mysql | grep '"IPAddress"'
+docker exec -it {{ .ProjectName }}-mysql mysql -u{{ .DBName }} -p -e "SELECT @@hostname, @@server_uuid"
+MYSQL_TEST_LOGIN_FILE=/nonexistent/mylogin.cnf mysql --protocol=TCP -h <容器IP> -P 3306 -u {{ .DBName }} -p -e "SELECT @@hostname, @@port, @@server_uuid, USER()"
+export MYSQL_OPS_HOST=<容器IP>
+```
+
+两次的 `server_uuid` 必须一致，才说明 `<容器IP>:3306` 就是本项目的 mysql 容器；不一致就停下。`USER()` 里 `@` 后面是 MySQL 看到的来源地址（通常是网络网关），给备份 / 恢复账号授权时用它作主机部分；`CONFIRM` 里的主机写容器 IP。compose 建的 `{{ .DBName }}` 账号对本库有全部权限，备份够用；恢复到新库需另建只授目标库权限的账号（8.7），可用 `docker exec -it {{ .ProjectName }}-mysql mysql -uroot -p` 进入后执行授权 SQL。
+
+**Docker Desktop（macOS / Windows）不能照搬**：容器在 Desktop 的虚拟机里，宿主通常访问不到容器 IP，上面第 4 条会连不上。需要一个能以 TCP 直接到达该 MySQL 的受控环境才能执行脚本，生产部署建议用原生 Linux 宿主。本文不提供、也没有验证过在 Desktop 上临时映射端口的做法；如果你们自行设计，只能绑定回环地址、用完立即撤销，并同样先核对 `server_uuid`。
+
+### 8.5 备份
+
+`make db-backup` 只接受 `DB`，输出到项目根目录下的 `backups/`；要放到别的目录时直接调脚本 `--output-dir`（连接参数同样走环境变量）：
+
+```bash
+make db-backup DB={{ .DBName }}
+scripts/db/backup.sh --database {{ .DBName }} --output-dir <备份目录>
+```
+
+1. `mysqldump --single-transaction --quick --routines --triggers --events --hex-blob --no-tablespaces --set-gtid-purged=OFF` 管道给 `gzip` 写临时文件（`pipefail`：任一失败都算失败）。
+2. 校验 `gzip -t` 通过，且最后一行是 mysqldump 的 `-- Dump completed`（导出被中途杀掉时没有）。
+3. 写 `.meta`（来源库名、源实例 hostname / port / server_uuid、库级对象标记数、时间）和覆盖数据文件与 `.meta` 的 `.sha256`，全部校验通过后才用硬链接落成最终文件名（目标已存在时失败、不覆盖）。**任何一步失败或 Ctrl+C 都不会留下最终文件**，只有三个文件全部落好才算完成。文件权限 `600`；输出目录**只在脚本新建时**是 `700`，已存在的目录保持原权限，请自己确认它不对其他用户开放。
+4. 导出里**不带** `CREATE DATABASE` / `USE`（没用 `--databases`），恢复时必须显式指定目标库，才能恢复到独立的库。
+
+报告里记下文件名、sha256、源实例 `server_uuid`，以及「库级对象」是「无」还是「有」（决定能恢复到哪里，见 8.7）。备份结束（成功或失败）且本轮不再需要连库时，按 8.2 执行 `unset MYSQL_OPS_PASSWORD`。一致性与限制：
+
+- `--single-transaction` 对 **InnoDB** 表给出一致性快照，不加表锁；本项目的 12 张表都是 InnoDB，你自己加的表也请用 InnoDB。**MyISAM 等非事务表不在快照保护内**。
+- **备份期间不要做 DDL**（`ALTER` / `DROP` / `RENAME` / `TRUNCATE TABLE`）：快照看不到 DDL 的隔离，可能导出不一致或报错（脚本按失败处理、不留文件）；mysqldump 在导出中的表上持有元数据锁，对它的 DDL 会一直等待并连带阻塞之后的访问。不要让备份和带 DDL 的更新同时进行。
+- 整个导出是一个长事务，期间 InnoDB 的 undo 历史无法清理，在业务低峰执行。
+
+备份账号的最小权限（只授备份的那个库，不要用 root；主机部分按实际来源地址写）。`--single-transaction` 下不需要 `LOCK TABLES`，`--no-tablespaces` 下不需要 `PROCESS`，不导 GTID 不需要 `RELOAD`；导出别的账号定义的例程时，MySQL 8.0.20 起还需要 `SHOW_ROUTINE` 或全局 `SELECT`（本项目默认没有例程）：
+
+```sql
+GRANT SELECT, SHOW VIEW, TRIGGER, EVENT ON `{{ .DBName }}`.* TO '备份账号'@'127.0.0.1';
+```
+
+### 8.6 备份文件怎么保管
+
+- 一份备份是**三个文件**：`<库>-<时间>.sql.gz`、`.sql.gz.meta`、`.sql.gz.sha256`，必须一起保存、一起拷贝；恢复时缺 `.meta` 直接拒绝，缺 `.sha256` 默认拒绝。
+- 备份含全部业务数据（包括密码散列、手机号），按敏感数据保管：保持 `600`、目录不对其他用户开放；`backups/` 已在 `.gitignore` 里，不要提交。
+- 拷一份到**主机外**的可信存储（只有运维能写），否则主机损坏时备份一起丢失。`.sha256` 只用来发现损坏，不是来源认证。没有恢复演练过（8.8）的备份不能算可用。
+
+### 8.7 恢复
+
+目标库已存在且为空时用第一条；目标库不存在、要让脚本创建时加 `CREATE=1`（只有恰好写 `CREATE=1` 才会传 `--create`，`CREATE=0`、`CREATE=yes` 都不算）；第三条是等价的脚本调用。`<主机>:<端口>` 就是 `MYSQL_OPS_HOST:MYSQL_OPS_PORT` 的值，恢复前把它们指向**目标实例**（不一定是备份时的源实例）。`--skip-checksum` 只能直接调脚本时使用，Make 入口不传它：
+
+```bash
+make db-restore BACKUP_FILE=backups/<文件>.sql.gz DB=<目标库> CONFIRM=<目标库>@<主机>:<端口>
+make db-restore BACKUP_FILE=backups/<文件>.sql.gz DB=<目标库> CONFIRM=<目标库>@<主机>:<端口> CREATE=1
+scripts/db/restore.sh --file backups/<文件>.sql.gz --database <目标库> --confirm <目标库>@<主机>:<端口> --create
+```
+
+恢复命令结束（成功、失败或中断）、本轮不再需要连库后，再按 8.2 执行 `unset MYSQL_OPS_PASSWORD`。
+
+**信任边界（先读）**：恢复就是把备份里的 SQL 原样交给 `mysql` 执行，脚本**不能**、也不尝试把不可信的 SQL 变安全。所以**只恢复本项目 `backup.sh` 生成、并且一直存放在可信位置的备份**，不要恢复来源不明的 `.sql.gz`；`.sha256` **只用来发现损坏**，不是来源认证（能改备份的人同样能改它）；恢复账号只授**目标库**权限，**不要用 root 或全局权限账号恢复**。
+
+保护规则：
+
+- **目标库非空一律拒绝**（有任何表、视图、存储过程或事件），没有「强制覆盖」开关；脚本从不执行 `DROP DATABASE`。要恢复生产数据，先恢复到**新库**，核对后再切换（8.9）。
+- `CONFIRM` 必须逐字等于由参数拼出的 `库@主机:端口`（例如 `{{ .DBName }}_drill@127.0.0.1:3306`），防止填错目标；它只核对参数，连上后脚本打印服务端 `hostname` / `port` / `server_uuid`，**请核对确实是你要恢复的实例**，与备份源实例相同时还会额外提示。
+- 连库之前先校验文件：必须有 `.meta`；`.sha256` 与数据文件、`.meta` 都匹配（缺 `.sha256` 时拒绝，确认来自可信存储后才可直接调脚本加 `--skip-checksum`，会打印警告）；`gzip -t` 通过；有 mysqldump 结尾标记；库级对象标记数与 `.meta` 一致。
+- 导入用 `mysql --binary-mode`，非交互输入下**禁用客户端命令**（`\!` / `system`、`source`、`tee` 等），只挡住「借 mysql 客户端在运维机上执行命令」，挡不住 SQL 本身。同时带 `--one-database`，但它**不是隔离手段**：只按 `USE` 过滤，写成 `其它库.表` 的语句、`GRANT`、`CREATE DATABASE` 照样执行；真正限制影响面的是恢复账号的权限。
+- **部分写入**：导入失败或导入中按 Ctrl+C 时退出码非 0，并提示目标库可能已写入部分数据；脚本**不会**替你清理。这个库不要使用：人工检查后决定如何处理，或换一个新的空库重新恢复。Ctrl+C 会发给整个前台进程组、立即中断；只对脚本进程 `kill <PID>` 时 bash 要等当前导入管道跑完才处理信号（仍以 143 退出并提示部分写入），要立即停就对整个进程组发信号（`kill -- -<PGID>`）。
+
+**库级对象（视图、存储过程 / 函数、触发器、事件）**：mysqldump 导出这些对象时定义里可能写死了**源库名**（视图里的 `` `源库`.`表` ``、例程两侧的 `` ALTER DATABASE `源库` ``），恢复到别的库名会读写或修改源库。备份时统计这些对象的标记行写进 `.meta`，报告显示「库级对象：有 / 无」；你的 MySQL 版本实际导出哪种写法没有在真库上确认过，加了例程以后先备份一次看报告。备份**含**库级对象时，`restore.sh` **只允许恢复到与源库同名的库**，源库还在时演练要用**另一个 MySQL 实例**上的同名库；**不含**时（本项目默认）才可恢复到任意名字的空库。事件恢复后会在目标实例上按原定义调度执行，跨库外键也会原样恢复，需自行评估。这里的统计只认 mysqldump 的输出格式，是**格式检查**，不是安全过滤。
+
+恢复账号的最小权限（只授目标库）：
+
+```sql
+GRANT SELECT, INSERT, CREATE, DROP, ALTER, INDEX, REFERENCES, LOCK TABLES ON `{{ .DBName }}_drill`.* TO '恢复账号'@'127.0.0.1';
+```
+
+导出里有 `DROP TABLE IF EXISTS`、`LOCK TABLES ... WRITE` 和外键，所以需要 `DROP`、`LOCK TABLES`、`REFERENCES`（只作用于这个库里的表）。库级 `CREATE` 即可让账号在 `CREATE=1` 时创建**这个名字**的库，不要授全局 `CREATE`；也可由 DBA 先建好空库、不用 `CREATE=1`。「是否为空」只能看到本账号有权限看到的对象，所以恢复账号必须对目标库有上述权限。备份含库级对象时还需要 `CREATE VIEW`、`SHOW VIEW`、`CREATE ROUTINE`、`ALTER ROUTINE`、`TRIGGER`、`EVENT`；`DEFINER` 不是恢复账号自己时还要 `SET_USER_ID`（8.0.22～8.1）/ `SET_ANY_DEFINER`（8.2 起，定义者不存在时另需 `ALLOW_NONEXISTENT_DEFINER`）/ 更早版本的 `SUPER`，定义者带 `SYSTEM_USER` 时也要 `SYSTEM_USER`。这些高权限只在确有这类对象时由 DBA 显式、临时授予，**不要图省事直接用 root 恢复**。
+
+### 8.8 恢复演练（恢复到新的空库，不删任何库）
+
+演练证明「这份备份能恢复出能登录的系统」。默认恢复到一个**新的空库**，不需要删除任何库，也不碰正在使用的库和源数据。
+
+**先按备份报告的「库级对象」选定恢复目标**，后面所有步骤的主机、端口、库名都用这个目标（下文记作 `<目标主机>`、`<目标端口>`、`<目标库>`）：
+
+| 备份报告 | 可选的恢复目标 |
+|---|---|
+| 「库级对象：无」（只有表和数据，本项目默认） | 同一实例或另一实例上的**异名新空库**，例如 `{{ .DBName }}_drill` |
+| 「库级对象：有」 | 只能是**另一个独立 MySQL 实例**上与源库**同名**的空库 `{{ .DBName }}`；源库所在实例上不能演练 |
+
+1. 按 8.5 备份，记下文件名、sha256、源实例 `server_uuid` 和「库级对象：有 / 无」；按上表选定目标。
+2. 记录源库基线（在低峰或停写时做，否则数字会对不上；主机端口填**源实例**）：`MYSQL_TEST_LOGIN_FILE=/nonexistent/mylogin.cnf mysql --protocol=TCP -h <源主机> -P <源端口> -u <账号> -p {{ .DBName }} -e "SELECT COUNT(*) FROM admin_users; SELECT COUNT(*) FROM admin_permissions;"`。
+3. 按 8.3 用 `<目标主机>`、`<目标端口>` 核对目标实例身份并记下它的 `server_uuid`；同名跨实例时它必须**不同于**源实例。
+4. 由 DBA 在目标实例上建一个只授 `<目标库>` 权限的恢复账号（8.7），把 `MYSQL_OPS_HOST` / `MYSQL_OPS_PORT` 指向目标实例，`MYSQL_OPS_USER` / `MYSQL_OPS_PASSWORD` 换成恢复账号，不要用 root。
+5. 恢复：`make db-restore BACKUP_FILE=backups/<文件>.sql.gz DB=<目标库> CONFIRM=<目标库>@<目标主机>:<目标端口> CREATE=1`（目标库已由 DBA 建好空库时去掉 `CREATE=1`）。核对脚本打印的「目标实例」`server_uuid` 与第 3 步一致。
+6. 核对数据：把第 2 步命令的主机、端口、库名换成 `<目标主机>`、`<目标端口>`、`<目标库>` 再查一次，数字应与基线一致。
+7. **登录验证**：起一个测试环境后端（例如按「五、本机开发」的方式，配独立 Redis），`DB_DSN` 的主机、端口、库名都指向目标（账号需对 `<目标库>` 有读写权限），浏览器登录并打开用户 / 角色 / 权限 / 部门 / 日志页面，确认数据在、控制台无报错。不要把正在服务的 app 指过去。
+8. 全部结束后按 8.2 执行 `unset MYSQL_OPS_PASSWORD`；演练库、演练账号和备份副本按需由人工清理，源库不动。
+
+> 演练默认不删除任何库。若要在同一个**独立演练实例**上重复演练同名库，需要先由人工删测试库：只在确认主机、端口、`server_uuid` 都是演练实例、库名是演练库后才做；脚本从不执行 `DROP DATABASE`，也没有覆盖开关。不要在生产实例上做这一步。
+
+### 8.9 正式恢复（生产数据损坏或误删时）
+
+原则：先恢复到**新库**、核对后再切换，旧库与源数据保留取证，不在原库上覆盖、不删除。恢复目标的选择与 8.8 的表相同：「库级对象：无」时可用同一实例上的**异名新空库**；「有」时只能用**另一个独立 MySQL 实例**上与源库**同名**的空库。
+
+1. **停写**：停止 app（第七节）。
+2. **选备份**：最近一份**可信**备份（本项目 `backup.sh` 生成、一直在可信位置），三个文件齐全；备份之后的写入会丢失，事先评估并告知相关人。
+3. **确认目标身份**：按 8.3 / 8.4 核对目标实例的 `server_uuid`；同名跨实例时它必须不同于原实例。
+4. **准备权限并恢复**：在目标实例上准备只授目标库权限的恢复账号，按 8.7 恢复到目标库（异名示例 `{{ .DBName }}_restore_<日期>`，库名只能含字母、数字、下划线；同名跨实例时就是 `{{ .DBName }}`）。
+5. **核对**：表数量、关键表行数、抽查业务数据。
+6. **切换前备份与授权**：用具备 8.5 备份权限的账号对恢复出的目标库做一次备份；在目标实例上给应用账号授予目标库的读写权限（应用账号在新实例上可能还不存在，需由 DBA 新建），并确认应用所在主机 / 容器网络能连到目标实例。
+7. **切换并启动**（app 一直保持停止，配置全部改好之后才启动；二选一）：
+   - **只恢复数据**（程序版本不变）：把运行配置里 `DB_DSN` 的**主机、端口、库名**都改成实际目标（异名新库只变库名；同名跨实例要改主机和端口），`DB_NAME` 不变，然后启动：原生改 `.env.local`（重新 `chown` / `chmod`）后用守护工具启动；Docker 改 `.env` 后 `docker compose up -d --no-deps app`。
+   - **数据恢复 + 版本回退**（9.5 里迁移失败、或新旧程序与表结构不兼容时）：先按 9.5「换回旧程序」回退程序、前端与兼容配置，**不启动**；再在回退后的运行配置里把 `DB_DSN` 改成目标，保留目标的主机、端口、库名和有效凭据；最后才启动。不要用旧版本的 `.env` / `.env.local` 回滚副本整体覆盖，那会把 `DB_DSN` 改回原来的库。
+8. **验证**：浏览器登录、打开关键页面、看日志。全部结束后按 8.2 执行 `unset MYSQL_OPS_PASSWORD`。原库确认不再需要取证后由人工按你们的流程处理，脚本不会删除它。
+
+---
+
+## 九、更新与失败处理
+
+### 9.1 先弄清楚三件事
+
+- **没有自动迁移，也没有一键回滚**。本项目不开 GORM AutoMigrate、没有迁移工具：表结构 / 数据变更靠你写的增量 SQL（放 `scripts/sql/` 留档）。**代码回退与数据库回退是两件事**：换回旧程序很容易；换回旧数据只能从备份恢复到新库，会丢掉备份之后的写入。
+- **更新不是重新导入 `init.sql`**。`init.sql` 只用于全新的空库 / 首次空卷（4.1）。
+- **先评估数据与应用的兼容性**：有没有表结构或数据变更？新程序能否在旧表结构上运行？旧程序能否在新表结构上运行？答案决定迁移与切换的顺序，以及失败后能不能只换回旧程序。
+
+### 9.2 每次更新都走的门禁
+
+1. **固定版本并留回滚副本**：明确要发布的 Git tag 或提交号；记下线上当前的源码提交，并按 9.3 留好旧版本的程序 / 镜像、前端、`config/` 和运行配置（`.env` / `.env.local`，含秘密）。不要「拉最新代码直接上」。
+2. **备份**：按 8.5 备份并确认三个文件齐全、拷到主机外。没有可用备份不做带迁移的更新；不要在备份进行时执行迁移。
+3. **先构建**：停机前完成新版本构建，构建失败就停在这里，线上不受影响。
+4. **迁移演练**：有增量 SQL 时先在由备份恢复出的测试库（8.8）上执行并验证。
+5. **停止 → 迁移 → 替换 → 启动**：迁移只做旧程序也能接受的变更（加表、加可空字段、加索引）时，可先迁移再替换程序；会删除 / 重命名 / 改类型或新旧程序不能共存时，先停 app、再迁移、再启动新程序。
+6. **验证**：`/health` 正常、浏览器登录进首页、打开受影响的页面、日志没有新错误。
+7. **失败处理**：按 9.5，不要在半迁移的库上反复试新旧程序。
+
+### 9.3 留回滚副本并更新
+
+回滚副本含运行配置里的秘密，统一放在**只有你可读**的目录（下例 `~/{{ .ProjectName }}-rollback/<旧版本>`，权限 `700`），不要放进部署目录、Git 仓库、构建上下文或 web 可访问的位置；不再需要时按你们的流程销毁。更新只追加新版本需要的配置项，**不覆盖已有的密码和密钥**。
+
+**Docker Compose**（在部署目录 `/data/app` 执行）。部署目录里改过的受版本管理文件（例如 compose 里加的 `TRUSTED_PROXIES`）先提交到你们自己的仓库，否则切版本会冲突、回退时也找不回。依次：记下当前源码提交；从**当前正在运行的 app 容器**取镜像 ID（`docker inspect` 输出两行 `"Image"`，取 `sha256:` 开头的那行，另一行是镜像名）并打回滚标签——不要假定 `{{ .ProjectName }}-app:latest` 就是线上镜像，之前可能 build 过尚未上线的镜像；备份 `.env`（`cp -p` 保留 `600`）；切到新版本只构建 app（应用配置 `config/` 打在镜像里，随镜像一起回退）；需要先停再迁移时停 app 并按 9.4 迁移（否则跳过 `stop`）；最后只替换 app：
+
+```bash
+cd /data/app && git rev-parse HEAD
+docker inspect {{ .ProjectName }}-app | grep '"Image"'
+docker tag <上一条输出里 sha256: 开头的镜像 ID> {{ .ProjectName }}-app:prev
+mkdir -p -m 700 ~/{{ .ProjectName }}-rollback/<旧版本>
+cp -p /data/app/.env ~/{{ .ProjectName }}-rollback/<旧版本>/env
+cd /data/app && git fetch --tags && git checkout <要发布的 tag 或提交号>
+docker compose build app
+docker compose stop app
+docker compose up -d --no-deps app
+docker compose ps
+```
+
+日常更新不要用不带服务名的 `docker compose up -d --build`，它会检查并可能重建所有服务。数据在 `mysql-data` 卷里，替换 app 不会还原数据库，但数据安全靠备份，不靠「没加 `-v`」。
+
+**原生部署**：在**独立的构建目录**（例如 `~/{{ .ProjectName }}-build`，不是运行中的 `/data/app`）里 `git checkout` 新版本并按 6.2 构建，构建失败不影响线上。然后留回滚副本（程序、`config/`、前端 `dist` 与 `.env.local`）；用守护工具**先停止** app（最多等 45 秒退出），再按需迁移（9.4），再用构建目录的新产物替换程序与前端——停止后再替换，不写运行中的文件：
+
+```bash
+mkdir -p -m 700 ~/{{ .ProjectName }}-rollback/<旧版本>
+cp -a /data/app/backend/build/{{ .ProjectName }} /data/app/backend/config /data/app/frontend/dist ~/{{ .ProjectName }}-rollback/<旧版本>/
+cp /data/app/backend/.env.local ~/{{ .ProjectName }}-rollback/<旧版本>/env.local
+cp ~/{{ .ProjectName }}-build/backend/build/{{ .ProjectName }} /data/app/backend/build/{{ .ProjectName }}
+rm -rf /data/app/frontend/dist
+cp -a ~/{{ .ProjectName }}-build/frontend/dist /data/app/frontend/dist
+```
+
+`config/` 不要整目录覆盖：与新版本对比后合并新增或变更的配置项。`.env.local` 只按新版本说明追加新增变量，改完按 6.2 重新 `chown` / `chmod`。然后用守护工具启动，按 9.2 第 6 步验证。
+
+### 9.4 执行增量 SQL
+
+增量 SQL 是为这次变更专门写的、已在测试库上演练过的脚本，**不是 `init.sql`**。MySQL 的 DDL 会隐式提交，脚本执行到一半失败时库处于部分迁移状态（按 9.5 处理）；输出里出现 `ERROR` 即视为迁移失败。原生部署用第一条（`-p` 后不写密码，账号需该库 DDL 权限）；Docker 先把文件拷进容器、用交互式客户端执行、再删掉副本：
+
+```bash
+mysql --protocol=TCP -h 127.0.0.1 -P 3306 -u <账号> -p {{ .DBName }} < scripts/sql/<增量文件>.sql
+docker cp scripts/sql/<增量文件>.sql {{ .ProjectName }}-mysql:/tmp/migration.sql
+docker exec -it {{ .ProjectName }}-mysql mysql -u{{ .DBName }} -p {{ .DBName }} -e 'source /tmp/migration.sql'
+docker exec {{ .ProjectName }}-mysql rm -f /tmp/migration.sql
+```
+
+### 9.5 失败了怎么办
+
+| 失败发生在 | 当时的状态 | 处理 |
+|------------|------------|------|
+| 构建阶段 | 线上没动 | 修好再从 9.2 第 3 步来 |
+| 替换程序后、尚未迁移 | 数据库没变 | 换回旧程序（见下），看第七节日志查原因 |
+| 迁移执行到一半失败 | 库可能处于部分迁移状态 | 保持 app 停止，不要让新旧程序跑在半迁移的库上。要么修正增量 SQL 后把迁移做完（先在测试库验证）再启动新程序；要么做**联合回退**：按 8.9 第 1–6 步把迁移前的备份恢复到新库并核对 → 按下面「换回旧程序」回退程序和兼容配置（不启动）→ 按 8.9 第 7 步「数据恢复 + 版本回退」改 `DB_DSN` → 最后启动 |
+| 迁移完成后发现新程序有问题 | 表结构已是新版本 | 先停止 app。确认旧程序能在新表结构上运行时，只换回旧程序（数据库不动）；否则修复后重新发布，或按上一行做联合回退（备份之后的写入会丢失） |
+
+换回旧程序（**不会**回滚数据库，也不会自动还原数据）。先确认旧程序和旧配置能在**当前**表结构上运行（9.1）；不能时不要只回退代码，改走上表的联合回退。代码、前端、配置要配套回退；`.env` / `.env.local` 只按项改回这次更新改过的配置，**不整体覆盖**，`DB_DSN` 保持当前要用的库（联合回退时是 8.9 的恢复目标）和仍有效的凭据：
+
+- **Docker**：先停止 app、切回旧源码（旧的 `docker-compose.yml` 等）、把回滚标签打回 `latest`；对照回滚副本 `~/{{ .ProjectName }}-rollback/<旧版本>/env` 用编辑器核对 `.env`（核对其中的密码仍与数据库里的实际账号一致）；最后才只启动 app：
+
+```bash
+docker compose stop app
+cd /data/app && git checkout <旧版本的提交>
+docker tag {{ .ProjectName }}-app:prev {{ .ProjectName }}-app:latest
+# 用编辑器核对 /data/app/.env：DB_DSN 指向当前要用的库，只改回本次更新改过的项
+docker compose up -d --no-deps app
+```
+
+- **原生**：用守护工具**先停止** app，从回滚副本恢复程序、`config/`、前端；`.env.local` 对照 `~/{{ .ProjectName }}-rollback/<旧版本>/env.local` 只按项改回（同样保留当前 `DB_DSN`），改完按 6.2 重新 `chown` / `chmod`；最后用守护工具启动并验证。停止后再复制，运行中覆盖程序文件会报 `Text file busy`：
+
+```bash
+cp ~/{{ .ProjectName }}-rollback/<旧版本>/{{ .ProjectName }} /data/app/backend/build/{{ .ProjectName }}
+rm -rf /data/app/backend/config /data/app/frontend/dist
+cp -a ~/{{ .ProjectName }}-rollback/<旧版本>/config /data/app/backend/config
+cp -a ~/{{ .ProjectName }}-rollback/<旧版本>/dist /data/app/frontend/dist
+```
+
+---
+
+## 十、常见问题
+
+| 现象 | 排查 |
+|------|------|
+| 启动报 `JWT_SECRET` 相关错误 | 启动保护：密钥未配置、过短或弱值。`openssl rand -hex 32` 生成后填入，不是要关闭认证 |
+| 启动即退出，日志是「环境变量文件 .env.local 不存在 / 打不开」 | `.env.local` 缺失或运行用户读不到；原生部署按 6.2 重新 `chown "$USER":<运行组>` 和 `chmod 640` |
+| 守护进程反复重启（如 supervisor `FATAL` / `BACKOFF`） | 看它写到 `backend/logs/` 的输出；常见原因：日志目录不可写、工作目录不是 `backend/`、程序架构不对（`exec format error`）、`JWT_SECRET` 未配置 |
+| Docker app 启动即退 | `docker compose logs app`；常见原因：`.env` 缺变量、DB / Redis 连不上、`docker-data` 没交给 uid 1000 |
+| Docker 部署后数据库像被清空、回到初始管理员 | 部署目录名或 compose 项目名变了，建了新的空数据卷（6.1），或执行过 `down -v` / `volume prune`。用 `docker volume ls` 找旧卷，确认后再决定如何恢复，不要在新卷上继续写数据 |
+| 页面能打开但登录失败 | 用的是本项目生成时打印的密码；库里是本项目的 `init.sql`（不是另一次生成的旧卷 / 旧库）；本机开发时 Vite 代理指向实际后端端口；Redis 可连接；看响应 JSON 的业务 `code`。忘记密码按 4.3 |
+| 前端白屏 / 接口 404 / 刷新子路由 404 | `frontend/dist` 是否存在且与 `backend/` 同级、工作目录是否为 `backend/`；nginx 是否全量 `location /` 反代 |
+| nginx 502 / 413 | 502：Go 没起来或端口不一致；413：`client_max_body_size` 太小 |
+| 加了 nginx 后频繁被限流、登录日志 IP 全一样 | 没设置 `TRUSTED_PROXIES`（3.4） |
+| 提示「请求过于频繁」（HTTP 429） | 在进程输出里找「限流器 admin 已拒绝」看来源 IP；是代理地址同上一条；确是多人共用出口 IP 时调大 `ADMIN_RATE_LIMIT_*`（Docker 要在 app `environment` 里加） |
+| Redis 卡住时请求要等几秒才报「认证服务暂时不可用」 | 预期：会话操作约 2 秒期限到达后拒绝（刷新两段合计约 4 秒），见第十一节「行为约定」 |
+| 配置值解析报错 | 值**加了引号**或含 `}` / 换行（3.3） |
+| 端口被占用 | 先查明是谁在用，不要停掉不属于本项目的进程；改 `SERVER_PORT` 并同步 Vite 代理 |
+| 修改了 `init.sql`，数据库没变化 | `init.sql` 只初始化空库（4.1）；已有库写增量 SQL（第九节） |
+| 备份「目标文件已存在，拒绝覆盖」/ 恢复「目标库非空」 | 都是保护规则：备份不覆盖已有文件；恢复只进空库，按备份报告选目标（8.7）——「库级对象：无」换一个异名新空库，「有」只能用另一个独立实例上的同名空库 |
+| 备份连接失败或备份了别的实例 | Docker 部署不能用默认 `127.0.0.1:3306`，按 8.4 查容器 IP 并核对 `server_uuid` |
+
+---
+
+## 十一、已知风险与待办
+
+底座是从一个在用的管理后台抽取的，以下问题**已知、尚未修复**或需要你在上生产前评估。代码与单元测试不替代你在真实 MySQL、HTTPS 与浏览器下的验收。
 
 ### 安全
 
-1. **`.env.local` / `.env` 必须留在版本库外**（已在 `.gitignore` 里），并设 `chmod 600`。
-2. **`/admin/user/bind-mobile`、`unbind-mobile` 仍挂在接口权限链上**。这两个接口只能改
-   JWT 里的自己（和 `change-password` 一样），但权限数据里还登记着 209、210 两条接口权限，
-   所以**普通角色不配这两条权限就绑不了自己的手机号**。`change-password` 已移出权限链；
-   这两条要一起移的话，同时删掉 `init.sql` 里 209/210 两行并改 `routes.go` 的中间件链。
-3. **限流是单机内存实现，后台接口没有全站总额度**。多实例部署时每个实例各算各的，总额度会按实例数放大；
-   后台接口只按 IP 限（登录、验证码、错误上报除按 IP 外另有各自的全站额度），要卡全站总量请在入口层（Nginx / WAF）做。
-4. **访问日志、操作日志走容量有限的队列异步写库**（`app/middleware/request_log_queue.go`）：
-   队列满时新日志直接丢弃（计数并每分钟最多告警一条），退出时在独立的「日志排空」阶段最多等
-   `http.request_log.drain_timeout_seconds` 秒写完（不受 HTTP 关闭阶段影响），超时、HTTP 超时后仍在跑的请求、
-   或进程被强杀时，未写完的日志仍会丢失。退出最坏总耗时见下面的「优雅退出」，守护进程停止等待为 45 秒。容量 / worker 数见 `config/autoload/http/http.yaml` 的 `http.request_log`。
-5. **应用内不做来源 IP 白名单**：需要按 IP 限制后台访问时，在 Nginx（`allow` / `deny`）或防火墙上配置，见 `docs/部署文档.md` 7.5。
+1. **`.env.local` / `.env` 必须留在版本库外**（已在 `.gitignore`），权限 `600`（原生部署 `640`、属组为运行组）。
+2. **`/admin/user/bind-mobile`、`unbind-mobile` 仍挂在接口权限链上**：普通角色不配 209、210 两条接口权限就绑不了自己的手机号。要移出时同时删掉 `init.sql` 里这两行并改 `routes.go` 的中间件链。
+3. **限流是单机内存实现，后台接口没有全站总额度**：多实例时总额度按实例数放大；要卡全站总量请在入口层（Nginx / WAF）做。多人共用一个出口 IP 时共享每 IP 的额度。
+4. **访问 / 操作日志走容量有限的队列异步写库**：队列满时新日志直接丢弃（计数并每分钟最多告警一条），退出排空超时、HTTP 超时后仍在跑的请求、进程被强杀时，未写完的日志会丢失。
+5. **应用内不做来源 IP 白名单**：见 6.3「按 IP 限制后台访问」。
+6. **Docker 编排默认值只适合起步**：app 端口绑定所有网卡；MySQL / Redis 没有对宿主映射端口，Redis 没有密码，只靠容器网络隔离；能执行 `docker` 命令的人可以看到容器环境变量里的密码。{{ if .Has.consul }}compose 内置的 Consul 是 dev 模式、没有 ACL。{{ end }}
 
-### 优雅退出（`app/helper/lifecycle`，由 `app/bootstrap.go` 的 `gracefulShutdown` 编排）
+### 优雅退出
 
-收到 SIGTERM / SIGINT 后分四个阶段，各自计时，前一阶段慢不占用后一阶段的预算：
+收到 SIGTERM / SIGINT 后分阶段退出，各阶段单独计时：{{ if .Has.consul }}Consul 注销（2 秒，失败只记录）→ {{ end }}入口关闭（HTTP{{ if .Has.grpc }} / gRPC{{ end }}{{ if .Has.tcp }} / TCP{{ end }} 同时停止接新连接，`HTTP_SHUTDOWN_TIMEOUT_SECONDS` 1~10 秒 + 强制关闭 1 秒）→ 日志排空（`REQUEST_LOG_DRAIN_TIMEOUT_SECONDS` 1~8 秒 + 0.5 秒）→ 资源关闭（Cron 最先停、日志最后关，每步单独限时，卡住的一步只记录名字、后面照常执行）。全选组件、预算取最大值时最坏约 37.7 秒（默认约 29.7 秒）；部署的停止等待（Docker `stop_grace_period`、原生守护工具）统一为 45 秒（`lifecycle.DeployStopWait`），启动时用代码常量校验至少留 5 秒余量——**读不到你实际配置的停止等待**，改小部署配置不会被发现，改动时请对照这里核对。
 
-| 阶段 | 做什么 | 上限 |
-|---|---|---|
-| 0 摘除 | 选了 Consul 时先注销本实例，失败只记录、不阻塞退出；组件 cleanup 不再重复注销 | 2 秒 |
-| 1 入口 | HTTP / gRPC / TCP **同时**停止接新连接，并行等在途请求 / 流 / 连接处理结束；到期强制断开（gRPC 用原始 `Stop`，长流如 `Health/Watch` 不会卡住退出） | `http.shutdown_timeout`（1~10 秒）+ 强制关闭 1 秒 |
-| 2 日志排空 | 写完访问日志 / 操作日志队列，超时取消剩余写入 | `drain_timeout_seconds`（1~8 秒）+ 0.5 秒 |
-| 3 资源关闭 | 按顺序逐步执行：日志清理器 → 应用组件图 → 框架组件（按初始化逆序：Cron 最先停 → Milvus / gRPC / TCP / OTel / Consul 客户端 → Redis → DB → 日志最后关）→ pprof。**每步单独限时**，卡住的一步只记录步骤名，后面的照常执行 | 每步 1~3 秒，见 `internal/taurus/shutdown.go` |
-
-每一步的 ctx 到期后再多等 0.2 秒收尾。所有步骤都卡满时的总上限（`Plan.WorstCase`）：全选组件、两项预算取最大值约 37.7 秒，
-默认配置约 29.7 秒；部署的停止等待（Docker `stop_grace_period`、supervisor `stopwaitsecs`、launchd `ExitTimeOut`）
-统一为 45 秒（`lifecycle.DeployStopWait`），启动时会用真实的退出计划校验至少留 5 秒余量，不满足拒绝启动。
-注意这个校验比对的是**代码里的常量**，读不到运维实际配置的 `stop_grace_period` / `stopwaitsecs` / `ExitTimeOut`：
-部署文件被手工改小不会被发现，改部署文件时请对照这里的最坏耗时自行核对（反过来改常量时也要同步改部署文件）。
-启动失败（端口被占、启动自检不过）也走同一套清理（Consul 注销、关闭已启动的入口和已初始化的组件），
-日志写「启动失败，清理已完成，以非 0 码退出」，再以非 0 码退出。
-退出过程中再发一次 SIGTERM / SIGINT 会立即终止进程。
-
-启动日志里有一行 `Shutdown capabilities: ...`，说明当前编译进来的组件版本在退出时走哪条路径
-（如 `consul=context-deregister` / `consul=legacy-wait-only`、`tcp=stop-context` / `tcp=legacy-stop`），
-联调时据此确认新 API 是否生效；它只含组件版本信息，不含配置值。
-
-已知限制：
-
-- Go 无法终止忽略 ctx 的协程。任何一步「超时」都只代表不再等它：它在后台继续运行，进程随后退出，
-  所以仍可能有迟到的 handler / 定时任务 / TCP 回调去访问已经关闭的连接池（日志里会看到对应步骤的超时告警）。
-- 依赖的组件版本决定能做到什么程度（`backend/go.mod` 默认 taurus-pro-consul v0.3.1、taurus-pro-tcp v0.2.0、
-  taurus-pro-opentelemetry v0.2.1；新 API 都靠类型断言探测，降级到旧版本照常编译，回落到下面写的旧版行为）：
-  - taurus-pro-consul 自 v0.3.0 起提供 `DeregisterServiceContext`（启动日志 `consul=context-deregister`），到期时注销请求被真正取消。
-    旧版 v0.2.0 及以前的注销不接收 ctx（`consul=legacy-wait-only`），到期只能放弃等待，那个 HTTP 请求取消不了。
-  - taurus-pro-tcp v0.2.0 提供 `StopContext`（启动日志 `tcp=stop-context`）：先关全部 socket、不调用回调，再限时等
-    `OnMessage` / `OnClose` 返回；回调卡住时到期放弃等待，回调本身不会被终止。
-    旧版 v0.1.0（`tcp=legacy-stop`）的 `Stop` 会先同步调用每个连接的 `OnClose` 再关 socket，
-    回调卡住时对应连接不会断开、后面的连接也排着，`OnClose` 无法被取消。
-    v0.1.0 还有一个启动竞态：进程刚启动、TCP 的 `Start` 还没真正开始时就收到停止信号，`Stop` 会成为空操作，
-    随后 `Start` 照常监听，入口阶段只能等到超时，日志排空期间 TCP 仍可能接入连接，直到资源关闭阶段的兜底才停掉。
-    兜底关闭拿不到 `Start` 的结束信号，且 v0.1.0 的重复 `Stop` 会立刻返回，所以日志只会写 `unconfirmed`（无法确认已关闭），不会写成功。
-    v0.1.0 的默认 handler 在连接数打满时会因空连接 panic，降级到 v0.1.0 时开启 TCP 前请注册自己的 handler。
-    （v0.2.0 中 `Stop` 先于 `Start` 时 `Start` 返回 `ErrServerStopped`、不再监听，默认 handler 对空连接只记日志，
-    见组件 README。）
-  - OpenTelemetry 用 `Shutdown(ctx)` 限时 flush，collector 不可达时到期放弃，未导出的 span 丢失；SDK 内部吞掉的导出错误拿不到。
-- Consul 注销失败后不重试，残留的注册由健康检查的 `deregister_after` 兜底摘除。
-- 信号监听在 `Run` 里才注册：`init`（组件初始化、Consul 注册、启动自检）期间收到 SIGTERM / SIGINT 时，
-  进程按系统默认行为立即终止，不走上面的清理，Consul 注册同样要等 `deregister_after` 摘除。
+- 超时只代表不再等待：Go 无法终止忽略 ctx 的协程，迟到的 handler / 定时任务可能访问已关闭的连接池（日志里有对应步骤的超时告警）。
+- 启动失败（端口被占、自检不过）也走同一套清理，日志写「启动失败，清理已完成，以非 0 码退出」后非 0 退出；退出中再发一次信号立即终止。信号监听在 `Run` 里才注册，`init`（组件初始化{{ if .Has.consul }}、Consul 注册{{ end }}、启动自检）期间收到信号按系统默认行为立即终止，不走清理{{ if .Has.consul }}，残留的 Consul 注册靠健康检查的 `deregister_after` 摘除{{ end }}。
+- 启动日志的 `Shutdown capabilities: ...` 说明当前组件版本的退出路径（只选必选组件时为 `http-only`），联调时据此确认；降级组件版本时的旧行为见对应组件 README。
 
 ### 行为约定（不是缺陷，容易被当成 bug）
 
-- **部门编码创建后不可修改**：`dept_code` 只在创建部门时写入，`UpdateDept` 不改它。
-  编码被 `uk_dept_code` 约束、并可能已被外部系统引用，改掉会让既有引用失效，
-  所以编辑部门时传新编码不会生效。要换编码请新建部门再迁移下属数据。
-
-### 已落实的加固（代码层面，含单元测试）
-
-一期接口、Cookie、单次轮换及并发边界、账号/部门事务、分页兼容和待验收事项见`docs/商用加固一期说明.md`。HTTPS代理须配置`AUTH_TRUSTED_ORIGINS`及`JWT_COOKIE_SECURE=true`；前端测试要求Node22.18+。代码和单元测试不替代独立真库及HTTPS浏览器验收。
-
-下面这些改动已经进代码并有对应单元测试覆盖；**是否满足你的业务验收仍需你自己在
-本机跑一遍真实流程确认**，这里不代表已通过业务验收。
-
-- **密码散列改为 bcrypt，老账号登录时自动升级**（`app/helper/crypto.go`、`app/service/auth_service.go`）。
-  新密码、改密、管理员重置、新建用户一律 bcrypt；库里还是旧 SHA-256 散列的账号仍能登录，
-  登录成功后立即在后台换成 bcrypt（不影响本次登录、不让已有会话失效；与改密并发时以改密为准）。
-  超过 bcrypt 72 字节上限的密码会被明确拒绝，不会被悄悄截断。
-  忘记管理员密码时用 `go run ./bin/hashpw` 计算新散列，见「四、初始管理员账号」。
-- **系统权限只能升、不能降**（`app/service/permission_service.go`）：`is_system=1` 的权限不能通过
-  任何接口改回普通权限，也就无法先降级再删除；`/admin/permission/update` 不再修改 `is_system`。
-  确需降级只能直接改数据库。
-- **限流的按 IP 记录会自动回收**（`app/middleware/ip_rate_limiter.go`）：替换了公共库里
-  只增不减的实现。闲置超过 5 分钟且额度已回满的 IP 记录会被清掉（没回满的不清，避免被限流的
-  IP 靠等待清理重置额度）；每个限流器最多记录 10 万个 IP（本底座共 5 个：登录、发验证码、校验验证码、前端错误上报、后台接口各 1 个），满了之后新 IP 不再单独记录（前 4 个只受全局额度约束，后台接口直接放行），不会撑爆内存。
-- **后台接口按 IP 限流**（`app/middleware/rate_limit.go` 的 `AdminRateLimitMiddleware`）：所有 `/admin/**` 接口（含发验证码、绑定手机号，它们另有自己更严的额度）和
-  `/user/refresh-token` 共用一份额度，默认同一 IP 可连续请求 300 次，之后每秒恢复 10 次；超过时返回 HTTP 429，
-  带 `Retry-After` 头，前端弹出「请求过于频繁，请稍后重试」（相同提示自动合并成一条；接口失败不再被当成前端 JS 异常写进前端错误日志），稍等即恢复。被拒绝时程序日志里每分钟最多一条汇总
-  （「限流器 admin 已拒绝 N 次请求（最近一次来自 某 IP）」），可据此判断是否需要调大额度。限流排在登录校验之前，未登录的刷接口请求也会被挡住。刻意**不设全站总额度**，避免一个人刷接口导致所有人不能用。
-  用 `ADMIN_RATE_LIMIT_BURST`、`ADMIN_RATE_LIMIT_PER_SECOND` 调整，两项都填 `0` 表示关闭；负数、非整数、只有一项为 `0` 或每秒次数超过 `10000` 时程序拒绝启动。
-  多人共用一个出口 IP（同一办公室）时共享这份额度；前面加了 nginx 却没设 `TRUSTED_PROXIES` 时，所有人会被当成同一个 IP。
-- **日志表自动清理**（`app/service/log_cleanup.go`）：访问、操作、前端错误、登录四类日志
-  默认保留 180 天，启动 5～15 分钟后（随机错开，避免多实例同时清理）清理一次，之后每 24 小时一次，分批删除避免锁表。
-  分批删除用 `DELETE … LIMIT`，依赖 MySQL 默认的 `binlog_format=ROW`。
-  用环境变量 `LOG_RETENTION_DAYS` 调整天数，`0` 表示关闭；填负数或非数字时程序拒绝启动。
-- JWT 签名密钥**没配置、过短（< 32 字符）或命中弱值时拒绝启动**（`app/helper/startup_check.go`），
-  `.env.example` 不再预置密钥。自检**不看 `http.jwt.enabled`**：那个开关只关掉请求侧的
-  鉴权中间件，登录签发 / 刷新 / 解析 Token 始终在用 `http.jwt.secret`。
-- 配置不再明文打印；访问日志 / 操作日志对密码、Token、验证码等字段**脱敏**，
-  验证码不再记明文。
-- **数据库日志不再写 SQL 语句原文**（`internal/taurus/daily_log.go`）：GORM 回调给出的是
-  **插值后**的 SQL，参数值（含密码散列、salt、手机号）就在语句里，所以错误 / 慢查询 / info
-  三个分支都只记录「耗时 + 影响行数 + 语句类型（SELECT/UPDATE/…）+ 错误分类
-  （如 `mysql_errno_1062`）」，原始数据库错误文本也不落盘。
-  注意这只覆盖本项目这个 logger —— 你自己新加的日志点仍要自己脱敏。
-- `/admin/option/*` 只返回选人必需的最小字段（不含手机号、邮箱、登录 IP）。
-- **系统角色受保护**：非超级管理员不能给自己或别人加/减超级管理员角色，
-  也不能通过新建或改角色伪造 `super_admin`、禁用系统角色（`app/service/role_guard.go`）。
-- **超管账号受保护：有接口权限 ≠ 能动这个账号**（`app/service/user_guard.go`）。
-  之前任何配了 `user/update`、`user/update-status`、`user/delete` 权限的普通管理员都能
-  **改超管资料、重置超管密码、禁用或删除超管**：`UpdateUser` 当时按「资料 → 密码 → 角色」
-  串了三个独立事务，唯一的超管判定在最后一步，所以 403 返回前密码已经提交，且撤不回来。
-  现在：
-  - 操作人只认 JWT 带上来的 `user_id`，目标身份只认库里的 `admin_user_roles` 关联表 ——
-    入参的 `role_ids` / `is_system` 不作为身份依据（否则等于让调用方自证清白）；
-  - 身份判定排在**任何写入之前**，并与写入在**同一个事务**里完成；拒绝时资料 / 密码 /
-    角色一个都不落库；
-  - 事实必须是**加锁当前读**的结果。「同一个事务里读」不等于「读到的是当前值」：
-    MySQL 默认 REPEATABLE READ，事务里第一次普通 `SELECT` 就钉死一致性快照，
-    并发已提交的「把超管授给目标」看不见。所以统一走**身份锁协议**：
-    先按 `user_id` 升序、去重地 `SELECT ... FOR UPDATE` 锁住操作人与目标的
-    `admin_users` 主键行，再 `FOR UPDATE` 当前读角色关联、`FOR SHARE` 当前读角色行，
-    然后判定，最后才写。锁锚在用户行而不是关联行，所以零角色账号、首次赋角色
-    同样锁得住；固定升序让交叉管理不会锁序反转；锁等待超时 / 死锁一律整笔回滚，
-    不做隐式重试。自助改密走同一个「先锁用户行」的开头，只为统一加锁顺序；
-  - 覆盖的入口：`/admin/user/update`、`update-status`、`delete`、
-    `/admin/role/assign`、新增账号事务内的初始角色校验及写入，以及自助 `change-password`
-    的锁顺序对齐；
-  - 角色关联的整体替换按 `user_id` 条件删一次再插入，不再「先查关联行、按主键逐行删」——
-    后者只删得掉自己快照里的行，快照之后新增的关联行会留下来；
-  - 身份查询出错或查不到一律拒绝（fail closed），不让一次数据库抖动变成一次提权；
-  - 口径故意不对称：判定「操作人有没有超管权力」要求角色启用中，判定「目标是否受保护」
-    不看角色状态 —— 否则把 `super_admin` 角色禁用一下就能改超管密码；
-  - 原来那个无操作人、无目标保护的 `AuthService.UpdateUserPassword`（只收 userID +
-    新密码的覆盖式重置）**已删除**，管理员重置他人密码只剩 `/admin/user/update` 一个入口；
-  - 保留：超管管理任何账号、普通管理员管理普通账号、本人自助改密（仍须旧密码，
-    也不会把超管本人的改密挡住）。
-  回归测试 `app/controller/user_admin_guard_test.go` 用 sqlmock 在**真实调用链**
-  （handler → service → repo → GORM）上按顺序断言：非超管管理超管时只有那几条带
-  `FOR UPDATE` / `FOR SHARE` 的身份读、随后 ROLLBACK，**一条写语句都不出现**，
-  `body.code` 为 403；用 `WithArgs` 钉住每条加锁读的 `user_id`，于是锁序（目标 ID 更小
-  就先锁目标）、「操作自己只锁一次」也成了可证的；用户行缺失、锁等待超时都拒绝；
-  零角色账号的首次赋角色、超管/普通管理员管理普通账号与本人自助改密照常走完整写入并
-  COMMIT。`app/repo/identity_lock_sql_test.go` 另用 MySQL dialector + DryRun 断言生成的
-  SQL 真的带加锁子句、删除真的按 `user_id` 条件走（不用 SQLite —— 它没有这两个子句）。
-  > 边界：这些测试能证明语句顺序、加锁子句、绑定参数和「没有写入」，
-  > **证不了真实 MySQL 的事务原子性与并发交错结果**（可见性、锁等待、死锁回滚）。
-  > 那部分仍需在真库上跑一遍，不要把它当成已验证的并发安全。
-- **编辑用户资料不会再静默撤销角色**。`/admin/user/update` 的 `role_ids` 改成
-  **选择性更新**：没带这个字段（或 `null`）表示本次不改角色，完全不碰
-  `admin_user_roles`；要清空必须显式传 `[]`。之前它是无条件整体替换，
-  于是前端一次「只改昵称」的保存就把该账号的角色全删了。
-  判定依据是切片的 **nil 性**而不是长度 —— `encoding/json` 对「字段缺失」和 `null`
-  都留下 nil 切片，对 `[]` 给出非 nil 的空切片，用 `len(...) == 0` 会把两者混成一种。
-  注意这只影响角色这一段：**目标账号保护、身份锁、`auth_version` 原子变更与
-  本次改不改角色无关，始终执行**，「不传 `role_ids`」不是绕过账号保护的口子。
-  > **选择性更新只有 `role_ids` 一个字段**，这个端点**不是 PATCH**：
-  > `realname`、`nickname`、`email`、`mobile`、`status`、`password` 等仍是
-  > **完整表单语义**（按收到的值覆盖），改一个字段仍要把其它字段的当前值一起回传。
-  > 只想改角色、不动资料，走已有的 `/admin/role/assign`。
-- **角色被禁用后，持有它的账号仍能正常编辑**：
-  - 编辑页的角色列表包含「该账号持有中但已被禁用」的角色（以库里的
-    `admin_user_roles` 为准补查，不依赖前端回传），显示为「已禁用」并保持勾选；
-  - 这类关联**可以原样保留、也可以明确取消**，但**不能新增**已禁用的角色
-    （`app/service/role_guard.go` 的 `CheckRoleStatusAssignable`）。对超管同样生效 ——
-    这是「禁用中的角色不该被新赋出去」的数据正确性约束，不是权限大小问题，
-    要赋它先把角色启用；
-  - 入参角色校验不再按 `status = 1` 过滤（`FindByRoleIDAnyStatusForShare`）：
-    过滤的后果是「保留一个自己已经持有的禁用角色」被当成「角色ID不存在」而整笔失败，
-    于是运维一禁用某个角色，持有它的账号连改昵称都存不下去。状态该怎么判定交给上面
-    那个纯守卫，不在查询里悄悄过滤。
-- **被禁用的角色不再贡献任何接口 / 菜单 / 按钮权限**。之前
-  `repo.FindUserPermissions` 只联 `admin_user_roles → admin_role_permissions →
-  admin_permissions` 并且只过滤权限行自身的 `status`，**没有角色状态条件** ——
-  于是「禁用角色」只是在角色列表里灰了一下：持有它的人该调的接口照样调通、
-  该看见的菜单照样在。现在那条查询联上 `admin_roles` 并同时要求
-  `r.status = 1 AND p.status = 1`：
-  - 关联行**照样保留**（启用后权限自然恢复、编辑页也靠它回显），禁用期间不算权限；
-    明确提交一个不含它的新集合同样允许，关联会被移除；
-  - 过滤只写在这一个地方。非超管「实际被授权了哪些权限」只有这一个出口：接口权限校验
-    （`middleware.PermissionMiddleware` → `helper/permission.Checker`）与菜单、按钮下发
-    （`AdminRoleService.GetUserMenusAndButtons`）都从它取数，所以不会出现
-    「接口已经不通了、菜单却还在」这种半截效果；
-  - 「唯一出口」指的是唯一的**授权来源**，不是「整个请求只查一次库」：那条查询给出的是
-    被直接授权的权限行（有效叶子），`parent_id != 0` 的子菜单要挂上树还需要祖先节点，
-    由 `collectMenuParentRecursive` 按 `parent_id` 再查一次 `admin_permissions`。
-    这次补查**只补结构、不扩授权** —— 递归起点全来自那条已过滤的查询，
-    **没有有效后代就不会发生补查**（禁用角色借不到这条路让菜单冒出来），
-    且**祖先自身必须启用**，禁用的祖先不补出来、它下面的有效子菜单成孤儿被丢弃；
-  - 多角色并集的口径：禁用角色**独占**的权限随它消失，同一条权限只要还有另一个
-    启用角色挂着就照常有效；角色重新启用后权限恢复，但**仍受权限行自身状态控制**；
-  - 「有没有超管权力」（`IsUserSuperAdmin`）同样要求 `super_admin` 角色启用中；
-    权限查询出错一律 fail closed（回 500 且不执行后续 handler）；
-  - **不引入权限缓存**，每次校验都查库 —— 加缓存必须同时设计禁用角色的失效路径。
-
-  回归测试分两层：`app/repo/user_permission_sql_test.go` 用 MySQL dialector + DryRun
-  断言生成的语句真的联了 `admin_roles` 且带这两个条件（状态是写死的常量、不是绑定参数）；
-  `app/controller/user_permission_scope_test.go` 跑真实调用链（真的中间件 + 真的
-  Checker + 真的 service + 真的 repo），期望正则**要求**语句里出现
-  `JOIN admin_roles` 与 `r.status = 1`，覆盖禁用 / 启用 / 多角色共享 / 权限行自身禁用 /
-  超管短路 / 查询出错 fail closed，以及 `parent_id != 0` 的嵌套菜单
-  （补出启用祖先并挂好子菜单 / 无有效后代时一次补查都不发生 / 祖先被禁用时不补出）。
-  > 边界：sqlmock **不执行也不理解 SQL**，「禁用角色的权限行没被返回」是测试喂的行数据
-  > 所模拟的结果。上面能证明的是**语句形状**、**授权只从这个出口取数**，以及
-  > **祖先补查发生与否和它的参数**；
-  > 「MySQL 真的按这些条件过滤出正确的并集」仍需真库验证。
-- **Token 吊销以数据库列 `admin_users.auth_version` 为权威标记**：
-  - 签发时把「校验凭证那一刻读到的版本」和 jti 一起登记到 Redis（`auth:jti:<jti>`），
-    校验时与库里的当前版本比对，不相等即失效；
-  - 改密、重置密码、禁用 / 删除用户都在**同一个数据库事务**里自增该版本，
-    不存在「密码已改、吊销没写成功」的中间态；
-  - 刷新 Token 沿用旧会话的版本，不重新读当前值，所以刷新不能跨过一次改密 / 禁用续命；
-  - 吊销标记不放 Redis，是因为 Redis 可淘汰、可重启丢失：计数一丢，已吊销的会话会复活。
-    现在丢的只可能是 jti 键，而 jti 键丢失的后果是**拒绝**，方向是安全的；
-  - 会话校验依赖的 Redis 或版本来源出错时**拒绝放行**（fail closed），而不是放过去。
-  - 每次会话操作有固定 **2 秒**期限（`store.SessionOperationTimeout`，不可配置）：登记、校验（Redis GET 与
-    认证版本查询共用这 2 秒）、轮换、吊销各在请求 ctx 上派生一个预算，请求 ctx 的期限更早时以它为准。
-    刷新先经会话中间件校验一次，再由刷新接口在入口建立的一个预算内完成解析、校验 + 签名 + 轮换和写 Cookie 前的检查，
-    **两段合计可达约 4 秒**；
-    登录的会话登记与写入失败后的尽力吊销共用一个预算，不另开。到期或请求已取消按会话存储不可用处理：
-    会话校验 / 刷新 / 登录回 503，登出回 500 且不清 Cookie；不放行、不下发令牌或 Cookie。
-  - 这只是会话依赖的等待上限，**不是整个 HTTP 请求的时限**：bcrypt、登录日志、最后登录信息、业务查询都不受它约束。
-  - Redis 命令的 socket 读写要遵守这个期限，靠 Redis 组件开启 `WithContextTimeoutEnabled(true)`（`internal/taurus/components.go`）：
-    socket 期限取 ctx deadline 与 `redis.toml` 读写超时中更早的那个。按驱动源码（go-redis v9.23.0），等连接池空闲连接、
-    等拨号结果、重试之间的退避会响应 ctx 取消；**只有已经阻塞的 socket 读写**只认 deadline、不监听取消，
-    请求被手动取消时这类读写**仍可能等到剩余期限**才返回，不是立即中止。
-  - 写操作（登记 / 轮换 / 吊销）超时后，Redis 端是否已写入**未知**：不回滚、不恢复旧会话、不补发令牌，按失败处理；
-    轮换已提交而响应超时时，旧令牌同样不再可用，用户需要重新登录。
-  - 测试边界：生成项目里的单测用 fake 存储验证期限传递、共享预算、取消后拒绝与不下发 Cookie，不经过 Redis socket；
-    静默 GET、冷连接握手的 socket 期限由组件自身测试覆盖。手动取消已阻塞的读写、连接池占满、写阻塞、拨号等待、
-    重试退避等场景没有专门测过。
-  > **依赖状态**：`redisx.WithContextTimeoutEnabled` 来自 `go.mod` 依赖的已发布 taurus-pro-storage v0.3.1，
-  > 模板不带 replace；该选项在组件里默认关闭，由 `internal/taurus/components.go` 显式开启。
-  > 维护方已完成该公开版本的必选、典型、全选组合生成 / Wire / 构建测试及各组合认证三包 race 重复三次；
-  > 同源 Linux 候选原生 / Docker 的正常认证、Redis 故障拒绝、Cookie 不变及同应用恢复增量验收通过。
-  > 这不是三组合逐一双部署或全部生产场景认证；部署与未验边界见 `docs/部署文档.md`。
-- **浏览器端只用 HttpOnly Cookie**：登录 / 刷新的响应体和响应头都不含令牌，后端只从 `jwt_token` Cookie 读令牌，
-  不接受 `Authorization: Bearer` / `jwt_token` 请求头；前端不保存令牌（localStorage 里旧版本残留的令牌启动时删除），
-  路由守卫只看非 HttpOnly 的 CSRF Cookie 是否存在，最终以服务端 401 为准。脚本调用用 cookie jar + `x-csrf-token` 头，
-  示例见 `docs/商用加固一期说明.md`。
-- 登出吊销的是**请求真正通过认证的那个 Token**：controller 与中间件统一用
-  `middleware.GetJWTToken`（只读 Cookie），不再各写一套提取逻辑。
-- service 错误统一走 `controller.FailByError`：只回显 `helper.NewBizError` 标记的业务错误，
-  数据库 / Redis 等内部错误回通用提示并记服务端日志。
-- `RefreshToken` 不再从 URL query 取 Token。
-- 登录、验证码发送/校验、前端错误上报、全部后台接口都挂了**限流**，并限制请求体大小；
-  客户端自带的 `X-Real-IP` 不再被信任（`app/middleware/client_ip.go`）。
-- 登录成功 / 失败都写 `admin_user_login_logs`；pprof 默认关闭。
-- **登录失败真的以 `login_status=0` 落库**。之前 model 的 `LoginStatus` 带了
-  `gorm:"default:1"`，GORM 把零值（失败）当成「调用方没赋值」并用默认值替换，
-  于是**每一条失败登录都被记成成功**（接口仍返回 401，只有日志表失真）——
-  真实环境里出现过「带失败原因的记录全是成功」。现在该字段**不带任何 gorm 默认值**，
-  建表默认值也改成 0（漏写列时记成失败比记成成功安全）。回归测试
-  `app/repo/admin_user_login_log_repo_test.go` 用 MySQL dialector + DryRun 真的跑一遍
-  GORM 的 Create，断言 INSERT 里 `login_status` 在场且绑定值就是 0 / 1。
-  > 注意：这个默认值是审计语义的坑，不是单个字段的笔误 —— 给「零值有业务含义」的列
-  > （0=失败 / 0=禁用 / 0=未读）加 `gorm:"default:..."` 都会踩同一条路径。
-- 普通用户可以改自己的密码（`/admin/user/change-password` 不再走接口权限）。
-- **个人中心有入口可进**：顶栏右上角的用户名 + 头像现在是一个原生按钮，点击进入已有的
-  `profile` 页面（Tab 可聚焦、Enter / Space 可触发，无障碍与键盘操作走浏览器默认行为）。
-  之前这块只是静态文字，`profile` 路由存在但没有任何入口，改密、绑手机只能手敲地址栏。
-  没有新增页面，也没有新增菜单权限行。
-- **自助改密只有一个入口，且必须带旧密码**：个人信息 → 修改密码（`/admin/user/change-password`）。
-  原来还有一个 `/admin/user/set-password`：它从 JWT 取本人 ID、只收 `new_password`，
-  等于「拿到一个有效 Token 就能静默改掉密码」，且与上面的流程重复 —— 已连同
-  controller / service / DTO / 接口权限行 / 前端页面、路由、API、类型一起删除。
-  **管理员重置他人密码不受影响**，走用户管理的 `/admin/user/update`（`password` 字段），
-  仍受接口权限校验（权限 204），并额外受上面的超管账号保护；资料 / 密码 / 角色在同一个
-  事务里写，判定不通过时都不落库。
-- `admin_depts.dept_code` 改成**可空**（`*string` + `NULL DEFAULT NULL`），
-  不填编码也能连续创建多个部门；非空编码仍受 `uk_dept_code` 唯一约束。
-- 初始管理员密码每次生成随机，且不写进本仓库任何文件。
-- 删掉了未挂路由的自助注册流程（controller / service / DTO / 前端类型）：
-  本底座的建号入口只有「管理员新增用户」。
-- **凭据占位符只把纯空白当「没配」**（`internal/taurus/conv.go` 的 `emptyIfBlank`）：配置占位符默认值不能为空串，
-  模板用一个空格占位；Redis 密码{{ if .Has.consul }}、Consul token / Basic Auth{{ end }}{{ if .Has.milvus }}、Milvus 用户名 / 密码 / API key{{ end }}
-  只有空白时按没配处理（不发认证信息），非空白的值不会被代码去掉首尾空格。受配置库限制（先文本替换再解析
-  YAML/TOML，值里含引号、反斜线、`}`、换行会被改写或导致解析失败），不保证任意字符都能原样传递；首尾空格保留
-  只验证过由进程环境变量直接提供的普通值，经 `.env.local` 等文件提供时未验证。
-- **Redis 日志默认 warn**（`config/autoload/redis/redis.toml`）：info 会把每条成功命令连同参数（会话键等）写进
-  `logs/redis.log`；warn 下只记失败命令（仍带参数），排查时再临时调成 info / debug。
+- **会话依赖 Redis，故障时拒绝而不是放行**：每次会话操作（登记 / 校验 / 轮换 / 吊销）有固定约 2 秒期限，到期或 Redis 不可用时会话校验 / 刷新 / 登录回 503，登出回 500 且不清 Cookie；刷新要两段校验，合计可达约 4 秒。这不是整个 HTTP 请求的时限。写操作超时后 Redis 端是否已写入未知，用户可能需要重新登录。
+- **改密、管理员重置密码、禁用 / 删除用户会让该账号已签发的会话立即失效**（数据库 `auth_version` 自增）；刷新不能跨过这些变更续命。
+- **浏览器端只用 HttpOnly Cookie**，后端不接受 `Authorization: Bearer`；脚本调用用 cookie jar + `x-csrf-token` 头，示例见 `docs/商用加固一期说明.md`。HttpOnly 不能阻止 XSS 借用户浏览器发请求。
+- 密码用 bcrypt；库里旧的 SHA-256 散列账号在下次登录成功时自动升级；超过 72 字节的密码明确拒绝。
+- **超级管理员账号受保护**：普通管理员即使有用户管理接口权限，也不能改超管资料、重置超管密码、禁用 / 删除超管或分配超管角色；判定与写入在同一事务里。真实 MySQL 下的并发交错只做过语句层面的单测，需要你在真库验证。
+- `/admin/user/update` 不是 PATCH：只有 `role_ids` 是选择性更新（不传或 `null` 不改角色，`[]` 清空），其他资料按完整表单覆盖；只调角色用 `/admin/role/assign`。
+- **禁用的角色不贡献任何权限**，关联保留、重新启用后恢复；编辑用户时可以保留或取消已持有的禁用角色，但不能新增。系统权限（`is_system=1`）只能升不能降。权限每次查库，不做缓存。
+- **部门编码创建后不可修改**；编码可为空，非空时唯一。
+- 日志表默认保留 180 天并自动分批删除（依赖 MySQL 默认的 `binlog_format=ROW`）；数据库日志不写 SQL 原文，访问 / 操作日志对密码、Token、验证码脱敏，你自己新加的日志点仍要自己脱敏；接口只回显业务错误，内部错误回通用提示。
 {{- if .Has.consul }}
-- **Consul Basic Auth 必须用户名和密码同时配置**，只配一个启动报错，不再静默忽略。
+- Consul Basic Auth 必须用户名和密码同时配置，只配一个启动报错。
 {{- end }}
-{{- if .Has.milvus }}
-- **Milvus 启用后严格校验、连不上就启动失败**（`internal/taurus/components.go` 的 `ProvideMilvusComponent`）：
-  `milvus.list` 缺失 / 为空 / 条目格式不对、name 为空或带首尾空白或重复、address 为空、字段类型不对、
-  `disable_conn=true`（会跳过握手、不校验认证）、建连或握手失败都直接返回错误；已建好的连接先关闭，
-  再由 wire 回滚已初始化的组件{{ if .Has.consul }}（例如注销 Consul 注册）{{ end }}。错误信息不含密码、API key 和地址。
-  这些路径有离线单元测试（进程内 fake Milvus{{ if .Has.consul }} / fake Consul{{ end }}），**真实 Milvus 服务上的联调不在单元测试范围内**。
-- **Milvus 查询失败只写脱敏日志、恢复由请求驱动**：Search / Query 用组件默认启用的只读恢复，只在本次请求内
-  按 5 秒间隔重建重试（5 秒是失败后的等待间隔，不保证每 5 秒都拨号一次，拨号和 SDK 内部重试也占同一预算），
-  单次最多 60 秒，调用方 ctx 期限更短时以调用方为准；请求结束后组件包装层没有后台重连或重放
-  （SDK / gRPC 对已建连接的既有维护不在此列），前一次失败不会永久关闭客户端，显式调用的连接池 Close 才是终态；
-  写操作不在恢复范围内，组件包装层不重试（不代表 SDK 内部不重试）。最终失败时往默认日志（模板默认 `logs/app.log`）写一条
-  `milvus_read_failed` ERROR，只有操作名、错误分类、执行次数（不含 SDK 内部重试，也不保证每次都发到服务端）和耗时；
-  只覆盖按 `milvus.list` 创建的客户端，运行时自己 `pool.Add` 的客户端不自动记录。
-  Close 会取消在途的 Search / Query 和恢复，`GetClient()` 的裸 SDK 句柄不能与 Search / Query 的恢复、
-  Close、UseDatabase 并发，组件不承诺裸 SDK 透明恢复。字段含义、日志配置与这些边界见 `docs/运维手册.md` 第六节。
-  这些行为来自 `go.mod` 依赖的已发布 taurus-pro-milvus v0.3.0（只读恢复与观察回调接口），模板不带 replace。
-{{- end }}
-
-### 其它
-
-- `docs/` 下的流程文档用「公告（Notice）」作为贯穿的示例域，**那是示例，不是已实现的模块**，
-  仓库里没有对应代码和表。
+- `docs/` 下的流程文档用「公告（Notice）」作贯穿示例，**那是示例，不是已实现的模块**。

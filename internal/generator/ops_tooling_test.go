@@ -21,7 +21,7 @@ import (
 //   - assertOpsTooling：静态断言，挂在 TestGenerate_Combinations 里，三种组合都跑；
 //   - TestDBScripts_*：用假的 mysql / mysqldump 跑真实脚本，只验证控制流（参数、失败处理、
 //     拒绝保护、临时文件清理、密码不进 argv），**不是**真库演练 —— 真库演练见生成项目
-//     docs/运维手册.md 的人工步骤。
+//     README.md「八、备份与恢复」的人工步骤。
 
 // 固定的工具版本：与模板 Makefile 一致，改版本要两边一起改并重新实测。
 const (
@@ -222,10 +222,12 @@ func assertOpsTooling(t *testing.T, outDir string) {
 			t.Errorf(".gitignore 应忽略 %q", strings.TrimSpace(want))
 		}
 	}
-	manual := readFile(t, filepath.Join(outDir, "docs", "运维手册.md"))
-	for _, want := range []string{"GO-2026-5932", "不等于没有漏洞", "Symbol Results", "--single-transaction",
+	// 备份恢复的唯一说明在生成 README「八、备份与恢复」（原运维手册第一节迁入）；运维手册只留压测 / SBOM / 漏洞判读。
+	readme := readFile(t, filepath.Join(outDir, "README.md"))
+	backupDoc := markdownSection(t, readme, "\n## 八、备份与恢复\n")
+	for _, want := range []string{"--single-transaction",
 		"备份期间不要做 DDL", "非事务表", "目标库非空一律拒绝", "人工删测试库", "登录验证", "不支持 `docker exec`",
-		"cyclonedx-npm", "MYSQL_OPS_PASSWORD",
+		"MYSQL_OPS_PASSWORD",
 		// P2：恢复的信任边界与客户端命令
 		"--binary-mode", "只恢复本项目 `backup.sh` 生成", "不是来源认证", "**不是隔离手段**", "不要用 root",
 		"**只允许恢复到与源库同名的库**", "另一个 MySQL 实例",
@@ -233,7 +235,18 @@ func assertOpsTooling(t *testing.T, outDir string) {
 		"SHOW_ROUTINE", "SET_USER_ID", "SET_ANY_DEFINER", "不需要 `LOCK TABLES`", "undo 历史", "元数据锁",
 		// 连接身份
 		"protocol=TCP", "server_uuid", "证明不了", "`~/.mylogin.cnf` 会覆盖 `--defaults-file`", "MYSQL_TEST_LOGIN_FILE",
-		"--local-infile=0", "不会停下来等你确认", "只在脚本新建时", "kill -- -<PGID>", "没有在真库上确认过",
+		"--local-infile=0", "不会停下来等你确认", "只在脚本新建时", "kill -- -<PGID>", "没有在真库上确认过"} {
+		if !strings.Contains(backupDoc, want) {
+			t.Errorf("README「八、备份与恢复」应说明 %q", want)
+		}
+	}
+	// 事先核对身份的命令：一行、显式 TCP / 主机 / 端口 / 账号 / -p、不读 login 文件。
+	if !strings.Contains(backupDoc, "\nMYSQL_TEST_LOGIN_FILE=/nonexistent/mylogin.cnf mysql --protocol=TCP -h 127.0.0.1 -P 3306 -u <账号> -p -e \"SELECT @@hostname, @@port, @@server_uuid\"\n") {
+		t.Error("README「八、备份与恢复」应给出完整的单行身份核对命令")
+	}
+	manual := readFile(t, filepath.Join(outDir, "docs", "运维手册.md"))
+	for _, want := range []string{"GO-2026-5932", "不等于没有漏洞", "Symbol Results",
+		"cyclonedx-npm",
 		// SBOM / vuln
 		"scripts/sbomcheck", "npm_config_ignore_scripts=true", "传递依赖", "exit status 3", "make 立即停止",
 		// govulncheck 结果层级与退出码：JSON 输出有 finding 也返回 0
@@ -249,6 +262,15 @@ func assertOpsTooling(t *testing.T, outDir string) {
 			t.Errorf("docs/运维手册.md 应说明 %q", want)
 		}
 	}
+	// 运维手册不再重复备份恢复步骤（不出现两份口径），并指回 README
+	for _, dup := range []string{"make db-backup", "make db-restore", "MYSQL_OPS_", "--single-transaction"} {
+		if strings.Contains(manual, dup) {
+			t.Errorf("docs/运维手册.md 不应再重复备份恢复步骤（命中 %q），唯一说明在 README", dup)
+		}
+	}
+	if !strings.Contains(manual, "](../README.md)") {
+		t.Error("docs/运维手册.md 应链接回项目 README.md")
+	}
 	// GO-2026-5932 旧文案：「没有修复版本 / 无法升级 / 不需要处理 / 保持不可达」及未复核的示例输出都已过时。
 	for _, bad := range []string{"Fixed in: N/A", "没有修复版本", "无法通过升级", "不需要处理", "保持不可达", "待独立复核",
 		"实现时用 govulncheck", "This scan also found 0 vulnerabilities in packages you import and 1"} {
@@ -256,14 +278,12 @@ func assertOpsTooling(t *testing.T, outDir string) {
 			t.Errorf("docs/运维手册.md 不应再有 GO-2026-5932 的过时说法 %q", bad)
 		}
 	}
-	// 事先核对身份的命令：一行、显式 TCP / 主机 / 端口 / 账号 / -p、不读 login 文件。
-	if !strings.Contains(manual, "\nMYSQL_TEST_LOGIN_FILE=/nonexistent/mylogin.cnf mysql --protocol=TCP -h 127.0.0.1 -P 3306 -u <账号> -p -e \"SELECT @@hostname, @@port, @@server_uuid\"\n") {
-		t.Error("docs/运维手册.md 应给出完整的单行身份核对命令")
-	}
 	for _, bad := range []string{"退出码原样返回", "忽略导出里切到其它库的语句，只写目标库", "`CONFIRM` 必须逐字等于实际连接的",
 		"主机和端口才真正决定连到哪里", "目录权限 `700`，文件权限 `600`", "实测", "2026-11-02"} {
-		if strings.Contains(manual, bad) {
-			t.Errorf("docs/运维手册.md 不应再有过头的说法 %q", bad)
+		for name, doc := range map[string]string{"README.md": readme, "docs/运维手册.md": manual} {
+			if strings.Contains(doc, bad) {
+				t.Errorf("%s 不应再有过头的说法 %q", name, bad)
+			}
 		}
 	}
 	ltReadme := readFile(t, filepath.Join(ltDir, "README.md"))
@@ -293,7 +313,7 @@ func assertOpsTooling(t *testing.T, outDir string) {
 	if rows < 8 {
 		t.Errorf("基准记录表应列出硬件、配置、限流、样本等记录项，实际 %d 行", rows)
 	}
-	for _, doc := range []string{"README.md", filepath.Join("docs", "部署文档.md"), filepath.Join("docs", "后端开发流程.md")} {
+	for _, doc := range []string{"README.md", filepath.Join("docs", "后端开发流程.md")} {
 		if !strings.Contains(readFile(t, filepath.Join(outDir, doc)), "运维手册.md") {
 			t.Errorf("%s 应链接到 docs/运维手册.md", doc)
 		}

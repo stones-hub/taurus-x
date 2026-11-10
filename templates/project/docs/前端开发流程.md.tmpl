@@ -162,11 +162,11 @@ initForm({ title: '', status: null })
 
 ```bash
 cd frontend
-pnpm build          # vue-tsc 类型检查 + vite 构建
+npm exec --yes pnpm@10.34.7 -- build    # vue-tsc 类型检查 + vite 构建（固定版本 pnpm，不需要全局安装）
 npx vue-tsc --noEmit  # 可选：单独跑类型检查（build 含 vue-tsc，且抓得更全）
 ```
 
-**必须**：`pnpm build`（含 vue-tsc）通过。
+**必须**：`pnpm build`（含 vue-tsc）通过；没有全局 pnpm 时用上面的 `npm exec --yes pnpm@10.34.7 -- build`。
 
 ---
 

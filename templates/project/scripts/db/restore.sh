@@ -169,7 +169,7 @@ case $exists in
 *) dbops_die "无法确认目标库是否存在（查询返回 '$exists'）" ;;
 esac
 
-# 非空判定只看本账号可见的对象：恢复账号必须对目标库有完整权限（见运维手册）。
+# 非空判定只看本账号可见的对象：恢复账号必须对目标库有完整权限（见 README.md「备份与恢复」）。
 objects=$(dbops_query objects "SELECT
   (SELECT COUNT(*) FROM information_schema.TABLES   WHERE TABLE_SCHEMA   = '$database')
 + (SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = '$database')
